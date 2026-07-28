@@ -1,0 +1,12 @@
+---
+description: Frontend SPA-only 禁令
+globs: frontend/**/*
+alwaysApply: false
+---
+
+# Frontend 範圍
+
+- 禁止修改 `backend/` 或新增伺服器端商業邏輯。
+- 只透過 `/api`（proxy）呼叫後端；WS 用 `/ws/occupancy`。
+- 會員／門禁禁止傳 `memberId`；儲值禁止自填金額，只送 `promotionId`。
+- 必須維持 `/auth/callback` 與 `/pay/return` 回流頁。

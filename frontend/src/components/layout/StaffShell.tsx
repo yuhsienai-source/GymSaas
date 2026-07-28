@@ -1,0 +1,234 @@
+import { useEffect, useState } from 'react';
+import { Link, Outlet, useLocation } from 'react-router-dom';
+import { Button } from '../ui';
+import { useStaffAuth } from '../../contexts/StaffAuthContext';
+import type { StaffPermission } from '../../lib/storage';
+
+const SIDEBAR_COLLAPSE_KEY = 'gymsaas.staff.sidebarCollapsed';
+
+const navItems: {
+  to: string;
+  label: string;
+  icon: string;
+  adminOnly?: boolean;
+  dutyOrAbove?: boolean;
+  permission?: StaffPermission;
+}[] = [
+  { to: '/staff/ops', label: '櫃檯維運', icon: '🏪', permission: 'ops' },
+  { to: '/staff/inventory', label: '進銷存', icon: '📦', dutyOrAbove: true },
+  { to: '/staff/hq', label: '總部 HQ', icon: '🏢', adminOnly: true },
+  { to: '/staff/trainer', label: '教練服務台', icon: '🏋️', permission: 'trainer' },
+  { to: '/staff/tx', label: '交易異動', icon: '🔁', dutyOrAbove: true },
+];
+
+export default function StaffShell() {
+  const { staff, isAdmin, canAccessTx, hasPermission, logout } = useStaffAuth();
+  const location = useLocation();
+  const [collapsed, setCollapsed] = useState(() => {
+    try {
+      return localStorage.getItem(SIDEBAR_COLLAPSE_KEY) === '1';
+    } catch {
+      return false;
+    }
+  });
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(SIDEBAR_COLLAPSE_KEY, collapsed ? '1' : '0');
+    } catch {
+      /* ignore */
+    }
+  }, [collapsed]);
+
+  // 換頁後關閉手機抽屜
+  useEffect(() => {
+    setMobileMenuOpen(false);
+  }, [location.pathname]);
+
+  useEffect(() => {
+    if (!mobileMenuOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setMobileMenuOpen(false);
+    };
+    window.addEventListener('keydown', onKey);
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      document.body.style.overflow = prev;
+    };
+  }, [mobileMenuOpen]);
+
+  const visibleNav = navItems.filter((item) => {
+    if (item.adminOnly) return isAdmin;
+    if (item.dutyOrAbove) return canAccessTx;
+    if (item.permission) return hasPermission(item.permission);
+    return true;
+  });
+
+  const activeLabel =
+    visibleNav.find((n) => location.pathname.startsWith(n.to))?.label || '後台';
+
+  /** 手機抽屜開啟時一律顯示完整標籤（不受桌面收合影響） */
+  const showLabels = !collapsed || mobileMenuOpen;
+
+  return (
+    <div className={`staff-app ${collapsed && !mobileMenuOpen ? 'staff-app--collapsed' : ''}`}>
+      {mobileMenuOpen ? (
+        <button
+          type="button"
+          className="staff-sidebar-backdrop"
+          aria-label="關閉選單"
+          onClick={() => setMobileMenuOpen(false)}
+        />
+      ) : null}
+
+      <aside
+        className={`staff-sidebar ${collapsed && !mobileMenuOpen ? 'staff-sidebar--collapsed' : ''} ${
+          mobileMenuOpen ? 'is-open' : ''
+        }`}
+      >
+        <div className="staff-sidebar__head">
+          <Link to="/portal" className="brand brand--compact" title="體育客員工後台">
+            <span className="brand__mark">體</span>
+            {showLabels && (
+              <span className="brand__text">
+                體育客
+                <small>員工後台</small>
+              </span>
+            )}
+          </Link>
+          <button
+            type="button"
+            className="staff-sidebar__collapse staff-sidebar__collapse--desktop"
+            onClick={() => setCollapsed((v) => !v)}
+            aria-label={collapsed ? '展開側邊欄' : '收起側邊欄'}
+            title={collapsed ? '展開' : '收起'}
+          >
+            {collapsed ? '»' : '«'}
+          </button>
+          <button
+            type="button"
+            className="staff-sidebar__collapse staff-sidebar__collapse--mobile"
+            onClick={() => setMobileMenuOpen(false)}
+            aria-label="關閉選單"
+          >
+            ✕
+          </button>
+        </div>
+
+        <nav className="staff-sidebar__nav" aria-label="員工功能選單">
+          {visibleNav.map((item) => (
+            <Link
+              key={item.to}
+              to={item.to}
+              className={`staff-sidebar__link ${
+                location.pathname.startsWith(item.to) ? 'is-active' : ''
+              }`}
+              title={item.label}
+            >
+              <span className="staff-sidebar__icon" aria-hidden>
+                {item.icon}
+              </span>
+              {showLabels && <span className="staff-sidebar__label">{item.label}</span>}
+            </Link>
+          ))}
+        </nav>
+
+        <div className="staff-sidebar__footer">
+          {showLabels ? (
+            <div className="staff-user">
+              <div className="avatar avatar--sm">{staff?.name?.charAt(0) || '?'}</div>
+              <div>
+                <strong>{staff?.name}</strong>
+                <span>
+                  {staff?.role}
+                  {staff?.branchName ? ` · ${staff.branchName}` : ''}
+                </span>
+              </div>
+            </div>
+          ) : (
+            <div className="avatar avatar--sm" title={staff?.name || '員工'}>
+              {staff?.name?.charAt(0) || '?'}
+            </div>
+          )}
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={logout}
+            className={!showLabels ? 'staff-sidebar__logout-icon' : 'w-full'}
+            title="登出"
+          >
+            {!showLabels ? '⎋' : '登出'}
+          </Button>
+        </div>
+      </aside>
+
+      <div className="staff-content">
+        <header className="staff-topbar">
+          <div className="staff-topbar__left">
+            <button
+              type="button"
+              className="staff-topbar__toggle"
+              onClick={() => setMobileMenuOpen(true)}
+              aria-label="開啟選單"
+              aria-expanded={mobileMenuOpen}
+            >
+              ☰
+            </button>
+            <button
+              type="button"
+              className="staff-topbar__toggle staff-topbar__toggle--desktop"
+              onClick={() => setCollapsed((v) => !v)}
+              aria-label={collapsed ? '展開側邊欄' : '收起側邊欄'}
+            >
+              ☰
+            </button>
+            <h1>{activeLabel}</h1>
+          </div>
+          <div className="staff-topbar__right">
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={logout}
+              className="staff-topbar__logout"
+              title="登出"
+            >
+              登出
+            </Button>
+            <Link to="/portal" className="text-muted text-sm staff-topbar__portal">
+              入口
+            </Link>
+          </div>
+        </header>
+        <main className="staff-main">
+          <Outlet />
+        </main>
+      </div>
+
+      <nav className="staff-mobile-nav" aria-label="手機快捷導覽">
+        {visibleNav.map((item) => (
+          <Link
+            key={item.to}
+            to={item.to}
+            className={`staff-mobile-nav__item ${
+              location.pathname.startsWith(item.to) ? 'is-active' : ''
+            }`}
+          >
+            <span>{item.icon}</span>
+            <small>{item.label}</small>
+          </Link>
+        ))}
+        <button
+          type="button"
+          className="staff-mobile-nav__item staff-mobile-nav__logout"
+          onClick={logout}
+        >
+          <span>⎋</span>
+          <small>登出</small>
+        </button>
+      </nav>
+    </div>
+  );
+}

@@ -1,0 +1,23 @@
+# 體育客 (GymSaaS) Monorepo 憲法
+
+## 👨‍💻 角色
+你是「碼字天才」。拒絕恭維；看到前後端混寫、靜態檔掛在 API 上、或商業邏輯塞進前端，必須直接擋下。
+
+## 🛑 前後端絕對分離（最高優先）
+本倉庫**只允許**兩個可執行專案，禁止在根目錄復活舊單體：
+
+| 目錄 | 職責 | 禁止 |
+|------|------|------|
+| `backend/` | 純 API + WebSocket + Prisma | 任何 HTML/CSS/React/Vue/EJS、`express.static`、回傳 UI |
+| `frontend/` | 獨立 SPA（Vite + React） | Express routes、Prisma、直接改 DB、自創金額欄位送儲值 |
+
+1. **根目錄不是伺服器**：根目錄不得存在 `app.js`、`routes/`、`public/*.html`、`prisma/`。根目錄只放 monorepo 說明與腳本轉發。
+2. **機密只在 `backend/.env`**：禁止把前端當後端跑；`FRONTEND_URL` 與 `API_PUBLIC_URL` / `BASE_URL` **必須是不同網域／埠**。
+3. **改哪邊就開哪邊的守則**：後端工作遵守 `backend/.cursorrules`；前端工作遵守 `frontend/.cursorrules`。禁止一次 PR 把 UI 寫進 backend。
+4. **瀏覽器回流 ≠ 託管 UI**：後端僅允許對 `FRONTEND_URL` 做 OAuth／金流 `302`；業務結果一律 JSON。
+
+## 📂 啟動
+```bash
+npm run dev:api   # backend → :8000
+npm run dev:web   # frontend → Vite（proxy /api、/ws → 後端）
+```

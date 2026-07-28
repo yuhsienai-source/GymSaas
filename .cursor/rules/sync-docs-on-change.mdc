@@ -1,0 +1,32 @@
+---
+description: 行為／權限／API 變更時同步更新 .cursorrules 與 README
+alwaysApply: true
+---
+
+# 文件同步（必做）
+
+改碼若影響**行為、權限、API、啟動方式、環境變數、商業規則**，同一輪必須同步文件，不必等使用者再說一次。
+
+## 更新哪些檔
+
+| 變更範圍 | 必更新 |
+|----------|--------|
+| 全倉／前後端邊界 | 根目錄 `.cursorrules`；必要時根 `README.md` |
+| 後端規則／API／權限 | `backend/.cursorrules`；必要時 `backend/README.md` |
+| 前端慣例／路由／門禁 | `frontend/.cursorrules`；必要時 `frontend/README.md` |
+
+## 何時一定要改
+
+- 權限／角色／分店綁定規則變了
+- 新增或改名對外 API、重要 env
+- 啟動／部署／schema 流程變了
+- `.cursorrules` 裡已寫死的禁令或必做項與程式不符
+
+## 何時可略過 README
+
+- 純 UI 微調、重命名變數、修 typo、不動對外契約的重構
+
+## 寫法
+
+- 只改過期段落，保持精簡；不要長篇複述實作細節
+- 守則（`.cursorrules`）寫「必須／禁止」；README 寫「怎麼跑／怎麼用」

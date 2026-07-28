@@ -1,0 +1,12 @@
+---
+description: Backend API-only 禁令
+globs: backend/**/*
+alwaysApply: false
+---
+
+# Backend 範圍
+
+- 禁止生成 HTML/CSS/React 或修改 `frontend/`。
+- 禁止 `express.static`、`res.render`、`sendFile`、回傳 HTML。
+- API 一律 JSON；儲值只收 `promotionId`；MEMBER 的 `memberId` 只從 JWT。
+- 瀏覽器回流只用 `lib/frontendUrl.js` 指向 `FRONTEND_URL`。

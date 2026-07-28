@@ -1,0 +1,983 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Get a free hosted Postgres database in seconds: `npx create-db`
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// Prisma 7 最新規範：這裡不再放網址
+datasource db {
+  provider = "postgresql"
+}
+
+// ==========================================
+// 1. 企業連鎖核心：分店與場地
+// ==========================================
+model Branch {
+  id          Int       @id @default(autoincrement())
+  name        String    @unique // 正式名稱（會員介面顯示）如: "和平店"
+  /// 員工端關聯顯示用代碼（如 HP）；會員介面仍用 name
+  code        String?   @unique
+  address     String?     // 👈 補上這個欄位 (加上 ? 代表允許為空，避免影響舊資料)
+  /// 折讓單／發票列印抬頭（營業人名稱）；未設則回退環境變數或「體育客」
+  invoiceSellerName String?
+  /// 折讓單抬頭統編（8 碼）
+  invoiceSellerUbn  String?
+  isActive    Boolean   @default(true)
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+  
+  // 該分店專屬的促銷方案與場地
+  promotions  Promotion[]
+  coursePlans CoursePlan[]
+  venues      Venue[]
+  
+  // 該分店有哪些教練有權限開課
+  trainers    TrainerBranch[]
+
+  // 進銷存
+  products        Product[]
+  purchaseOrders  PurchaseOrder[]
+  saleOrders      SaleOrder[]
+  checkoutSessions CheckoutSession[]
+  shiftHandovers  ShiftHandover[]
+  checkInLogs     CheckInLog[]
+
+  // 綁定本分店的員工
+  staffMembers    Staff[]
+  ptContracts     PTContract[]
+  memberBranches  MemberBranch[]
+  gateDevices     GateDevice[]
+}
+
+model Venue {
+  id       Int    @id @default(autoincrement())
+  branchId Int
+  branch   Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  name     String // 如: "A區VIP室", "草皮區"
+
+  // 關聯：在該場地舉辦的課程、可細分站點（A~E、外區等）
+  classes     Class[]
+  classSeries ClassSeries[]
+  stations    VenueStation[]
+}
+
+// 場地站點：教練排課時可再選細項訓練位置
+model VenueStation {
+  id        Int    @id @default(autoincrement())
+  venueId   Int
+  venue     Venue  @relation(fields: [venueId], references: [id], onDelete: Cascade)
+  name      String // 如: "A", "B", "外區"
+  sortOrder Int    @default(0)
+
+  classes     Class[]
+  classSeries ClassSeries[]
+
+  @@unique([venueId, name])
+  @@index([venueId])
+}
+
+// ==========================================
+// 2. 會員主表
+// ==========================================
+model Member {
+  // 內部主鍵（關聯／JWT 用）；對外請顯示 memberNo
+  id         Int      @id @default(autoincrement())
+
+  // 對外會員編號（隨機 6 碼大寫英數，如 A3K9XZ）；舊資料可由 backfill 補齊
+  memberNo   String?  @unique
+  
+  // name 欄位，型態是字串 (String)
+  name       String
+
+  // 基礎聯絡資訊：電話號碼作為系統唯一識別基準 (合併帳號用)
+  phone           String       @unique
+
+  // 緊急聯絡人（臨櫃編輯）
+  emergencyContact      String?
+  emergencyContactPhone String?
+
+  role            String    @default("MEMBER")
+  
+  // plan：未購方案預設分鐘計費（計時會員）；購買完成後由金流／商品流程寫入
+  plan       String   @default("計時會員")
+
+  // expireDate 方案到期日。加問號 (?) 代表可以為空
+  expireDate DateTime?
+
+  /// 請假結束時間；非空且 now < leaveUntil → 禁止以無限／月費通行進場（效期已於請假開始時預先順延）
+  leaveUntil DateTime?
+
+  cashWallet  Float          @default(0.0) // 真金白銀
+  bonusWallet Float          @default(0.0) // 贈送的運動金
+
+  // 【新增】防弊與社群登入綁定
+  lineId          String?      @unique // LINE 唯一授權碼 (可選綁定)
+  deviceId        String?      // 綁定的手機裝置碼 (一機一帳號防借用)
+  /// 裝置綁定世代：每次綁定／解除／改綁遞增；JWT 須帶相同值，否則舊票立即失效
+  deviceAuthVersion Int        @default(0)
+  allowBiometrics Boolean      @default(false) // 快取：是否已簽目前版生物辨識同意書（以合約簽署為準）
+  /// 櫃檯勾選「啟用人臉辨識」；為 true 時生物辨識同意書才標為必簽（紅）
+  faceEnabled     Boolean      @default(false)
+  /// 會員已於自助／櫃檯回答過是否啟用人臉（舊會員登入須先回答才進綁定）
+  facePreferenceSet Boolean    @default(false)
+  papagoFaceId    String?      @unique // PAPAGO Face8 人臉特徵 ID (臨櫃註冊綁定)
+  isAlert         Boolean      @default(false) // 警示帳號 (防弊：若為 true 則強制人工查驗)
+
+  // createdAt 欄位，型態是時間。紀錄這個會員是什麼時候建立的。
+  // @default(now()) 會在資料寫入的瞬間，自動抓取當下的時間，這是現代 SaaS 系統的標配欄位。
+  createdAt  DateTime @default(now())
+
+  // 建立關聯：一個會員可以擁有「多個」進出場紀錄
+  checkInLogs     CheckInLog[]
+  reservations    Reservation[]
+  consultGuests   ConsultGuest[]
+  
+  // 【4.0 新增】會員名下的私教合約
+  ptContracts     PTContract[]
+  orders Order[]
+  saleOrders      SaleOrder[]
+  checkoutSessions CheckoutSession[]
+  cardSubscriptions CardSubscription[]
+  memberLeaves      MemberLeave[]
+  contractSignatures MemberContractSignature[]
+  phoneOtps         PhoneOtp[]
+  /// 會員綁定分店（進出場須符合綁定場館；AC↔HP 可互進）
+  branches          MemberBranch[]
+}
+
+/// 會員 ↔ 分店綁定（進出場閘機驗證）
+model MemberBranch {
+  memberId Int
+  branchId Int
+  member   Member @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  branch   Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  @@id([memberId, branchId])
+  @@index([branchId])
+}
+
+/** 手機 OTP（會員自助註冊／登入驗證；正式環境請接簡訊閘道） */
+model PhoneOtp {
+  id         Int       @id @default(autoincrement())
+  phone      String
+  codeHash   String
+  purpose    String    // LOGIN | REGISTER
+  expiresAt  DateTime
+  consumedAt DateTime?
+  attempts   Int       @default(0)
+  createdAt  DateTime  @default(now())
+  memberId   Int?
+  member     Member?   @relation(fields: [memberId], references: [id], onDelete: SetNull)
+
+  @@index([phone, purpose, createdAt])
+}
+
+// 2. 全新新增的進出場紀錄表
+model CheckInLog {
+  id       Int @id @default(autoincrement())
+
+  // 外鍵 (Foreign Key)：用來記錄這是哪位會員的紀錄
+  memberId Int
+
+  // 設定關聯對應：當 Member 被刪除時，其紀錄也會一併連帶刪除 (onDelete: Cascade)
+  member Member @relation(fields: [memberId], references: [id], onDelete: Cascade)
+
+  /// 進場分店（閘機／裝置設定）；舊資料可為 null
+  branchId Int?
+  branch   Branch? @relation(fields: [branchId], references: [id], onDelete: SetNull)
+
+  /// 進出場裝置（GateDevice）；舊資料可為 null
+  gateDeviceId Int?
+  gateDevice   GateDevice? @relation(fields: [gateDeviceId], references: [id], onDelete: SetNull)
+
+  // 進場當下的計費快照。用來決定出場時要不要扣款
+  billingMode String @default("計時扣款")
+
+  // 進場時間：必填，預設為當下
+  checkInAt DateTime @default(now())
+
+  // 出場時間：可為空 (Nullable)，因為剛進場時還不知道什麼時候出場
+  checkOutAt DateTime?
+
+  // 本次消費金額：出場時才會計算並寫入
+  fee Float @default(0.0)
+
+  // ACTIVE | CANCELLED（櫃檯取消進出場／沖銷費用）
+  status String @default("ACTIVE")
+
+  cancelledAt   DateTime?
+  cancelReason  String?
+  cancelledByStaffId Int?
+
+  @@index([branchId, checkInAt])
+  @@index([gateDeviceId, checkInAt])
+  @@index([checkInAt])
+  @@index([memberId, status, checkOutAt])
+}
+
+/// 進出場閘機／掃碼裝置（綁定分店；憑 deviceKey 驗證，不可由前端任意選店）
+model GateDevice {
+  id           Int       @id @default(autoincrement())
+  /// 裝置代碼（如 HP-IN-01），全倉唯一
+  code         String    @unique
+  name         String
+  branchId     Int
+  branch       Branch    @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  /// SHA-256(hex) of deviceKey；明文僅建立／輪替時回傳一次
+  keyHash      String
+  /// 裝置金鑰前綴（顯示用，非完整金鑰）
+  keyPrefix    String?
+  isActive     Boolean   @default(true)
+  lastSeenAt   DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  checkInLogs  CheckInLog[]
+
+  @@index([branchId, isActive])
+}
+
+// ==========================================
+// 3. 促銷方案表 (升級：綁定特定分店)
+// ==========================================
+model Promotion {
+  id          Int       @id @default(autoincrement())
+  branchId    Int       // 【4.0 新增】這個方案屬於哪間店
+  branch      Branch    @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  name        String    // 商品名稱，例如："迎新儲值500送100"
+  usageType   String    @default("TIMED") // TIMED(分鐘計費) | UNLIMITED(無限使用)
+  planMode    String    @default("STANDING") // STANDING(長註) | CAMPAIGN(活動檔期)
+  saleStartAt DateTime? // 活動上架時間（長註為 null）
+  saleEndAt   DateTime? // 活動下架時間（長註為 null）
+  /// 無限使用：每期天數（可自訂）；TIMED 為 null
+  unitDays     Int?
+  /// 無限使用：期數（可自訂）；TIMED 為 null
+  periodCount  Int?
+  /// 無限使用：有效天數＝unitDays × periodCount（購案延長用）
+  durationDays Int?
+  requiresMemberContract Boolean @default(false) // 需簽署會員合約
+  enableCardRecurring    Boolean @default(false) // 啟用信用卡定期定額
+  price       Float     // 實際要收取的現金 (500)
+  bonusGiven  Float     // TIMED：贈送運動金；UNLIMITED 固定 0（不入錢包）
+  isActive    Boolean   @default(true) // 上下架狀態 (老闆隨時可停賣)
+  createdAt   DateTime  @default(now())
+
+  contractLinks PromotionMembershipContract[]
+  cardSubscriptions CardSubscription[]
+}
+
+// ==========================================
+// 課程方案（私教／團課商品化；與排程 Class 分離）
+// ==========================================
+model CoursePlan {
+  id          Int       @id @default(autoincrement())
+  branchId    Int
+  branch      Branch    @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  name        String
+  planType    String    // CUSTOM_PT(客製化私教) | GROUP(團體課程)
+  planMode    String    @default("STANDING") // STANDING(長註) | CAMPAIGN(活動檔期)
+  saleStartAt DateTime?
+  saleEndAt   DateTime?
+  price       Float     // 方案售價
+  sessions    Int?      // 堂數（私教／套票）
+  capacity    Int?      // 團體課建議人數上限（參考）
+  description String?
+  requiresMemberContract Boolean @default(false) // 需簽署會員合約
+  enableCardRecurring Boolean @default(false) // 啟用信用卡批次扣款
+  /// 是否提供「課程第二人+$500(課程當日現場支付)」選項（結帳不入應付金額）
+  enableSecondPerson Boolean @default(false)
+  /// 加贈禮名稱；入購物車／訂單快照，金額 $0
+  giftLabel   String?
+  isActive    Boolean   @default(true)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  contractLinks CoursePlanMembershipContract[]
+}
+
+// ==========================================
+// 會員合約範本（總部管理；與私教 PTContract 分離）
+// ==========================================
+model MembershipContract {
+  id          Int      @id @default(autoincrement())
+  title       String
+  shortName   String?  // 頁面顯示用簡稱（過長標題時優先顯示）
+  purpose     String   @default("GENERAL") // GENERAL | NEW_MEMBER（新會員入會，自助註冊必簽） | BIOMETRICS_CONSENT（生物辨識，各至多一份啟用）
+  versionBase String   @default("V1") // 初版版本備註（建立時可編輯，之後鎖定）；修訂為 V1.1、V1.2…
+  status      String   @default("ACTIVE") // ACTIVE | VOIDED
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  versions   MembershipContractVersion[]
+  changeLogs MembershipContractChangeLog[]
+  promotions PromotionMembershipContract[]
+  coursePlans CoursePlanMembershipContract[]
+  signatures MemberContractSignature[]
+}
+
+model MembershipContractVersion {
+  id               Int      @id @default(autoincrement())
+  contractId       Int
+  contract         MembershipContract @relation(fields: [contractId], references: [id], onDelete: Cascade)
+  version          Int
+  body             String   @db.Text
+  /// 條文內容 SHA-256（簽署時比對，防事後竄改）
+  bodyHash         String?
+  changeNote       String?  // 建立此版本時的異動原因
+  status           String   @default("ACTIVE") // ACTIVE | VOIDED（大規模異動升版後前版作廢）
+  createdByStaffId Int?
+  createdAt        DateTime @default(now())
+
+  signatures MemberContractSignature[]
+  changeLogs MembershipContractChangeLog[]
+
+  @@unique([contractId, version])
+  @@index([contractId, status])
+}
+
+/** 合約操作歷程：每次異動必填原因；小幅修正不升版也會記錄 */
+model MembershipContractChangeLog {
+  id               Int      @id @default(autoincrement())
+  contractId       Int
+  contract         MembershipContract        @relation(fields: [contractId], references: [id], onDelete: Cascade)
+  versionId        Int?
+  version          MembershipContractVersion? @relation(fields: [versionId], references: [id], onDelete: SetNull)
+  action           String   // CREATE | UPDATE | BUMP_VERSION | VOID_CONTRACT | REACTIVATE
+  changeNote       String   @db.Text
+  summary          String?  // 變更摘要（標題／內容／升版等）
+  createdByStaffId Int?
+  createdAt        DateTime @default(now())
+
+  @@index([contractId, createdAt])
+}
+
+/**
+ * 電子合約全域稽核軌跡（append-only）
+ * 涵蓋範本異動、開啟、簽署、重簽、指派等；簽名快照可存於 detail
+ */
+model ContractAuditLog {
+  id           String   @id // CAL...
+  contractId   Int?
+  memberId     Int?
+  signatureId  Int?
+  versionId    Int?
+  /// CREATE | UPDATE | BUMP_VERSION | VOID | REACTIVATE | OPEN | ASSIGN | SIGN | RESIGN | VIEW
+  action       String
+  summary      String?
+  changeNote   String?  @db.Text
+  detail       Json?
+  actorStaffId Int?
+  /// STAFF | ADMIN | MEMBER | SYSTEM
+  actorType    String   @default("STAFF")
+  ipAddress    String?
+  userAgent    String?  @db.Text
+  createdAt    DateTime @default(now())
+
+  @@index([contractId, createdAt])
+  @@index([memberId, createdAt])
+  @@index([action, createdAt])
+}
+
+model PromotionMembershipContract {
+  promotionId Int
+  contractId  Int
+  promotion   Promotion          @relation(fields: [promotionId], references: [id], onDelete: Cascade)
+  contract    MembershipContract @relation(fields: [contractId], references: [id], onDelete: Cascade)
+
+  @@id([promotionId, contractId])
+}
+
+model CoursePlanMembershipContract {
+  coursePlanId Int
+  contractId   Int
+  coursePlan   CoursePlan          @relation(fields: [coursePlanId], references: [id], onDelete: Cascade)
+  contract     MembershipContract  @relation(fields: [contractId], references: [id], onDelete: Cascade)
+
+  @@id([coursePlanId, contractId])
+}
+
+model MemberContractSignature {
+  id                Int       @id @default(autoincrement())
+  memberId          Int
+  contractId        Int
+  contractVersionId Int
+  status            String    @default("PENDING") // PENDING | SIGNED
+  signatureData     String?   @db.Text // data:image/png;base64,...
+  /// 簽署當下條文 hash（應與版本 bodyHash 一致）
+  bodyHash          String?
+  ipAddress         String?
+  userAgent         String?   @db.Text
+  /// STAFF | MEMBER
+  actorType         String?
+  signedAt          DateTime?
+  staffId           Int?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  member          Member                     @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  contract        MembershipContract         @relation(fields: [contractId], references: [id], onDelete: Cascade)
+  contractVersion MembershipContractVersion  @relation(fields: [contractVersionId], references: [id], onDelete: Cascade)
+
+  @@unique([memberId, contractVersionId])
+  @@index([memberId, status])
+}
+
+// ==========================================
+// 4. 教練與權限系統
+// ==========================================
+model Trainer {
+  id          Int       @id @default(autoincrement())
+  /// 真實姓名（總部／內部作業）
+  name        String
+  /// 對外顯示名稱（會員／LINE／公開介面）；預設匿名
+  displayName String    @default("匿名")
+  phone       String    @unique
+  role        String    @default("NORMAL") // NORMAL(一般教練), MANAGER(主管教練)
+  isActive    Boolean   @default(true)
+  /// 綁定員工帳號：教練端僅能操作本人資料；總部 ADMIN 可跨教練
+  staffId     Int?      @unique
+  staff       Staff?    @relation(fields: [staffId], references: [id], onDelete: SetNull)
+
+  classes     Class[]
+  classSeries ClassSeries[]
+  ptContracts PTContract[] // 綁定該教練的私教合約
+  branches    TrainerBranch[] // 該教練可授課的分店
+  timeOffs    TrainerTimeOff[]
+  consultGuests ConsultGuest[]
+}
+
+// 教練排休／不可預約時段（會員與排課需避開）
+model TrainerTimeOff {
+  id               Int      @id @default(autoincrement())
+  trainerId        Int
+  trainer          Trainer  @relation(fields: [trainerId], references: [id], onDelete: Cascade)
+  startAt          DateTime
+  endAt            DateTime
+  /// 休假｜外出｜私人｜其他
+  reason           String   @default("休假")
+  note             String?
+  createdByStaffId Int?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@index([trainerId, startAt])
+  @@index([trainerId, endAt])
+}
+
+// 教練與分店的多對多權限中介表
+model TrainerBranch {
+  trainerId   Int
+  branchId    Int
+  trainer     Trainer   @relation(fields: [trainerId], references: [id], onDelete: Cascade)
+  branch      Branch    @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  
+  @@id([trainerId, branchId]) // 複合主鍵
+}
+
+// ==========================================
+// 5. 【全新】私教堂數合約 (PT Flow 核心)
+// ==========================================
+model PTContract {
+  id            Int       @id @default(autoincrement())
+  memberId      Int
+  trainerId     Int
+  member        Member    @relation(fields: [memberId], references: [id])
+  trainer       Trainer   @relation(fields: [trainerId], references: [id])
+  /// 購買分店（課程方案所屬）；私教上課僅限此店或 HP↔HR 共享場地
+  branchId      Int?
+  branch        Branch?   @relation(fields: [branchId], references: [id], onDelete: SetNull)
+
+  totalSessions Int       // 購買總堂數 (如: 24堂)
+  usedSessions  Int       @default(0) // 已扣堂數
+  pricePaid     Float     // 實際支付總金額
+
+  expiresAt     DateTime? // 合約到期日
+  isActive      Boolean   @default(true)
+  createdAt     DateTime  @default(now())
+
+  @@index([branchId])
+}
+
+// ==========================================
+// 6. 課程與排班 (升級：綁定場地與課程類型)
+// ==========================================
+
+/// 團課期班（GROUP）：開始～結束日期 × 每週幾 × 上課時段 → 展開多堂 Class
+model ClassSeries {
+  id        Int      @id @default(autoincrement())
+  title     String
+  type      String   @default("GROUP") // 目前僅 GROUP
+  venueId   Int
+  venue     Venue    @relation(fields: [venueId], references: [id])
+  stationId Int?
+  station   VenueStation? @relation(fields: [stationId], references: [id], onDelete: SetNull)
+  trainerId Int
+  trainer   Trainer  @relation(fields: [trainerId], references: [id])
+  capacity  Int      @default(12)
+  /// 期班開始日（台北日曆日）
+  startDate DateTime @db.Date
+  /// 期班結束日（含當日）
+  endDate   DateTime @db.Date
+  /// 每週幾：0=日 … 6=六（可多選）
+  weekdays  Int[]
+  /// HH:mm
+  startTime String
+  /// HH:mm
+  endTime   String
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  classes Class[]
+
+  @@index([trainerId, startDate])
+  @@index([venueId, startDate])
+}
+
+model Class {
+  id      Int    @id @default(autoincrement())
+  title   String // "館長諮詢", "1v1 深蹲特訓"
+  type    String // "CONSULT"(諮詢), "PRIVATE"(私教), "GROUP"(團課)
+
+  venueId Int // 【4.0 新增】在哪個場地上課
+  venue   Venue @relation(fields: [venueId], references: [id])
+
+  stationId Int? // 場地內站點（可空＝未指定細項）
+  station   VenueStation? @relation(fields: [stationId], references: [id], onDelete: SetNull)
+
+  trainerId Int
+  trainer   Trainer @relation(fields: [trainerId], references: [id])
+
+  /// 所屬期班（團課期班展開之單堂）；私教／諮詢為 null
+  seriesId Int?
+  series   ClassSeries? @relation(fields: [seriesId], references: [id], onDelete: Cascade)
+
+  startAt DateTime
+  endAt   DateTime
+
+  capacity Int @default(1)
+
+  reservations Reservation[]
+
+  @@index([seriesId])
+  @@index([trainerId, startAt])
+}
+
+model Reservation {
+  id             Int           @id @default(autoincrement())
+  /// 正式會員預約；諮詢客人可為空
+  memberId       Int?
+  member         Member?       @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  /// 諮詢客人（姓名＋電話，尚未開通會員亦可）
+  consultGuestId Int?
+  consultGuest   ConsultGuest? @relation(fields: [consultGuestId], references: [id], onDelete: SetNull)
+  classId        Int
+  class          Class         @relation(fields: [classId], references: [id], onDelete: Cascade)
+  status         String        @default("PENDING")
+  /// MEMBER | LINE | TRAINER | CONSULT_GUEST
+  source         String        @default("TRAINER")
+  bookedAt       DateTime      @default(now())
+
+  @@index([classId, status])
+  @@index([memberId, status])
+  @@index([consultGuestId])
+}
+
+/// 諮詢客人（教練代登姓名／電話；可之後綁定正式會員）
+model ConsultGuest {
+  id        Int      @id @default(autoincrement())
+  name      String
+  phone     String
+  note      String?
+  trainerId Int
+  trainer   Trainer  @relation(fields: [trainerId], references: [id], onDelete: Cascade)
+  /// 若電話已是會員或之後開通，可連結
+  memberId  Int?
+  member    Member?  @relation(fields: [memberId], references: [id], onDelete: SetNull)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  reservations Reservation[]
+
+  @@unique([trainerId, phone])
+  @@index([phone])
+  @@index([trainerId, isActive])
+}
+
+model Order {
+  id            String   @id // 必須是 String，因為你的訂單編號是 TYK 開頭
+  memberId      Int
+  amount        Float    // 台幣通常用整數，但對應你程式碼裡的 parseFloat
+  itemDesc      String
+  payMethod     String?  // 複合：CASH+CARD+VOUCHER
+  payBreakdown  Json?
+  voucherCode   String?
+  cardAmount    Float    @default(0)
+  /// 刷卡模式：LUMP（一次付清）｜INSTALLMENT（分期）｜RECURRING（定期定額）
+  cardMode      String?  @default("LUMP")
+  /// 分期期數（3/6/9/12/18/24/30）；僅 INSTALLMENT
+  cardInst      Int?
+  /// 定期定額週期：W｜M｜Y
+  periodType    String?
+  /// 定期定額總期數；0 或不設＝不限
+  periodTimes   Int?
+  /// 續扣基準金額（定期定額）；未設則用 cardAmount／amount
+  recurringAmount Float?
+  /// PayUNi CreditHash（約定扣款 Token）
+  creditHash    String?
+  carrierNum    String?  // 發票載具（手機條碼／自然人憑證）
+  buyerUbn      String?  // 公司統編（B2B）
+  loveCode      String?  // 發票捐贈碼（愛心碼）
+  status        String   @default("PENDING") // 狀態：PENDING, PAID, FAILED
+  merchantNo    String?  // 統一金流端產生的交易序號
+  invoiceNumber String?  // ezPay 回傳的電子發票字軌號碼
+  /// 合併結帳工作階段（CHK…）
+  checkoutSessionId String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  // 關聯設定：一筆訂單屬於一個會員
+  member        Member   @relation(fields: [memberId], references: [id])
+
+  @@index([invoiceNumber])
+  @@index([checkoutSessionId])
+  @@index([status, createdAt])
+  @@index([memberId, createdAt])
+}
+
+// ==========================================
+// 信用卡定期定額訂閱（首期 UPP 綁 Token，後續幕後 CreditHash 扣款）
+// ==========================================
+model CardSubscription {
+  id             String   @id // CRS...
+  memberId       Int
+  member         Member   @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  promotionId    Int
+  promotion      Promotion @relation(fields: [promotionId], references: [id])
+  /// 首期訂單編號（TYK…）
+  originOrderId  String?
+  creditHash     String
+  amount         Float // 每期扣款金額
+  periodType     String // W | M | Y
+  /// 總扣款期數；0＝不限（含首期）
+  periodTimes    Int      @default(0)
+  /// 已成功扣款次數（含首期）
+  chargedCount   Int      @default(1)
+  /// ACTIVE | PAUSED | CANCELLED | COMPLETED | FAILED
+  status         String   @default("ACTIVE")
+  nextChargeAt   DateTime
+  lastChargeAt   DateTime?
+  failCount      Int      @default(0)
+  lastError      String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  charges        CardSubscriptionCharge[]
+  leaves         MemberLeave[]
+
+  @@index([status, nextChargeAt])
+  @@index([memberId])
+  @@unique([originOrderId])
+}
+
+/// 無限使用（訂閱制月卡）請假：效期預先順延、定期定額暫停並順延 nextChargeAt
+model MemberLeave {
+  id                 Int       @id @default(autoincrement())
+  memberId           Int
+  member             Member    @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  subscriptionId     String?
+  subscription       CardSubscription? @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
+  /// 申請請假天數
+  days               Int
+  startAt            DateTime
+  endAt              DateTime
+  /// 請假開始前的效期快照
+  expireDateBefore   DateTime?
+  /// 請假開始前的下次扣款時間快照
+  nextChargeAtBefore DateTime?
+  /// ACTIVE=請假中 | ENDED=已結束（含提早銷假）| CANCELLED=作廢
+  status             String    @default("ACTIVE")
+  reason             String?
+  staffId            Int?
+  createdAt          DateTime  @default(now())
+  endedAt            DateTime?
+
+  @@index([memberId, status])
+  @@index([status, endAt])
+}
+
+model CardSubscriptionCharge {
+  id             String   @id // CRC...
+  subscriptionId String
+  subscription   CardSubscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+  /// 本期對應 Order（續扣建立）
+  orderId        String?
+  merchantNo     String?
+  amount         Float
+  /// 期別序號（2 起；1 為首期 UPP，不寫入此表或寫 SUCCESS 紀錄）
+  periodIndex    Int
+  /// PENDING | PAID | FAILED
+  status         String   @default("PENDING")
+  errorMessage   String?
+  attemptedAt    DateTime @default(now())
+  paidAt         DateTime?
+
+  @@unique([subscriptionId, periodIndex])
+}
+
+// ==========================================
+// 7. 進銷存：商品 / 庫存流水 / 進貨 / 銷貨（與 Promotion 儲值分離）
+// ==========================================
+model Product {
+  id          Int      @id @default(autoincrement())
+  branchId    Int
+  branch      Branch   @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  sku         String
+  name        String
+  /// PHYSICAL=實體控庫存 | SERVICE=服務類不控庫存（禁進貨／盤點／安全庫存預警）
+  productKind String   @default("PHYSICAL")
+  price       Float // 售價（後端權威，前端禁自填金額）
+  cost        Float    @default(0) // 參考成本
+  stockQty    Int      @default(0)
+  /// 安全庫存（僅 PHYSICAL）；低於等於時 HQ 預警。SERVICE 必須為 null
+  safetyStock Int?
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  movements     StockMovement[]
+  purchaseItems PurchaseItem[]
+  saleItems     SaleItem[]
+
+  @@unique([branchId, sku])
+}
+
+model StockMovement {
+  id        Int      @id @default(autoincrement())
+  productId Int
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  type      String // IN | OUT | ADJUST
+  qty       Int // 正整數；方向由 type 決定（STOCKTAKE 校正差額可為 0）
+  unitCost  Float?
+  refType   String? // PURCHASE | SALE | SALE_CANCEL | LOSS(盤損) | GAIN(盤盈) | STOCKTAKE(盤點校正) | ADJUST
+  refId     String?
+  note      String?
+  staffId   Int?
+  createdAt DateTime @default(now())
+}
+
+model PurchaseOrder {
+  id         String   @id // POH...
+  branchId   Int
+  branch     Branch   @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  supplier   String?
+  status     String   @default("RECEIVED") // 本階段進貨即入庫
+  totalCost  Float    @default(0)
+  note       String?
+  staffId    Int?
+  createdAt  DateTime @default(now())
+  items      PurchaseItem[]
+}
+
+model PurchaseItem {
+  id              Int           @id @default(autoincrement())
+  purchaseOrderId String
+  purchaseOrder   PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  productId       Int
+  product         Product       @relation(fields: [productId], references: [id])
+  qty             Int
+  unitCost        Float
+  lineCost        Float
+}
+
+model SaleOrder {
+  id            String   @id // SAL...
+  branchId      Int
+  branch        Branch   @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  memberId      Int?
+  member        Member?  @relation(fields: [memberId], references: [id])
+  payMethod     String // 複合：CASH+CARD+VOUCHER 等
+  payBreakdown  Json? // { CASH: 100, CARD: 200, WALLET_CASH: 0, VOUCHER: 50 }
+  voucherCode   String? // 抵用券條碼
+  status        String   @default("PENDING") // PENDING | PAID | CANCELLED
+  amount        Float // 訂單總額
+  cardAmount    Float    @default(0) // 刷卡待收／已收部分（複合時）
+  cardMode      String?  @default("LUMP") // LUMP | INSTALLMENT | RECURRING
+  cardInst      Int?
+  periodType    String?
+  periodTimes   Int?
+  creditHash    String?
+  itemDesc      String
+  merchantNo    String?
+  invoiceNumber String?
+  carrierNum    String? // 發票載具（手機條碼／自然人憑證）
+  buyerUbn      String? // 公司統編（B2B）
+  loveCode      String? // 發票捐贈碼（愛心碼）
+  staffId       Int?
+  /// 合併結帳工作階段（CHK…）；有值時發票由 CheckoutSession 統一開立
+  checkoutSessionId String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  items         SaleItem[]
+
+  @@index([branchId, status, createdAt])
+  @@index([checkoutSessionId])
+  @@index([invoiceNumber])
+}
+
+// ==========================================
+// 臨櫃合併結帳：商品 + 購案同一筆付款／發票（PayUNi MerTradeNo = CHK…）
+// ==========================================
+model CheckoutSession {
+  id              String   @id // CHK...
+  branchId        Int?
+  branch          Branch?  @relation(fields: [branchId], references: [id])
+  memberId        Int?
+  member          Member?  @relation(fields: [memberId], references: [id])
+  amount          Float // 購物車查價合計（首期應付）
+  itemDesc        String
+  payMethod       String?
+  payBreakdown    Json?
+  voucherCode     String?
+  cardAmount      Float    @default(0)
+  cardMode        String?  @default("LUMP")
+  cardInst        Int?
+  periodType      String?
+  periodTimes     Int?
+  /// 定期定額續扣金額（可與首期刷卡額不同）
+  recurringAmount Float?
+  creditHash      String?
+  carrierNum      String?
+  buyerUbn        String?
+  loveCode        String?
+  status          String   @default("PENDING") // PENDING | PAID | FAILED | CANCELLED
+  merchantNo      String?
+  invoiceNumber   String?
+  saleOrderId     String?  @unique
+  orderId         String?  @unique
+  /// 私教課程購物車快照：[{ coursePlanId, name, qty, unitPrice, lineTotal, sessions, totalSessions, branchId }]
+  ptItems         Json?
+  trainerId       Int?
+  /// 刷卡成功後是否已建立 PTContract（idempotent）
+  ptFulfilled     Boolean  @default(false)
+  staffId         Int?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([status])
+  @@index([memberId])
+}
+
+model SaleItem {
+  id          Int       @id @default(autoincrement())
+  saleOrderId String
+  saleOrder   SaleOrder @relation(fields: [saleOrderId], references: [id], onDelete: Cascade)
+  productId   Int
+  product     Product   @relation(fields: [productId], references: [id])
+  name        String // 成交快照
+  unitPrice   Float
+  qty         Int
+  lineTotal   Float
+}
+
+/// ezPay 折讓單稽核／列印用快照（開立成功後寫入）
+model InvoiceAllowance {
+  id              String   @id // IAL…
+  /// ezPay 折讓號
+  allowanceNo     String   @unique
+  invoiceNumber   String
+  merchantOrderNo String
+  orderId         String?
+  saleOrderId     String?
+  memberId        Int?
+  memberName      String?
+  itemDesc        String?
+  untaxedAmt      Float
+  taxAmt          Float
+  totalAmt        Float
+  remainAmt       Float?
+  buyerEmail      String?
+  /// REFUND | CANCEL_SALE | SUB_CANCEL | MANUAL
+  source          String   @default("REFUND")
+  staffId         Int?
+  /// 列印用營業人（開立當下快照）
+  sellerName      String?
+  sellerUbn       String?
+  sellerAddress   String?
+  createdAt       DateTime @default(now())
+
+  @@index([invoiceNumber])
+  @@index([orderId])
+  @@index([createdAt])
+}
+
+// 廠館員工與管理員表
+model Staff {
+  id        Int      @id @default(autoincrement())
+  
+  // 登入憑證 (嚴格禁止使用員工私人 LINE 綁定，一律配發內部帳號)
+  account   String   @unique
+  password  String   // 這裡之後會存 bcrypt 加密後的雜湊值，絕對不存明碼
+  
+  // 基本資料
+  /// 真實姓名（總部／交接班／內部作業）
+  name      String
+  /// 對外／側欄顯示名稱；預設匿名
+  displayName String @default("匿名")
+  
+  // 權限控管：ADMIN 總部 / MANAGER 店長 / DUTY 值星 / STAFF 櫃檯
+  // 交易異動僅 DUTY 以上
+  role      String   @default("STAFF")
+
+  // 綁定分店（ADMIN 可為 null 表示全連鎖；STAFF/DUTY/MANAGER 必填）
+  branchId  Int?
+  branch    Branch?  @relation(fields: [branchId], references: [id])
+
+  // 模組權限：ops | pt | trainer（ADMIN 忽略，視為全開）
+  permissions String[] @default([])
+  
+  // 帳號狀態 (離職或調職時直接設為 false，保留操作歷史不刪除帳號)
+  isActive  Boolean  @default(true)
+
+  /// 若此員工為教練，一對一綁定 Trainer 個人工作區
+  trainerProfile Trainer?
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+/// 櫃檯交接班結算（錢櫃現金對帳）
+model ShiftHandover {
+  id              String   @id // SHF…
+  branchId        Int
+  branch          Branch   @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  openedByStaffId Int
+  openedByName    String
+  closedByStaffId Int?
+  closedByName    String?
+  startedAt       DateTime
+  endedAt         DateTime?
+  /// OPEN | CLOSED
+  status          String   @default("OPEN")
+  /// MORNING | MIDDAY | EVENING（早／中／晚）
+  slot            String?
+  /// 開班錢櫃底金（預設沿用上一班實點）
+  openingFloat    Float    @default(0)
+  /// 系統應有現金＝底金＋班內現金收入
+  expectedCash    Float?
+  /// 交班實點現金
+  countedCash     Float?
+  /// counted − expected
+  variance        Float?
+  payMixSnapshot  Json?
+  summarySnapshot Json?
+  note            String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([branchId, status])
+  @@index([branchId, startedAt])
+  @@index([branchId, slot, startedAt])
+}

@@ -1,0 +1,15 @@
+{
+  "name": "gymsaas",
+  "private": true,
+  "description": "體育客 GymSaaS monorepo（前後端絕對分離）",
+  "scripts": {
+    "dev:api": "npm run dev --prefix backend",
+    "dev:web": "npm run dev --prefix frontend",
+    "setup:api": "npm run setup --prefix backend",
+    "build:web": "npm run build --prefix frontend",
+    "db:push": "npm run db:push --prefix backend",
+    "db:generate": "npm run db:generate --prefix backend",
+    "db:studio": "npm run db:studio --prefix backend",
+    "db:seed": "npm run db:seed --prefix backend"
+  }
+}

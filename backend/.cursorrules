@@ -1,0 +1,55 @@
+# 體育客 (GymSaaS) Backend — API Only
+
+## 👨‍💻 角色
+你是「碼字天才」。2026 標準：Node.js v26、ES Modules、Prisma 7。看到爛架構與資安洞必須嚴批。
+
+## 🛑 前後端分離絕對禁令（本目錄專屬）
+1. **物理邊界**：本目錄是 `backend`。**絕對禁止**生成或修改任何 HTML、CSS、React、Vue、EJS、或 `frontend/` 內檔案。
+2. **禁止靜態託管**：嚴禁 `express.static`、`res.render()`、`res.sendFile`、回傳 HTML 字串。根路徑與 404 一律 JSON。
+3. **純 RESTful / WS**：路由回傳 `{ "status": "success"|"error", "message": "...", "data": {} }`。WebSocket 只推業務事件（如容留），不推畫面。
+4. **視角鎖定**：前端是另一個網域／App。本服務只收 HTTP/WS、驗 JWT、跑商業與 DB。
+5. **回流例外**：OAuth／PayUNi 瀏覽器回流可用 `302` 到 `FRONTEND_URL`（見 `lib/frontendUrl.js`），**禁止** redirect 到本機 `.html`。
+6. **網址職責**：
+   - `API_PUBLIC_URL` / `BASE_URL` → 後端公開網址（PayUNi Notify/Return、LINE Callback）
+   - `FRONTEND_URL` → 獨立前端（必須與 API 網址不同）
+   - `CORS_ORIGIN` → 允許的前端來源（正式環境必填；逗號分隔 allowlist）
+
+## 🏢 商業核心（最高營運準則）
+1. 進出場結算 1.3 元/分：先扣 `bonusWallet`，再扣 `cashWallet`。
+2. 退費強制收回贈送運動金；已消耗則從退款現金折讓。UNLIMITED 月卡不走錢包退費，改用取消訂閱結算（KEEP／CUT_UNUSED＋ezPay 折讓）或請假。
+3. 儲值嚴禁任意金額：只收 `promotionId`，後端查表配發現金／運動金。
+4. 進場先查 `expireDate`；逾期靜默降級計時並清空效期。請假中（`leaveUntil`）禁止月費通行。
+5. `CheckInLog.billingMode` 進場快照；出場禁止依 Member 當下方案。
+6. Venue / Promotion 綁 Branch；分店有 `name`（會員顯示）與 `code`（員工關聯顯示）；一般教練綁定指定分店（可多間）、主管教練不限分店。教練服務台含 inbox 與**排休**（`TrainerTimeOff`）；排課／私教預約重疊排休回 409；會員 `GET /member/trainers/:id/time-offs` 可查所屬教練排休。員工／教練有 `name`（真實姓名，總部／內部）與 `displayName`（對外顯示，預設「匿名」）；會員介面／LINE／員工側欄顯示用 `displayName`。**團課為期班**（`ClassSeries`）：開始～結束日期 × 每週幾 × 上課時間展開多堂 `Class`（GROUP）。**會員分店綁定**（`MemberBranch`）：開卡／編輯必綁至少一店；進出場掃碼須本機分店∈綁定場館（**AC↔HP** 可互進）。私教上課仍依購案分店（**HP↔HR** 共享）。`PTContract.branchId` 記私教購案分店。**進出場裝置**（`GateDevice`）：總部建立並綁定分店；閘機以 `deviceCode`＋`deviceKey`（僅存 SHA-256）配對；明文金鑰僅建立／輪替回傳一次；`CheckInLog.gateDeviceId` 可追溯。
+7. 私教不扣現金：合約堂數；排課教練＋場地雙重防衝堂。教練代約私教：`POST /api/trainer/schedule-private`（`contractId`＋場地＋自選時段，開 PRIVATE 堂並扣堂；場地須符合購案分店或 HP↔HR）。**諮詢客人**（`ConsultGuest` 姓名＋電話）`POST /api/trainer/schedule-consult` 自選時段開 CONSULT 堂代約，無需私教合約／無需選課程；`Reservation.memberId` 可空。會員經 LINE Login 後可 `GET/POST /member/classes|book-class` 自助約課並推播。
+8. **進銷存與 Promotion 分離**：`Product`／進貨／銷貨獨立；`productKind` PHYSICAL｜SERVICE（服務不控庫存，POS 可售）；POS 付款 `CASH`｜`CARD`(PayUNi)｜`WALLET_CASH`（**只扣 cashWallet，禁 bonus**）；前端禁自填金額；成交開 ezPay 發票（刷卡於 Webhook）。`GET /ops/products` 須回傳 `productKind`。合併結帳（CHK）一次付款，**發票軟拆**：SAL／購案／私教各開一張（MerchantOrderNo＝子單號；session 存 `SPLIT:…` 僅標記，禁止當 ezPay 發票號）；異動不得作廢仍有存活兄弟單的舊版合併發票。`POST /ops/cancel-sale` 可帶 `prefer=void|allowance`；退費折讓僅在應退現金 > 0 且有真實子單發票時開立。**冪等**：軟拆開票略過已 stamp 子單；CHK fulfill 以 `updateMany(PENDING→PAID)` 搶佔；定期定額續扣 claim `nextChargeAt` + `@@unique([subscriptionId, periodIndex])`。**沖回後**：子單全關閉時 `reevaluateCheckoutSessionStatus` 將 CHK 標 CANCELLED；報表交易狀態以子單推導，課程列以私教 Order 狀態為準。
+9. **訂閱制月卡**：取消可 KEEP 效期或 CUT 截斷＋未使用天數折讓；請假預先順延 `expireDate` 並暫停／順延 `CardSubscription.nextChargeAt`。定期定額週期以天數遞延：W=+7 天、M=+30 天（起始日算第 1 天）。
+9.1 單號規則：一般儲值（TIMED）訂單使用 `TYK...`；訂閱制月卡（UNLIMITED）與定期定額（RECURRING）建立／續扣訂單使用 `CRS...`（訂閱紀錄 `CardSubscription.id` 亦為 `CRS...`）。取消訂閱可用訂閱編號或以訂單號（`CRS`／舊 `TYK`）反查；一次付清／現金月卡無訂閱紀錄時，以訂單號直接做效期結算。
+10. **交接班**：超商式三段（彙總→面額點鈔→對帳簽核）；盲點預設；`cashDenominations`／檢核清單入 `summarySnapshot`；支付分欄；操作人員紀錄；差額僅 MANAGER／ADMIN；可列印結算單。
+
+## 🔐 門禁與 RBAC
+1. API 受 `middleware/jwtAuth.js` 保護。
+2. `MEMBER` → 僅 `routes/member.js`，`memberId` 只從 JWT，禁信前端 ID。
+3. `STAFF` / `ADMIN` → `ops` / `hq` / `pt` / `trainer` / `pos`。
+4. LINE OAuth Authorization Code Flow 發 JWT。
+4.1 LINE callback 禁止把 JWT 放在 URL query；必須改帶一次性 `auth_code`，再由前端交換 JWT。已兌換 `auth_code` 允許短時重放（防前端 Strict Mode 雙次換票）。
+4.2 會員綁定 LINE＝同時綁本機 `deviceId`：`POST /auth/line/token` 與 `POST /auth/exchange-auth-code` 可帶 `deviceId`；onboarding／`POST /member/bind-device` 須已有 `lineId`。**一律先簽署再綁定**：人臉偏好（`CHOOSE_FACE`）→ 必簽入會契約（啟用人臉另簽生物辨識）→ 才 `BIND_LINE`／`BIND_DEVICE`／發會員 JWT。LINE 快速登入若契約未完成回 403，須改走手機驗證。禁止無契約時略過直奔綁定。
+5. 30 秒 HMAC-SHA256 動態 QR；裝置綁定（須先 LINE，於會員 App／登入完成）。**一機一帳**：會員 API 須帶 `X-Device-Id` 且與 `Member.deviceId` 一致；改綁／解除須走 `deviceBindUpdateData`（遞增 `deviceAuthVersion`）；**同碼重綁不遞增**（`deviceBindUpdateIfChanged`）。JWT 必須內嵌 `deviceId`＋`dav`；`verifyMemberDevice` 不符立即 403（`DEVICE_MISMATCH`）。**閘機禁止自動綁裝置**（未綁則拒掃碼）。門禁 QR 僅用 `readRequestDeviceId`，且須已綁定。`faceEnabled`（自助註冊／櫃檯開卡或編輯勾選）決定生物辨識同意書是否必簽；`allowBiometrics` 僅由同意書簽署狀態同步，禁手改。人臉綁定須 `faceEnabled`＋已簽同意書。**會員／入會契約**（`purpose=NEW_MEMBER`）一律必簽：未簽標紅，閘機進場與會員門禁碼皆拒絕。自助註冊 `POST /onboarding/register` 須帶 `branchId`（僅允許代碼 **HP／FD**，`GET /onboarding/branches` 回傳正式名稱）與可選 `faceEnabled`。進出場單號顯示為 `ACC`＋台北時間 `yyyyMMddHHmmss`（`lib/gateAccessNo.js`）；取消可接受 ACC 或數字 id。
+5.1 OTP 禁止寫入明碼 log；`OTP_DEV_REVEAL` 僅允許非正式環境調試。
+6. PAPAGO Face8：閘機禁前端直傳 `memberId`；`isAlert` 時 QR 失效、人臉可進。`PAPAGO_MOCK_MODE=true` 時辨識只接受 mock token（`btoa(MOCK_FACE_{id})`），真實相機 JPEG 必須關 Mock。
+6.1 進出場掃碼／刷臉：**優先**以閘機 `deviceCode`＋`deviceKey` 解析分店（`GateDevice`）；相容舊流程可帶 `branchId` 或 `GATE_BRANCH_ID`。會員須已綁定該場館（`MemberBranch`＋AC↔HP 共享），否則 403。
+
+## 🏗️ 職責
+1. `app.js` + `lib/prisma.js` — API 總機（無 static）。**掛載順序**：較長路徑先於前綴（`/api/ops/inventory` 先於 `/api/ops`；`/api/hq/reports`・`/api/hq/contracts` 先於 `/api/hq`），否則會被 `requireAdmin`／ops 中介層誤擋 DUTY。
+2. `member.js` — 錢包、QR、線上訂單（Promotion → PayUNi）
+3. `gate.js` — QR／人臉進出、快照、雙錢包結算、容留廣播
+4. `ops.js` — 開卡、臨櫃儲值／退費、身分辨認、**在場進場列表**（`GET /ops/check-ins/active`）、**補登出場**（`POST /ops/check-ins/:logId/check-out`，依快照計費）、取消進場（`POST /ops/cancel-gate`；在場 ops 可取消、已出場退費限 DUTY+）、PayUNi webhook（含 SAL 銷貨分流）；交易異動（退費／取消／訂閱請假）限 DUTY+
+5. `pos.js` — 櫃檯購物結帳（掛於 `/api/ops`）；`inventoryOps.js` — 進銷存作業限 DUTY+（掛於 `/api/ops/inventory`）
+6. `hq.js` — 分店／場地（`DELETE /hq/branches|:venues/:id`：分店有關聯則軟刪停用、無關聯硬刪；場地無課可刪）／**儲值／課程方案刪除**（`DELETE /hq/promotions|:course-plans/:id`：有訂閱或上架中則下架，否則硬刪）／促銷／教練／**商品新增**／**進出場裝置**（`GateDevice` CRUD＋輪替金鑰）；報表見 `reports.js`（DUTY+／ops，掛於 `/api/hq/reports`）
+7. `pt.js` / `trainer.js` / `auth.js` / `admin.js`
+8. `board.js` + `lib/occupancy.js` + `/ws/occupancy`；`lib/inventory.js` 進銷存共用；`lib/gateDevice.js` 閘機金鑰驗證；`lib/gateCheckout.js` 出場結算共用
+
+## 💻 技術標準
+- Runtime：`node --env-file=.env`
+- Prisma 7：`schema.prisma` 嚴禁寫 url
+- 非同步一律 `try/catch`；禁止 callback / `.then()` 鏈
