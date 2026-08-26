@@ -10,6 +10,10 @@
     "db:push": "npm run db:push --prefix backend",
     "db:generate": "npm run db:generate --prefix backend",
     "db:studio": "npm run db:studio --prefix backend",
-    "db:seed": "npm run db:seed --prefix backend"
+    "db:seed": "npm run db:seed --prefix backend",
+    "lint": "npm run lint:web && npm run lint:api",
+    "lint:web": "npm run lint --prefix frontend",
+    "lint:api": "npm run check:lint --prefix backend",
+    "doctor:api": "npm run doctor --prefix backend"
   }
 }

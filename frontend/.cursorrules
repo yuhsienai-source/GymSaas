@@ -19,14 +19,16 @@
 ## 🏢 商業規則（前端必須配合的產品約束）
 1. 雙錢包展示：現金 / 運動金分開顯示；扣款順序由後端決定，前端不可「先扣現金」。**方案文案**加贈顯示為 `SC $金額`（`formatScAmount`／`formatPromotionValue`）；**會員頁**錢包與說明仍用「運動金」。
 2. 促銷方案列表來自 API；結帳導向後端回傳的 PayUNi `actionUrl` + `payload` 表單 POST。
-3. 警示帳號：QR 區應顯示不可用，引導櫃檯／人臉。自助流程**一律先簽署再綁定**：人臉偏好 → 必簽會員契約（啟用則加簽生物辨識）→ LINE／裝置。會員／入會契約必簽未簽標紅，且不得產生門禁碼／進場。LINE 快速登入若未簽完會被拒，須改走手機驗證。禁止「略過簽署」。櫃檯開卡／編輯同理；綁定人臉須已啟用＋已簽同意書。
+3. 警示帳號：QR 區應顯示不可用，引導櫃檯／人臉。**解除 isAlert** 僅能經總部合規補償 API／「合規補償」分頁（必填 reason）；櫃檯不可自行取消警示。自助流程**一律先簽署再綁定**：人臉偏好 → 必簽會員契約（啟用則加簽生物辨識）→ LINE／裝置。會員／入會契約必簽未簽標紅，且不得產生門禁碼／進場。LINE 快速登入若未簽完會被拒，須改走手機驗證。禁止「略過簽署」。櫃檯開卡／編輯同理；綁定人臉須已啟用＋已簽同意書。
+3.1 儲值／補償運動金／補償課程：前端**禁止自填金額或堂數**；可售方案只送 `promotionId`／`coursePlanId`；客訴補償僅能選 `kind=COMPENSATION` 專案再呼叫 HQ compensate-bonus／compensate-course。補償贈送私教合約會標 `source=COMPENSATION`，與付費購案區隔顯示。
 4. 容留看板：連 `/ws/occupancy` 或 `GET /api/board/occupancy`，不偽造人數。
 5. **POS 購物**：只傳 `productId` + `qty` + `payMethod`（+必要時 `memberId`），**禁止自填金額**；`WALLET_CASH` 禁用運動金；刷卡用後端 payload 導向 PayUNi。合併結帳一次付款，發票由後端**分腿開立**（商品／購案／私教各一張）。
 6. **分店歸屬**：會員開卡／編輯須綁定分店。閘機 `/gate` 以總部建立的**裝置代碼＋金鑰**配對（優先掃配對 QR，亦可手動；存 `localStorage` `gymsaas_gate_pair`，重開自動還原；**網路暫時失敗不清除配對**，僅金鑰失效／手動解除才重綁）；進出場送 `deviceCode`／`deviceKey`，禁止前端任意選店當主流程。會員須已綁定該場館（AC↔HP 可互進）。私教代約場地依購案分店（HP↔HR 可互用）。
 7. **會員 LINE＝本機裝置**：`exchangeLineCode`／`exchangeAuthCallbackCode` 必須帶 `getOrCreateDeviceId()`；綁定 LINE 成功即視為綁裝置。登入回流須 **await** 裝置確認（同機不 bump `dav`）並以回傳 token 更新 context，禁止 fire-and-forget。獨立「綁裝置」僅補缺；未綁 LINE 不可只綁裝置。自助註冊須選綁定分店（僅 HP／FD，UI 顯示正式名稱）。會員 API 一律送 `X-Device-Id`；收到 `DEVICE_MISMATCH` 須清 JWT 並硬導回登入。閘機掃碼不自動綁會員手機。
 
 ## 🏗️ 頁面職責（建議）
-- `/` 入口、`/member/*` 會員（含 `/member/book` LINE 約課）、`/gate` 閘機（**單一路相機**同時刷臉＋軟體解 QR，禁再開第二路 getUserMedia；配對可另掃總部 QR）、`/staff/*` 員工後台（HQ「進出場裝置」＋「團課管理」；櫃檯維運「進場會員」列表可取消入場／補登出場；交易異動一般報表列可取消沖回／退費折讓並顯示／列印折讓單據號碼；「折讓單據」僅以單號查詢，旁側「退費折讓一覽」）、`/board` 看板
+- `/` 入口、`/member/*` 會員（含 `/member/book` LINE 約課）、`/gate` 閘機（**單一路相機**同時刷臉＋軟體解 QR，禁再開第二路 getUserMedia；配對可另掃總部 QR）、`/staff/*` 員工後台（HQ「進出場裝置」＋「團課管理」＋「合規補償」；櫃檯維運「進場會員」列表可取消入場／補登出場；交易異動一般報表列可取消沖回／退費折讓並顯示／列印折讓單據號碼，頁面上方說明兩者使用規則；「折讓單據」僅以單號查詢，旁側「退費折讓一覽」）、`/board` 看板
+- 員工後台 UX：側欄收合＋hover 展開標籤；**Ctrl/⌘K** 全域搜尋（會員用 `GET /ops/members?lite=1&q=`，不預載全表）；閘機失敗 Toast／紅框可帶「續約」深連 `/staff/ops?tab=checkout&memberId=`；教練課表週曆拖拉改期；HQ 銷售分析單線圖＋hover Tooltip
 - `/auth/callback`、`/pay/return` 專責回流，不塞業務表單
 - 教練代約：私教學員（自動帶入購買合約＋自選日期／時間）｜諮詢客人（姓名＋電話＋時段，無需選課程）
 
@@ -35,4 +37,5 @@
 - 路由頁面以 `React.lazy` + `Suspense` 分 chunk（閘機 QR／HQ 勿與登入同包）
 - 金流按鈕須同步 ref 防連點（`checkoutInFlight` 等），不只靠 `useState` busy
 - 與現有 UI／context／router 風格一致；不引入第二套狀態管理除非必要
+- **視覺語言**：Adaptive Tech-Sport。管理端／閘機：運動海軍藍 `#1A2332`＋玻璃擬態卡片＋螢光Mint CTA；會員端：亮灰內容（約 80%）＋深色頂欄（約 20%）、錢包卡螢光漸層。QR／簽章預覽可保留白底。禁止會員端再回退成全站極黑。
 - 環境：可用 `VITE_API_BASE_URL`（預設走相對路徑 `/api` 由 proxy 轉發）；開發 proxy 見 `VITE_PROXY_API`

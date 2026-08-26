@@ -263,7 +263,7 @@ export default function MemberDashboardPage() {
         </Card>
       )}
 
-      <div className="wallet-row">
+      <div className="wallet-row bento-grid--compact">
         {loading ? (
           <>
             <Skeleton className="skeleton--stat" />
@@ -292,7 +292,7 @@ export default function MemberDashboardPage() {
         <p className="text-sm text-muted mt-sm">計時 1.3 元/分 · 優先扣運動金</p>
       </Card>
 
-      <Card title="私教合約" subtitle="購課後依堂數扣減，不扣零錢包">
+      <Card title="私教合約" subtitle="購課或總部補償贈送後依堂數扣減，不扣零錢包">
         {loading ? (
           <Skeleton style={{ height: 60 }} />
         ) : contracts.length === 0 ? (
@@ -304,11 +304,19 @@ export default function MemberDashboardPage() {
               <div key={c.id} className="contract-card">
                 <div className="contract-card__head">
                   <strong>{c.trainer.name}</strong>
-                  <Badge tone={c.isActive ? 'success' : 'neutral'}>
-                    {c.isActive ? '有效' : '失效'}
-                  </Badge>
+                  <div className="btn-row" style={{ gap: 6 }}>
+                    {c.source === 'COMPENSATION' ? (
+                      <Badge tone="info">補償贈送</Badge>
+                    ) : (
+                      <Badge tone="neutral">付費</Badge>
+                    )}
+                    <Badge tone={c.isActive ? 'success' : 'neutral'}>
+                      {c.isActive ? '有效' : '失效'}
+                    </Badge>
+                  </div>
                 </div>
                 <p className="text-sm text-muted" style={{ marginBottom: '0.5rem' }}>
+                  {c.coursePlanName ? `${c.coursePlanName} · ` : ''}
                   剩餘 {c.remainingSessions} / {c.totalSessions} 堂
                 </p>
                 <div className="contract-card__bar">

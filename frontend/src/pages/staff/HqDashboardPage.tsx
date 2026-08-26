@@ -20,6 +20,7 @@ import type {
   Venue,
 } from '../../types/api';
 import HqBranchesTab from './hq/HqBranchesTab';
+import HqCompensationTab from './hq/HqCompensationTab';
 import HqContractsTab from './hq/HqContractsTab';
 import HqCoursePlansTab from './hq/HqCoursePlansTab';
 import HqGateDevicesTab from './hq/HqGateDevicesTab';
@@ -168,6 +169,9 @@ export default function HqDashboardPage() {
         {tab === 'coursePlans' && <HqCoursePlansTab {...sharedProps} />}
         {tab === 'groupClasses' && <PtDashboardPage />}
         {tab === 'contracts' && <HqContractsTab />}
+        {tab === 'compensation' && (
+          <HqCompensationTab branches={branches} trainers={trainers} />
+        )}
         {tab === 'people' && <HqPeopleTab {...sharedProps} />}
         {tab === 'gateDevices' && <HqGateDevicesTab branches={branches} />}
         {tab === 'salesAnalytics' && (

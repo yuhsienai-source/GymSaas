@@ -17,7 +17,7 @@ export function normalizeBranchCode(raw) {
     err.statusCode = 400;
     throw err;
   }
-  if (!/^[\w\u4e00-\u9fff\-]+$/u.test(s)) {
+  if (!/^[\w\u4e00-\u9fff-]+$/u.test(s)) {
     const err = new Error('分店代碼僅能使用中英數、底線或連字號');
     err.statusCode = 400;
     throw err;

@@ -573,13 +573,7 @@ export default function OpsShiftHandoverTab({ branchId, branchName }: Props) {
 
             {closeStep === 'summary' && (
               <div className="form-stack">
-                <div
-                  style={{
-                    display: 'grid',
-                    gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))',
-                    gap: '0.75rem',
-                  }}
-                >
+                <div className="bento-grid bento-grid--compact">
                   <StatCard label="開班底金" value={Math.round(shift.openingFloat)} tone="cash" />
                   <StatCard label="已付筆數" value={live?.totals?.paidTxnCount || 0} />
                   {showExpected ? (

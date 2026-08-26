@@ -46,6 +46,74 @@ function formatMoney(n: number) {
   return `$${n.toLocaleString('zh-TW')}`;
 }
 
+/** recurringPeriods bitmask：2＝可選2期、4＝可選4期、6＝兩者 */
+function decodeRecurringMask(raw: number | null | undefined) {
+  const n = Number(raw) || 0;
+  return { allow2: (n & 2) !== 0, allow4: (n & 4) !== 0 };
+}
+
+function encodeRecurringMask(allow2: boolean, allow4: boolean) {
+  let mask = 0;
+  if (allow2) mask |= 2;
+  if (allow4) mask |= 4;
+  return mask > 0 ? mask : null;
+}
+
+/** 4 期第1~3期金額：優先 recurringAmount4；舊資料僅4期時落在 recurringAmount */
+function resolveAmount4Base(p: {
+  recurringPeriods?: number | null;
+  recurringAmount?: number | null;
+  recurringAmount4?: number | null;
+}) {
+  if (p.recurringAmount4 != null && Number(p.recurringAmount4) > 0) {
+    return Number(p.recurringAmount4);
+  }
+  const { allow2, allow4 } = decodeRecurringMask(p.recurringPeriods);
+  if (allow4 && !allow2 && p.recurringAmount != null && Number(p.recurringAmount) > 0) {
+    return Number(p.recurringAmount);
+  }
+  return null;
+}
+
+function formatRecurringLabel(p: {
+  enableCardRecurring?: boolean;
+  recurringPeriods?: number | null;
+  price?: number;
+  recurringAmount?: number | null;
+  recurringAmount4?: number | null;
+  recurringAmountFinal?: number | null;
+}) {
+  if (!p.enableCardRecurring) return '否';
+  const { allow2, allow4 } = decodeRecurringMask(p.recurringPeriods);
+  if (!allow2 && !allow4) return '—';
+  const parts: string[] = [];
+  if (allow2) {
+    const second = p.recurringAmount != null ? Number(p.recurringAmount) : null;
+    const first =
+      second != null ? (Number(p.price) || 0) - second : null;
+    parts.push(
+      `2期 · 第1期 ${first != null ? formatMoney(first) : '—'} · 第2期 ${
+        second != null ? formatMoney(second) : '—'
+      }`,
+    );
+  }
+  if (allow4) {
+    const base = resolveAmount4Base(p);
+    const final =
+      p.recurringAmountFinal != null ? Number(p.recurringAmountFinal) : null;
+    parts.push(
+      `4期 · 第1-3期 ${base != null ? formatMoney(base) : '—'} · 第4期 ${
+        final != null ? formatMoney(final) : '—'
+      }`,
+    );
+  }
+  return parts.join(' ／ ');
+}
+
+function toCents(v: number) {
+  return Math.round(v * 100);
+}
+
 function unitPriceFromTotal(total: number, sessions: number | null | undefined) {
   if (!sessions || sessions <= 0) return String(total);
   const unit = Math.round((total / sessions) * 100) / 100;
@@ -74,6 +142,7 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
     activeBranches[0] ? [activeBranches[0].id] : [],
   );
   const [name, setName] = useState('');
+  const [planKind, setPlanKind] = useState<'SALE' | 'COMPENSATION'>('SALE');
   const [planType, setPlanType] = useState<CoursePlanType>('CUSTOM_PT');
   const [planMode, setPlanMode] = useState<PromotionPlanMode>('STANDING');
   const [saleStart, setSaleStart] = useState('');
@@ -84,10 +153,17 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
   const [capacity, setCapacity] = useState('8');
   const [description, setDescription] = useState('');
   const [cardRecurring, setCardRecurring] = useState(false);
+  const [allowRecurring2, setAllowRecurring2] = useState(false);
+  const [allowRecurring4, setAllowRecurring4] = useState(false);
+  const [recurring2FirstStr, setRecurring2FirstStr] = useState('');
+  const [recurring2SecondStr, setRecurring2SecondStr] = useState('');
+  const [recurring4BaseStr, setRecurring4BaseStr] = useState('');
+  const [recurring4FinalStr, setRecurring4FinalStr] = useState('');
   const [requiresContract, setRequiresContract] = useState(false);
   const [contractIds, setContractIds] = useState<number[]>([]);
   const [enableSecondPerson, setEnableSecondPerson] = useState(false);
   const [giftLabel, setGiftLabel] = useState('');
+  const [giftQty, setGiftQty] = useState('1');
   const [activeContracts, setActiveContracts] = useState<MembershipContract[]>([]);
   const [filterBranchId, setFilterBranchId] = useState<number | ''>('');
 
@@ -102,10 +178,17 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
   const [editCapacity, setEditCapacity] = useState('');
   const [editDescription, setEditDescription] = useState('');
   const [editCardRecurring, setEditCardRecurring] = useState(false);
+  const [editAllowRecurring2, setEditAllowRecurring2] = useState(false);
+  const [editAllowRecurring4, setEditAllowRecurring4] = useState(false);
+  const [editRecurring2FirstStr, setEditRecurring2FirstStr] = useState('');
+  const [editRecurring2SecondStr, setEditRecurring2SecondStr] = useState('');
+  const [editRecurring4BaseStr, setEditRecurring4BaseStr] = useState('');
+  const [editRecurring4FinalStr, setEditRecurring4FinalStr] = useState('');
   const [editRequiresContract, setEditRequiresContract] = useState(false);
   const [editContractIds, setEditContractIds] = useState<number[]>([]);
   const [editEnableSecondPerson, setEditEnableSecondPerson] = useState(false);
   const [editGiftLabel, setEditGiftLabel] = useState('');
+  const [editGiftQty, setEditGiftQty] = useState('1');
   const [editActive, setEditActive] = useState(true);
   const [busyId, setBusyId] = useState<number | null>(null);
 
@@ -164,6 +247,11 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
       toast('請至少選擇一間分店', 'error');
       return;
     }
+    const isCompensation = planKind === 'COMPENSATION';
+    if (isCompensation && planType !== 'CUSTOM_PT') {
+      toast('客訴補償課程僅限客製化私教', 'error');
+      return;
+    }
     if (planMode === 'CAMPAIGN' && saleStart && saleEnd && saleEnd <= saleStart) {
       toast('活動下架時間必須晚於上架時間', 'error');
       return;
@@ -172,7 +260,7 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
       toast(planType === 'GROUP' ? '團體課程必須設定期班堂數' : '客製化私教必須設定堂數', 'error');
       return;
     }
-    if (createTotal == null) {
+    if (!isCompensation && createTotal == null) {
       toast('請填寫有效的單堂售價與堂數', 'error');
       return;
     }
@@ -184,30 +272,94 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
       toast('需簽署會員合約時，請至少選擇一份合約', 'error');
       return;
     }
-    const price = Number(createTotal);
+    const price = isCompensation ? 0 : Number(createTotal);
+
+    if (!isCompensation && cardRecurring) {
+      if (!allowRecurring2 && !allowRecurring4) {
+        toast('請至少勾選 2 期或 4 期', 'error');
+        return;
+      }
+      if (allowRecurring2) {
+        const first = recurring2FirstStr ? parseFloat(recurring2FirstStr) : NaN;
+        const second = recurring2SecondStr ? parseFloat(recurring2SecondStr) : NaN;
+        if (!Number.isFinite(first) || first <= 0) {
+          toast('請填寫 2 期方案的第1期扣款金額', 'error');
+          return;
+        }
+        if (!Number.isFinite(second) || second <= 0) {
+          toast('請填寫 2 期方案的第2期扣款金額', 'error');
+          return;
+        }
+        if (toCents(first + second) !== toCents(price)) {
+          toast('2 期：第1期 + 第2期金額加總必須等於總售價', 'error');
+          return;
+        }
+      }
+      if (allowRecurring4) {
+        const base = recurring4BaseStr ? parseFloat(recurring4BaseStr) : NaN;
+        const finalAmt = recurring4FinalStr ? parseFloat(recurring4FinalStr) : NaN;
+        if (!Number.isFinite(base) || base <= 0) {
+          toast('請填寫 4 期方案的第1~3期扣款金額', 'error');
+          return;
+        }
+        if (!Number.isFinite(finalAmt) || finalAmt <= 0) {
+          toast('請填寫 4 期方案的第4期扣款金額', 'error');
+          return;
+        }
+        if (toCents(3 * base + finalAmt) !== toCents(price)) {
+          toast('4 期：第1~3期共用 ×3 + 第4期金額加總必須等於總售價', 'error');
+          return;
+        }
+      }
+    }
     try {
       const result = await createHqCoursePlan({
         branchIds,
         name: name.trim(),
-        planType,
+        kind: planKind,
+        planType: isCompensation ? 'CUSTOM_PT' : planType,
         planMode,
         saleStartAt: planMode === 'CAMPAIGN' ? toIsoOrNull(saleStart) : null,
         saleEndAt: planMode === 'CAMPAIGN' ? toIsoOrNull(saleEnd) : null,
         price,
         sessions: parseInt(sessions, 10),
-        capacity: planType === 'GROUP' ? parseInt(capacity, 10) : capacity ? parseInt(capacity, 10) : null,
+        capacity:
+          isCompensation || planType !== 'GROUP'
+            ? null
+            : parseInt(capacity, 10),
         description: description.trim() || null,
-        enableCardRecurring: cardRecurring,
-        requiresMemberContract: requiresContract,
-        enableSecondPerson,
-        giftLabel: effectiveGiftLabel.trim() || null,
-        contractIds: requiresContract ? contractIds : [],
+        enableCardRecurring: isCompensation ? false : cardRecurring,
+        recurringPeriods:
+          !isCompensation && cardRecurring
+            ? encodeRecurringMask(allowRecurring2, allowRecurring4)
+            : null,
+        recurringAmount:
+          !isCompensation && cardRecurring && allowRecurring2
+            ? parseFloat(recurring2SecondStr)
+            : null,
+        recurringAmount4:
+          !isCompensation && cardRecurring && allowRecurring4
+            ? parseFloat(recurring4BaseStr)
+            : null,
+        recurringAmountFinal:
+          !isCompensation && cardRecurring && allowRecurring4
+            ? parseFloat(recurring4FinalStr)
+            : null,
+        requiresMemberContract: isCompensation ? false : requiresContract,
+        enableSecondPerson: isCompensation ? false : enableSecondPerson,
+        giftLabel: isCompensation ? null : effectiveGiftLabel || null,
+        giftQty:
+          isCompensation || !effectiveGiftLabel
+            ? null
+            : Math.max(1, parseInt(giftQty, 10) || 1),
+        contractIds: isCompensation || !requiresContract ? [] : contractIds,
       });
       toast(result.message || '課程方案已建立', 'success');
       setName('');
+      setPlanKind('SALE');
+      setUnitPrice('1000');
+      setSessions('10');
       setDescription('');
-      setSaleStart('');
-      setSaleEnd('');
       setCardRecurring(false);
       setRequiresContract(false);
       setContractIds([]);
@@ -231,10 +383,27 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
     setEditUnitPrice(unitPriceFromTotal(Number(p.price) || 0, p.sessions));
     setEditDescription(p.description || '');
     setEditCardRecurring(Boolean(p.enableCardRecurring));
+    const { allow2, allow4 } = decodeRecurringMask(p.recurringPeriods);
+    setEditAllowRecurring2(allow2);
+    setEditAllowRecurring4(allow4);
+    setEditRecurring2SecondStr(
+      allow2 && p.recurringAmount != null ? String(p.recurringAmount) : '',
+    );
+    setEditRecurring2FirstStr(
+      allow2 && p.recurringAmount != null
+        ? String(Number(p.price || 0) - Number(p.recurringAmount || 0))
+        : '',
+    );
+    const amount4Base = resolveAmount4Base(p);
+    setEditRecurring4BaseStr(allow4 && amount4Base != null ? String(amount4Base) : '');
+    setEditRecurring4FinalStr(
+      allow4 && p.recurringAmountFinal != null ? String(p.recurringAmountFinal) : '',
+    );
     setEditRequiresContract(Boolean(p.requiresMemberContract));
     setEditContractIds((p.contracts || []).map((c) => c.id));
     setEditEnableSecondPerson(Boolean(p.enableSecondPerson));
     setEditGiftLabel(p.giftLabel || '');
+    setEditGiftQty(p.giftQty && p.giftQty > 0 ? String(p.giftQty) : '1');
     setEditActive(p.isActive !== false);
   }
 
@@ -265,6 +434,45 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
       return;
     }
     const price = Number(editTotal);
+
+    if (editCardRecurring) {
+      if (!editAllowRecurring2 && !editAllowRecurring4) {
+        toast('請至少勾選 2 期或 4 期', 'error');
+        return;
+      }
+      if (editAllowRecurring2) {
+        const first = editRecurring2FirstStr ? parseFloat(editRecurring2FirstStr) : NaN;
+        const second = editRecurring2SecondStr ? parseFloat(editRecurring2SecondStr) : NaN;
+        if (!Number.isFinite(first) || first <= 0) {
+          toast('請填寫 2 期方案的第1期扣款金額', 'error');
+          return;
+        }
+        if (!Number.isFinite(second) || second <= 0) {
+          toast('請填寫 2 期方案的第2期扣款金額', 'error');
+          return;
+        }
+        if (toCents(first + second) !== toCents(price)) {
+          toast('2 期：第1期 + 第2期金額加總必須等於總售價', 'error');
+          return;
+        }
+      }
+      if (editAllowRecurring4) {
+        const base = editRecurring4BaseStr ? parseFloat(editRecurring4BaseStr) : NaN;
+        const finalAmt = editRecurring4FinalStr ? parseFloat(editRecurring4FinalStr) : NaN;
+        if (!Number.isFinite(base) || base <= 0) {
+          toast('請填寫 4 期方案的第1~3期扣款金額', 'error');
+          return;
+        }
+        if (!Number.isFinite(finalAmt) || finalAmt <= 0) {
+          toast('請填寫 4 期方案的第4期扣款金額', 'error');
+          return;
+        }
+        if (toCents(3 * base + finalAmt) !== toCents(price)) {
+          toast('4 期：第1~3期共用 ×3 + 第4期金額加總必須等於總售價', 'error');
+          return;
+        }
+      }
+    }
     try {
       const result = await updateHqCoursePlan(editing.id, {
         name: editName.trim(),
@@ -282,9 +490,25 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
               : null,
         description: editDescription.trim() || null,
         enableCardRecurring: editCardRecurring,
+        recurringPeriods: editCardRecurring
+          ? encodeRecurringMask(editAllowRecurring2, editAllowRecurring4)
+          : null,
+        recurringAmount:
+          editCardRecurring && editAllowRecurring2
+            ? parseFloat(editRecurring2SecondStr)
+            : null,
+        recurringAmount4:
+          editCardRecurring && editAllowRecurring4
+            ? parseFloat(editRecurring4BaseStr)
+            : null,
+        recurringAmountFinal:
+          editCardRecurring && editAllowRecurring4
+            ? parseFloat(editRecurring4FinalStr)
+            : null,
         requiresMemberContract: editRequiresContract,
         enableSecondPerson: editEnableSecondPerson,
         giftLabel: editGiftLabel.trim() || null,
+        giftQty: editGiftLabel.trim() ? parseInt(editGiftQty, 10) || 1 : null,
         contractIds: editRequiresContract ? editContractIds : [],
         isActive: editActive,
       });
@@ -317,7 +541,7 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
   return (
     <PageSection
       title="課程方案"
-      desc="客製化私教／團體課程商品化上架 · 長註或活動檔期"
+      desc="客製化私教／團體課程商品化上架 · 客訴補償課程（price $0）僅經「合規補償」配發，不進 POS"
     >
       <div className="staff-grid">
         <Card title="新增課程">
@@ -352,9 +576,34 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
             <Field label="方案名稱">
               <Input value={name} onChange={(e) => setName(e.target.value)} required />
             </Field>
+            <Field
+              label="方案用途"
+              hint="客訴補償課程不出現在櫃檯／POS；僅「合規補償」可贈送堂數"
+            >
+              <Select
+                value={planKind}
+                onChange={(e) => {
+                  const next = e.target.value as 'SALE' | 'COMPENSATION';
+                  setPlanKind(next);
+                  if (next === 'COMPENSATION') {
+                    setPlanType('CUSTOM_PT');
+                    setUnitPrice('0');
+                    setCardRecurring(false);
+                    setRequiresContract(false);
+                    setEnableSecondPerson(false);
+                  } else if (unitPrice === '0') {
+                    setUnitPrice('1000');
+                  }
+                }}
+              >
+                <option value="SALE">可售方案（SALE）</option>
+                <option value="COMPENSATION">客訴補償課程（COMPENSATION）</option>
+              </Select>
+            </Field>
             <Field label="方案類型">
               <Select
                 value={planType}
+                disabled={planKind === 'COMPENSATION'}
                 onChange={(e) => setPlanType(e.target.value as CoursePlanType)}
               >
                 <option value="CUSTOM_PT">客製化私教</option>
@@ -456,18 +705,34 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
               label="加贈禮"
               hint="選填；從進銷存商品選取，加入購物車時帶入且金額 $0"
             >
-              <Select
-                value={effectiveGiftLabel}
-                onChange={(e) => setGiftLabel(e.target.value)}
-                disabled={branchIds.length === 0}
-              >
-                <option value="">無</option>
-                {createGiftOptions.map((name) => (
-                  <option key={name} value={name}>
-                    {name}
-                  </option>
-                ))}
-              </Select>
+              <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+                <Select
+                  value={effectiveGiftLabel}
+                  onChange={(e) => setGiftLabel(e.target.value)}
+                  disabled={branchIds.length === 0}
+                  style={{ flex: 1 }}
+                >
+                  <option value="">無</option>
+                  {createGiftOptions.map((name) => (
+                    <option key={name} value={name}>
+                      {name}
+                    </option>
+                  ))}
+                </Select>
+                {effectiveGiftLabel && (
+                  <>
+                    <span className="text-sm">×</span>
+                    <Input
+                      type="number"
+                      min={1}
+                      value={giftQty}
+                      onChange={(e) => setGiftQty(e.target.value)}
+                      style={{ width: 70 }}
+                      aria-label="加贈禮數量"
+                    />
+                  </>
+                )}
+              </div>
               {branchIds.length > 0 && createGiftOptions.length === 0 && (
                 <p className="text-muted text-sm">所選分店尚無啟用中商品，請先至「總部 HQ → 商品主檔」建立</p>
               )}
@@ -517,6 +782,92 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
               />
               啟用信用卡定期定額
             </label>
+            {cardRecurring && (
+              <>
+                <Field label="可選期數" hint="未勾選的期數不會出現在櫃檯選項；兩者皆勾則可選 2 或 4 期">
+                  <div className="checkbox-group">
+                    <label className="checkbox-item">
+                      <input
+                        type="checkbox"
+                        checked={allowRecurring2}
+                        onChange={(e) => {
+                          setAllowRecurring2(e.target.checked);
+                          if (!e.target.checked) {
+                            setRecurring2FirstStr('');
+                            setRecurring2SecondStr('');
+                          }
+                        }}
+                      />
+                      2 期
+                    </label>
+                    <label className="checkbox-item">
+                      <input
+                        type="checkbox"
+                        checked={allowRecurring4}
+                        onChange={(e) => {
+                          setAllowRecurring4(e.target.checked);
+                          if (!e.target.checked) {
+                            setRecurring4BaseStr('');
+                            setRecurring4FinalStr('');
+                          }
+                        }}
+                      />
+                      4 期
+                    </label>
+                  </div>
+                </Field>
+                {allowRecurring2 && (
+                  <>
+                    <Field
+                      label="2期 · 第1期扣款金額"
+                      hint="需滿足（第1期 + 第2期）= 總售價"
+                    >
+                      <Input
+                        type="number"
+                        min={1}
+                        value={recurring2FirstStr}
+                        onChange={(e) => setRecurring2FirstStr(e.target.value)}
+                        placeholder="例：2500"
+                      />
+                    </Field>
+                    <Field label="2期 · 第2期扣款金額" hint="續扣金額">
+                      <Input
+                        type="number"
+                        min={1}
+                        value={recurring2SecondStr}
+                        onChange={(e) => setRecurring2SecondStr(e.target.value)}
+                        placeholder="例：5000"
+                      />
+                    </Field>
+                  </>
+                )}
+                {allowRecurring4 && (
+                  <>
+                    <Field
+                      label="4期 · 第1~3期金額（相同）"
+                      hint="需滿足（第1~3期共用 × 3）+ 第4期 = 總售價"
+                    >
+                      <Input
+                        type="number"
+                        min={1}
+                        value={recurring4BaseStr}
+                        onChange={(e) => setRecurring4BaseStr(e.target.value)}
+                        placeholder="例：2000"
+                      />
+                    </Field>
+                    <Field label="4期 · 第4期扣款金額" hint="最後一期續扣金額">
+                      <Input
+                        type="number"
+                        min={1}
+                        value={recurring4FinalStr}
+                        onChange={(e) => setRecurring4FinalStr(e.target.value)}
+                        placeholder="例：5000"
+                      />
+                    </Field>
+                  </>
+                )}
+              </>
+            )}
             <Button type="submit" disabled={branchIds.length === 0}>
               建立方案{branchIds.length > 1 ? `（${branchIds.length} 間分店）` : ''}
             </Button>
@@ -544,6 +895,7 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
               <thead>
                 <tr>
                   <th>分店</th>
+                  <th>用途</th>
                   <th>類型</th>
                   <th>名稱</th>
                   <th>單堂售價</th>
@@ -553,6 +905,7 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
                   <th>模式</th>
                   <th>檔期</th>
                   <th>合約</th>
+                  <th>定期定額</th>
                   <th>二人／贈禮</th>
                   <th>狀態</th>
                   <th></th>
@@ -561,7 +914,7 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
               <tbody>
                 {filtered.length === 0 ? (
                   <tr>
-                    <td colSpan={13} className="text-muted text-center">
+                    <td colSpan={14} className="text-muted text-center">
                       {coursePlans.length === 0 ? '尚無課程方案' : '此分店尚無課程方案'}
                     </td>
                   </tr>
@@ -586,6 +939,7 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
                     return (
                       <tr key={p.id}>
                         <td>{staffBranchLabel(p.branch) || `#${p.branchId}`}</td>
+                        <td>{p.kind === 'COMPENSATION' ? '補償' : '可售'}</td>
                         <td>
                           {COURSE_PLAN_TYPE_LABELS[
                             p.planType === 'GROUP' ? 'GROUP' : 'CUSTOM_PT'
@@ -621,10 +975,13 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
                               : '需合約'
                             : '—'}
                         </td>
+                        <td className="text-sm">{formatRecurringLabel(p)}</td>
                         <td className="text-sm">
                           {[
                             p.enableSecondPerson ? '∨' : null,
-                            p.giftLabel ? `贈：${p.giftLabel}` : null,
+                            p.giftLabel
+                              ? `贈：${p.giftLabel}${p.giftQty && p.giftQty > 1 ? ` ×${p.giftQty}` : ''}`
+                              : null,
                           ]
                             .filter(Boolean)
                             .join(' · ') || '—'}
@@ -679,8 +1036,13 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
                     : null;
                 const extras =
                   [
+                    p.enableCardRecurring
+                      ? `定期定額 ${formatRecurringLabel(p)}`
+                      : null,
                     p.enableSecondPerson ? '第二人' : null,
-                    p.giftLabel ? `贈：${p.giftLabel}` : null,
+                    p.giftLabel
+                      ? `贈：${p.giftLabel}${p.giftQty && p.giftQty > 1 ? ` ×${p.giftQty}` : ''}`
+                      : null,
                   ]
                     .filter(Boolean)
                     .join(' · ') || '—';
@@ -879,20 +1241,36 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
             label="加贈禮"
             hint="選填；從進銷存商品選取，加入購物車時帶入且金額 $0"
           >
-            <Select
-              value={editGiftLabel}
-              onChange={(e) => setEditGiftLabel(e.target.value)}
-            >
-              <option value="">無</option>
-              {editGiftOptions.map((name) => (
-                <option key={name} value={name}>
-                  {name}
-                </option>
-              ))}
-              {editGiftLabel && !editGiftOptions.includes(editGiftLabel) ? (
-                <option value={editGiftLabel}>{editGiftLabel}（目前值）</option>
-              ) : null}
-            </Select>
+            <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+              <Select
+                value={editGiftLabel}
+                onChange={(e) => setEditGiftLabel(e.target.value)}
+                style={{ flex: 1 }}
+              >
+                <option value="">無</option>
+                {editGiftOptions.map((name) => (
+                  <option key={name} value={name}>
+                    {name}
+                  </option>
+                ))}
+                {editGiftLabel && !editGiftOptions.includes(editGiftLabel) ? (
+                  <option value={editGiftLabel}>{editGiftLabel}（目前值）</option>
+                ) : null}
+              </Select>
+              {editGiftLabel && (
+                <>
+                  <span className="text-sm">×</span>
+                  <Input
+                    type="number"
+                    min={1}
+                    value={editGiftQty}
+                    onChange={(e) => setEditGiftQty(e.target.value)}
+                    style={{ width: 70 }}
+                    aria-label="加贈禮數量"
+                  />
+                </>
+              )}
+            </div>
             {editGiftOptions.length === 0 && (
               <p className="text-muted text-sm">此分店尚無啟用中商品，請先至「總部 HQ → 商品主檔」建立</p>
             )}
@@ -938,6 +1316,92 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
             />
             啟用信用卡定期定額
           </label>
+          {editCardRecurring && (
+            <>
+              <Field label="可選期數" hint="未勾選的期數不會出現在櫃檯選項；兩者皆勾則可選 2 或 4 期">
+                <div className="checkbox-group">
+                  <label className="checkbox-item">
+                    <input
+                      type="checkbox"
+                      checked={editAllowRecurring2}
+                      onChange={(e) => {
+                        setEditAllowRecurring2(e.target.checked);
+                        if (!e.target.checked) {
+                          setEditRecurring2FirstStr('');
+                          setEditRecurring2SecondStr('');
+                        }
+                      }}
+                    />
+                    2 期
+                  </label>
+                  <label className="checkbox-item">
+                    <input
+                      type="checkbox"
+                      checked={editAllowRecurring4}
+                      onChange={(e) => {
+                        setEditAllowRecurring4(e.target.checked);
+                        if (!e.target.checked) {
+                          setEditRecurring4BaseStr('');
+                          setEditRecurring4FinalStr('');
+                        }
+                      }}
+                    />
+                    4 期
+                  </label>
+                </div>
+              </Field>
+              {editAllowRecurring2 && (
+                <>
+                  <Field
+                    label="2期 · 第1期扣款金額"
+                    hint="需滿足（第1期 + 第2期）= 總售價"
+                  >
+                    <Input
+                      type="number"
+                      min={1}
+                      value={editRecurring2FirstStr}
+                      onChange={(e) => setEditRecurring2FirstStr(e.target.value)}
+                      placeholder="例：2500"
+                    />
+                  </Field>
+                  <Field label="2期 · 第2期扣款金額" hint="續扣金額">
+                    <Input
+                      type="number"
+                      min={1}
+                      value={editRecurring2SecondStr}
+                      onChange={(e) => setEditRecurring2SecondStr(e.target.value)}
+                      placeholder="例：5000"
+                    />
+                  </Field>
+                </>
+              )}
+              {editAllowRecurring4 && (
+                <>
+                  <Field
+                    label="4期 · 第1~3期金額（相同）"
+                    hint="需滿足（第1~3期共用 × 3）+ 第4期 = 總售價"
+                  >
+                    <Input
+                      type="number"
+                      min={1}
+                      value={editRecurring4BaseStr}
+                      onChange={(e) => setEditRecurring4BaseStr(e.target.value)}
+                      placeholder="例：2000"
+                    />
+                  </Field>
+                  <Field label="4期 · 第4期扣款金額" hint="最後一期續扣金額">
+                    <Input
+                      type="number"
+                      min={1}
+                      value={editRecurring4FinalStr}
+                      onChange={(e) => setEditRecurring4FinalStr(e.target.value)}
+                      placeholder="例：5000"
+                    />
+                  </Field>
+                </>
+              )}
+            </>
+          )}
           <label className="checkbox-item">
             <input
               type="checkbox"

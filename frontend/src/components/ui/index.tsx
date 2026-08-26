@@ -188,7 +188,7 @@ export function StatCard({
   suffix?: string;
 }) {
   return (
-    <div className={`stat-card stat-card--${tone}`}>
+    <div className={`stat-card stat-card--${tone}${tone === 'default' ? ' stat-card--glow' : ''}`}>
       <span className="stat-card__label">{label}</span>
       <strong className="stat-card__value">
         {value}

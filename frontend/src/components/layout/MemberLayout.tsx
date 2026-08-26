@@ -1,5 +1,5 @@
 import { Link } from 'react-router-dom';
-import type { ReactNode } from 'react';
+import { useEffect, type ReactNode } from 'react';
 import { Button } from '../ui';
 
 interface MemberLayoutProps {
@@ -24,6 +24,15 @@ export default function MemberLayout({
   activeTab = 'home',
 }: MemberLayoutProps) {
   const initial = name.charAt(0).toUpperCase();
+
+  useEffect(() => {
+    const meta = document.querySelector('meta[name="theme-color"]');
+    const prev = meta?.getAttribute('content') ?? '#1A2332';
+    meta?.setAttribute('content', '#1A2332');
+    return () => {
+      meta?.setAttribute('content', prev);
+    };
+  }, []);
 
   return (
     <div className="member-app">

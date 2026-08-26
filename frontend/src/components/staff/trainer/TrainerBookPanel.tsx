@@ -573,6 +573,7 @@ export default function TrainerBookPanel({
                           </span>
                           <span className="coach-student-pick__meta text-sm text-muted">
                             {c.memberPhone || '—'} · 剩 {c.remainingSessions}/{c.totalSessions} 堂
+                            {c.source === 'COMPENSATION' ? ' · 補償贈送' : ''}
                             {c.hasLineBound ? ' · LINE' : ''}
                           </span>
                         </button>
@@ -588,6 +589,11 @@ export default function TrainerBookPanel({
                 <div className="coach-book-detail__head">
                   <strong>{selectedPt.memberName || `會員 #${selectedPt.memberId}`}</strong>
                   <div className="btn-row" style={{ gap: 6 }}>
+                    {selectedPt.source === 'COMPENSATION' ? (
+                      <Badge tone="info">補償贈送</Badge>
+                    ) : (
+                      <Badge tone="neutral">付費購案</Badge>
+                    )}
                     {selectedPt.hasLineBound ? (
                       <Badge tone="success">LINE 已綁</Badge>
                     ) : (

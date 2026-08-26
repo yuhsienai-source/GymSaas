@@ -1,10 +1,18 @@
 import { Link } from 'react-router-dom';
 import type { ReactNode } from 'react';
 
+export type GateFlashResult = {
+  ok: boolean;
+  message: string;
+  memberId?: number;
+  code?: string;
+  renewable?: boolean;
+};
+
 interface GateLayoutProps {
   mode: 'check-in' | 'check-out';
   onModeChange: (mode: 'check-in' | 'check-out') => void;
-  lastResult?: { ok: boolean; message: string } | null;
+  lastResult?: GateFlashResult | null;
   children: ReactNode;
 }
 
@@ -14,6 +22,11 @@ export default function GateLayout({
   lastResult,
   children,
 }: GateLayoutProps) {
+  const renewHref =
+    lastResult?.renewable && lastResult.memberId
+      ? `/staff/ops?tab=checkout&memberId=${lastResult.memberId}`
+      : null;
+
   return (
     <div className="gate-app">
       <header className="gate-header">
@@ -32,6 +45,13 @@ export default function GateLayout({
       {lastResult && (
         <div className={`gate-flash gate-flash--${lastResult.ok ? 'ok' : 'err'}`}>
           {lastResult.message}
+          {renewHref ? (
+            <div className="gate-flash__actions">
+              <Link className="btn btn--primary btn--sm" to={renewHref}>
+                櫃檯續約／儲值
+              </Link>
+            </div>
+          ) : null}
         </div>
       )}
 

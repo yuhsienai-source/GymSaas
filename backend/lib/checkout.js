@@ -13,9 +13,8 @@ import {
 import { assertMemberSignedPromotionContracts } from './memberContract.js';
 import { assertBranchAccess } from './staffAccess.js';
 import {
-  buildUPPPayload,
+  buildCardCheckoutRequest,
   parseCardPayOptions,
-  PAYUNI_UPP_URL,
 } from './payuni.js';
 import { normalizeInvoiceOptions } from './ezpay.js';
 import {
@@ -26,8 +25,9 @@ import {
 } from './inventory.js';
 import { createSubscriptionFromPaidOrder } from './cardSubscription.js';
 import { buildPtCheckoutLines, fulfillPtCheckoutLines } from './ptPurchase.js';
-import { resolveTopupOrderId } from './orderIds.js';
+import { resolveTopupOrderId, generateSubscriptionOrderId } from './orderIds.js';
 import { issueSplitCheckoutInvoices } from './checkoutInvoice.js';
+import { resolveCourseRecurringSchedule } from './coursePlan.js';
 
 export function generateCheckoutId() {
   const dateStr = new Date().toISOString().replace(/[-:T.Z]/g, '').slice(0, 8);
@@ -233,15 +233,25 @@ export async function priceCheckoutCart(tx, cart) {
   };
 }
 
-function parseRecurringAmount(raw, fallback) {
-  if (raw === undefined || raw === null || raw === '') {
-    return fallback;
+/**
+ * 找出購物車內可定期定額的課程方案（一次僅支援單一方案）
+ */
+async function resolveRecurringCourseTarget(cart) {
+  if (!cart?.courseDraft?.length) return null;
+  const ids = [...new Set(cart.courseDraft.map((r) => r.coursePlanId))];
+  const plans = await prisma.coursePlan.findMany({
+    where: { id: { in: ids } },
+  });
+  const enabled = plans.filter((p) => p.enableCardRecurring);
+  if (enabled.length === 0) return null;
+  if (enabled.length > 1) {
+    throw httpError('定期定額一次僅能購買一個已啟用定期定額的課程方案');
   }
-  const n = typeof raw === 'number' ? raw : parseFloat(String(raw));
-  if (!Number.isFinite(n) || n <= 0) {
-    throw httpError('定期定額金額必須為正數');
-  }
-  return Math.round(n * 100) / 100;
+  const plan = enabled[0];
+  const qty = cart.courseDraft
+    .filter((r) => r.coursePlanId === plan.id)
+    .reduce((s, r) => s + r.qty, 0);
+  return { plan, qty };
 }
 
 /**
@@ -259,7 +269,7 @@ export async function runOpsCheckout(req, body) {
     cardInst,
     periodType,
     periodTimes,
-    recurringAmount: recurringAmountRaw,
+    recurringAmount: _recurringAmountRaw,
     branchId: _b,
     memberId: _m,
     items: _i,
@@ -287,9 +297,76 @@ export async function runOpsCheckout(req, body) {
     throw httpError('應付金額無效');
   }
 
+  const recurringCourse = await resolveRecurringCourseTarget(cart);
+  const promoRecurring = Boolean(cart.promotion?.enableCardRecurring && cart.promotion);
+  if (promoRecurring && recurringCourse) {
+    throw httpError('儲值方案與課程方案不可同時使用定期定額，請分開結帳');
+  }
+  const allowRecurring = promoRecurring || Boolean(recurringCourse);
+
+  let cardOpts = { cardMode: 'LUMP', cardInst: null, periodType: null, periodTimes: null };
+  let recurringAmount = null;
+  let recurringAmountFinal = null;
+  let courseSchedule = null;
+  let chargeAmount = priced.amount;
+
+  const paymentMethods = Array.isArray(payments)
+    ? payments.map((p) => String(p?.method || '').toUpperCase())
+    : [];
+  const needsCardHint =
+    paymentMethods.includes('CARD') ||
+    String(payMethod || '')
+      .toUpperCase()
+      .split('+')
+      .map((s) => s.trim())
+      .includes('CARD');
+
+  if (needsCardHint) {
+    cardOpts = parseCardPayOptions(
+      { cardMode, cardInst, periodType, periodTimes },
+      { allowRecurring },
+    );
+    if (cardOpts.cardMode === 'RECURRING') {
+      if (promoRecurring) {
+        const periodCount = parseInt(cart.promotion.periodCount, 10);
+        if (!Number.isInteger(periodCount) || periodCount <= 0) {
+          throw httpError('此儲值方案未設定有效期期數，無法使用定期定額');
+        }
+        // 每期金額＝方案費用；總期數＝有效期期數（忽略前端覆寫）
+        recurringAmount = computeTopupAmount(cart.promotion, cart.promoQty);
+        cardOpts.periodTimes = periodCount;
+      } else if (recurringCourse) {
+        courseSchedule = resolveCourseRecurringSchedule(
+          recurringCourse.plan,
+          cardOpts.periodTimes,
+        );
+        cardOpts.periodTimes = courseSchedule.periodTimes;
+        const firstPt =
+          Math.round(courseSchedule.firstAmount * recurringCourse.qty * 100) / 100;
+        const otherPt =
+          Math.round(
+            (priced.ptAmount - recurringCourse.plan.price * recurringCourse.qty) * 100,
+          ) / 100;
+        chargeAmount =
+          Math.round(
+            (priced.posAmount + priced.promoAmount + Math.max(0, otherPt) + firstPt) * 100,
+          ) / 100;
+        recurringAmount = courseSchedule.recurringAmount;
+        recurringAmountFinal = courseSchedule.amountFinal;
+        // 續扣金額依方案排程（忽略前端覆寫，與儲值定期定額一致）
+      } else {
+        throw httpError('定期定額僅限購物車含已啟用儲值或課程方案時使用');
+      }
+    }
+  }
+
+  if (!(chargeAmount > 0)) {
+    throw httpError('應付金額無效');
+  }
+
   const pay = coercePaymentsFromBody(
     { payments, payMethod, voucherCode },
-    priced.amount,
+    chargeAmount,
     CHECKOUT_PAY_METHODS,
   );
 
@@ -297,25 +374,10 @@ export async function runOpsCheckout(req, body) {
     throw httpError('零錢包付款必須指定會員 memberId');
   }
 
-  const allowRecurring = Boolean(cart.promotion?.enableCardRecurring && cart.promotion);
-  let cardOpts = { cardMode: 'LUMP', cardInst: null, periodType: null, periodTimes: null };
-  let recurringAmount = null;
-  if (pay.needsCard) {
-    cardOpts = parseCardPayOptions(
-      { cardMode, cardInst, periodType, periodTimes },
-      { allowRecurring },
-    );
-    if (cardOpts.cardMode === 'RECURRING') {
-      if (!cart.promotion) {
-        throw httpError('定期定額僅限購物車含已啟用儲值方案時使用');
-      }
-      const fallback = computeTopupAmount(cart.promotion, cart.promoQty);
-      recurringAmount = parseRecurringAmount(recurringAmountRaw, fallback);
-    }
-  }
-
   const status = pay.needsCard ? 'PENDING' : 'PAID';
   const checkoutId = generateCheckoutId();
+  const isCourseRecurring =
+    pay.needsCard && cardOpts.cardMode === 'RECURRING' && Boolean(courseSchedule);
 
   const created = await prisma.$transaction(async (tx) => {
     let member = null;
@@ -404,6 +466,7 @@ export async function runOpsCheckout(req, body) {
           periodType: pay.needsCard ? cardOpts.periodType : null,
           periodTimes: pay.needsCard ? cardOpts.periodTimes : null,
           recurringAmount,
+          recurringAmountFinal,
           carrierNum: invoiceOpts.carrierNum,
           buyerUbn: invoiceOpts.buyerUbn,
           loveCode: invoiceOpts.loveCode,
@@ -417,6 +480,35 @@ export async function runOpsCheckout(req, body) {
           qty: cart.promoQty,
         });
       }
+    } else if (isCourseRecurring) {
+      const firstPt =
+        Math.round(courseSchedule.firstAmount * recurringCourse.qty * 100) / 100;
+      orderId = generateSubscriptionOrderId();
+      await tx.order.create({
+        data: {
+          id: orderId,
+          memberId: cart.parsedMemberId,
+          amount: firstPt,
+          itemDesc:
+            `課程定期定額首期 | ${recurringCourse.plan.name} ×${recurringCourse.qty}` +
+            ` | 課程方案#${recurringCourse.plan.id} | ${courseSchedule.periodTimes}期`,
+          payMethod: pay.payMethodLabel,
+          payBreakdown: pay.breakdown,
+          voucherCode: pay.voucherCode,
+          cardAmount: 0,
+          cardMode: 'RECURRING',
+          cardInst: null,
+          periodType: cardOpts.periodType,
+          periodTimes: courseSchedule.periodTimes,
+          recurringAmount,
+          recurringAmountFinal,
+          carrierNum: invoiceOpts.carrierNum,
+          buyerUbn: invoiceOpts.buyerUbn,
+          loveCode: invoiceOpts.loveCode,
+          status,
+          checkoutSessionId: checkoutId,
+        },
+      });
     }
 
     let ptFulfilled = false;
@@ -441,7 +533,7 @@ export async function runOpsCheckout(req, body) {
         id: checkoutId,
         branchId: cart.parsedBranchId,
         memberId: cart.parsedMemberId,
-        amount: pricedTx.amount,
+        amount: isCourseRecurring ? chargeAmount : pricedTx.amount,
         itemDesc: pricedTx.itemDesc,
         payMethod: pay.payMethodLabel,
         payBreakdown: pay.breakdown,
@@ -452,6 +544,7 @@ export async function runOpsCheckout(req, body) {
         periodType: pay.needsCard ? cardOpts.periodType : null,
         periodTimes: pay.needsCard ? cardOpts.periodTimes : null,
         recurringAmount,
+        recurringAmountFinal,
         carrierNum: invoiceOpts.carrierNum,
         buyerUbn: invoiceOpts.buyerUbn,
         loveCode: invoiceOpts.loveCode,
@@ -475,7 +568,7 @@ export async function runOpsCheckout(req, body) {
   });
 
   if (pay.needsCard) {
-    const payuniPayload = buildUPPPayload({
+    const { actionUrl, payload: payuniPayload } = buildCardCheckoutRequest({
       id: created.session.id,
       amount: pay.cardAmount,
       itemDesc: created.session.itemDesc,
@@ -483,6 +576,8 @@ export async function runOpsCheckout(req, body) {
       cardInst: cardOpts.cardInst,
       periodType: cardOpts.periodType,
       periodTimes: cardOpts.periodTimes,
+      periodAmt: recurringAmount,
+      recurringAmount,
     });
 
     return {
@@ -501,11 +596,12 @@ export async function runOpsCheckout(req, body) {
         periodType: cardOpts.periodType,
         periodTimes: cardOpts.periodTimes,
         recurringAmount,
+        recurringAmountFinal,
         voucherCode: pay.voucherCode,
         carrierNum: invoiceOpts.carrierNum,
         buyerUbn: invoiceOpts.buyerUbn,
         loveCode: invoiceOpts.loveCode,
-        actionUrl: PAYUNI_UPP_URL,
+        actionUrl,
         payload: payuniPayload,
       },
     };
@@ -582,6 +678,7 @@ export async function fulfillCheckoutSession(checkoutId, merchantNo, cardMeta = 
 
   const isRecurring = String(session.cardMode || '').toUpperCase() === 'RECURRING';
   let promotionForSub = null;
+  let coursePlanForSub = null;
   let paidOrderId = session.orderId;
 
   await prisma.$transaction(async (tx) => {
@@ -614,6 +711,12 @@ export async function fulfillCheckoutSession(checkoutId, merchantNo, cardMeta = 
               durationDaysOverride: durationDaysOverride ?? undefined,
             });
           }
+        } else if (isRecurring && order) {
+          const courseMatch = (order.itemDesc || '').match(/課程方案#(\d+)/);
+          const coursePlanId = courseMatch ? parseInt(courseMatch[1], 10) : null;
+          if (coursePlanId) {
+            coursePlanForSub = await tx.coursePlan.findUnique({ where: { id: coursePlanId } });
+          }
         }
       }
     }
@@ -630,6 +733,8 @@ export async function fulfillCheckoutSession(checkoutId, merchantNo, cardMeta = 
               select: { name: true },
             })
           : null;
+        // 課程定期定額：首期訂單已存在，略過再開私教全額 Order（合約仍給滿堂數）
+        const skipPtOrders = isRecurring && Boolean(coursePlanForSub || session.recurringAmount != null);
         await fulfillPtCheckoutLines(tx, {
           memberId: session.memberId,
           trainerId: session.trainerId,
@@ -640,11 +745,22 @@ export async function fulfillCheckoutSession(checkoutId, merchantNo, cardMeta = 
             checkoutSessionId: session.id,
             payMethod: session.payMethod || 'CARD',
             status: 'PAID',
+            skipOrders: skipPtOrders,
           },
         });
       }
     }
   });
+
+  // 若交易外才解析到課程（order 早已 PAID 的重入），再補一次
+  if (isRecurring && !promotionForSub && !coursePlanForSub && paidOrderId) {
+    const order = await prisma.order.findUnique({ where: { id: paidOrderId } });
+    const courseMatch = (order?.itemDesc || '').match(/課程方案#(\d+)/);
+    const coursePlanId = courseMatch ? parseInt(courseMatch[1], 10) : null;
+    if (coursePlanId) {
+      coursePlanForSub = await prisma.coursePlan.findUnique({ where: { id: coursePlanId } });
+    }
+  }
 
   if (session.saleOrderId) {
     await fulfillCardSaleOrder(session.saleOrderId, merchantNo, session.staffId, cardMeta, {
@@ -673,12 +789,18 @@ export async function fulfillCheckoutSession(checkoutId, merchantNo, cardMeta = 
     console.error(`❌ 合併結帳 ${session.id} 軟拆開票例外:`, err.message);
   }
 
-  if (isRecurring && promotionForSub && paidOrderId) {
+  if (isRecurring && paidOrderId && (promotionForSub || coursePlanForSub)) {
     try {
       const paidOrder = await prisma.order.findUnique({ where: { id: paidOrderId } });
       await createSubscriptionFromPaidOrder(paidOrder, {
-        promotion: promotionForSub,
+        promotion: promotionForSub || null,
+        coursePlan: coursePlanForSub || null,
         creditHash: cardMeta?.creditHash || paidOrder?.creditHash,
+        amountFinal:
+          paidOrder?.recurringAmountFinal ??
+          session.recurringAmountFinal ??
+          coursePlanForSub?.recurringAmountFinal ??
+          undefined,
       });
     } catch (subErr) {
       console.error(`❌ 合併結帳 ${session.id} 建立定期定額失敗:`, subErr.message);

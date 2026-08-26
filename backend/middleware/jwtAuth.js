@@ -34,7 +34,7 @@ export const verifyMember = (req, res, next) => {
 
     req.user = decoded;
     next();
-  } catch (error) {
+  } catch (_error) {
     return res.status(403).json({ status: "error", message: "⛔ 登入憑證已過期或遭竄改" });
   }
 };
@@ -119,7 +119,7 @@ export const verifyStaff = (req, res, next) => {
     
     req.user = decoded; // 統一掛載為 req.user
     next(); 
-  } catch (error) {
+  } catch (_error) {
     return res.status(403).json({ status: "error", message: "⛔ 員工憑證已過期或遭竄改" });
   }
 };

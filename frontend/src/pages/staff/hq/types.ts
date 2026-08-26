@@ -7,6 +7,7 @@ export type HqTab =
   | 'coursePlans'
   | 'groupClasses'
   | 'contracts'
+  | 'compensation'
   | 'people'
   | 'gateDevices'
   | 'salesAnalytics';
@@ -18,6 +19,7 @@ export const HQ_TABS: { key: HqTab; label: string }[] = [
   { key: 'coursePlans', label: '課程方案' },
   { key: 'groupClasses', label: '團課管理' },
   { key: 'contracts', label: '電子合約' },
+  { key: 'compensation', label: '合規補償' },
   { key: 'people', label: '員工管理' },
   { key: 'gateDevices', label: '進出場裝置' },
   { key: 'salesAnalytics', label: '銷售分析' },

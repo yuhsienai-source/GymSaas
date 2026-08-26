@@ -20,10 +20,19 @@ npm run dev:api
 npm run dev:web
 ```
 
+Lint（前後端各自設定，根目錄僅轉發）：
+
+```bash
+npm run lint        # frontend + backend
+npm run lint:web
+npm run lint:api
+npm run doctor:api  # backend：prisma validate → eslint → syntax
+```
+
 | 變數（在 `backend/.env`） | 意義 |
 |---------------------------|------|
-| `API_PUBLIC_URL` / `BASE_URL` | 後端公開網址（金流 Notify、LINE Callback） |
-| `FRONTEND_URL` | **獨立**前端網域（本機預設 `https://localhost:5173`） |
+| `API_PUBLIC_URL` / `BASE_URL` | 後端公開網址（PayUNi Return／Notify、LINE Callback）— **必須是 API，勿與前端共用錯隧道** |
+| `FRONTEND_URL` | **獨立**前端網域（刷卡回流 303 目標；本機預設 `https://localhost:5173`） |
 | `CORS_ORIGIN` | 允許的前端 Origin（建議設成 `FRONTEND_URL`） |
 | `LINE_CHANNEL_ID` / `LINE_CHANNEL_SECRET` | LINE Login（會員綁定／登入） |
 | `LINE_CHANNEL_ACCESS_TOKEN` | Messaging API 推播（代約課通知）；未設則略過推播 |

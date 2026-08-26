@@ -40,6 +40,7 @@ export async function findActiveSubscriptionForMember(memberId, { subscriptionId
 
 /**
  * 若請假已到期，自動銷假（清 leaveUntil；效期已於請假開始時預先順延）
+ * 並恢復對應 PAUSED 訂閱（與 completeMemberLeaveOnSchedule 一致）
  */
 export async function settleExpiredLeave(memberId, { now = new Date() } = {}) {
   const member = await prisma.member.findUnique({ where: { id: memberId } });
@@ -52,7 +53,7 @@ export async function settleExpiredLeave(memberId, { now = new Date() } = {}) {
     orderBy: { endAt: 'desc' },
   });
 
-  return prisma.$transaction(async (tx) => {
+  const result = await prisma.$transaction(async (tx) => {
     if (active) {
       await tx.memberLeave.update({
         where: { id: active.id },
@@ -65,6 +66,16 @@ export async function settleExpiredLeave(memberId, { now = new Date() } = {}) {
     });
     return { settled: true, member: updated, leave: active };
   });
+
+  const subId = active?.subscriptionId;
+  if (subId) {
+    const sub = await prisma.cardSubscription.findUnique({ where: { id: subId } });
+    if (sub?.status === 'PAUSED') {
+      await resumeCardSubscription(sub.id, { now });
+    }
+  }
+
+  return result;
 }
 
 /**
@@ -318,7 +329,7 @@ export async function listMemberLeaves({ memberId, status, take = 50 } = {}) {
   });
 }
 
-/** 閘機／進場前：請假中擋月費；期滿自動清 leaveUntil */
+/** 閘機／進場前：請假中擋月費；期滿自動清 leaveUntil 並恢復 PAUSED 訂閱 */
 export async function assertMemberNotOnLeave(member, { now = new Date(), tx } = {}) {
   if (!member?.leaveUntil) return member;
   if (new Date(member.leaveUntil) > now) {
@@ -327,8 +338,11 @@ export async function assertMemberNotOnLeave(member, { now = new Date(), tx } = 
       403,
     );
   }
-  // 期滿：清 leaveUntil
   const db = tx || prisma;
+  const active = await db.memberLeave.findFirst({
+    where: { memberId: member.id, status: 'ACTIVE' },
+    orderBy: { endAt: 'desc' },
+  });
   const updated = await db.member.update({
     where: { id: member.id },
     data: { leaveUntil: null },
@@ -337,5 +351,14 @@ export async function assertMemberNotOnLeave(member, { now = new Date(), tx } = 
     where: { memberId: member.id, status: 'ACTIVE', endAt: { lte: now } },
     data: { status: 'ENDED', endedAt: now },
   });
+
+  const subId = active?.subscriptionId;
+  if (subId) {
+    // 用 root client 恢復訂閱，避免卡在進場長交易裡
+    const sub = await prisma.cardSubscription.findUnique({ where: { id: subId } });
+    if (sub?.status === 'PAUSED') {
+      await resumeCardSubscription(sub.id, { now });
+    }
+  }
   return updated;
 }

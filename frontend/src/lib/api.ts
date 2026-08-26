@@ -36,6 +36,7 @@ import type {
   MemberContractListItem,
   CoursePlan,
   CardSubscription,
+  HqCompensationLog,
 } from '../types/api';
 import type { StaffInfo } from './storage';
 
@@ -115,6 +116,35 @@ export function getErrorMessage(error: unknown, fallback = '系統錯誤'): stri
   }
   if (error instanceof Error) return error.message;
   return fallback;
+}
+
+/** 閘機／業務錯誤的結構化欄位（memberId、code） */
+export function getApiErrorDetails(error: unknown): {
+  message: string;
+  memberId?: number;
+  code?: string;
+  status?: number;
+} {
+  const message = getErrorMessage(error);
+  if (!axios.isAxiosError(error) || !error.response?.data) {
+    return { message };
+  }
+  const data = error.response.data as {
+    message?: string;
+    memberId?: number;
+    code?: string;
+  };
+  const memberId =
+    typeof data.memberId === 'number' && Number.isFinite(data.memberId)
+      ? data.memberId
+      : undefined;
+  const code = typeof data.code === 'string' ? data.code : undefined;
+  return {
+    message: data.message || message,
+    memberId,
+    code,
+    status: error.response.status,
+  };
 }
 
 /** 閘機配對金鑰／權限錯誤（應重新配對）；網路／5xx 不算 */
@@ -518,8 +548,29 @@ export async function fetchGateFaceStatus() {
 }
 
 // ── Ops ──
-export async function fetchOpsMembers() {
-  const { data } = await staffApi.get<ApiResponse<OpsMember[]>>('/ops/members');
+export async function fetchOpsMembers(params?: {
+  q?: string;
+  take?: number;
+  skip?: number;
+  id?: number;
+  lite?: boolean;
+}) {
+  const { data } = await staffApi.get<
+    ApiResponse<{
+      items: OpsMember[];
+      total: number;
+      take: number;
+      skip: number;
+    }>
+  >('/ops/members', {
+    params: {
+      q: params?.q || undefined,
+      take: params?.take,
+      skip: params?.skip,
+      id: params?.id,
+      lite: params?.lite ? 1 : undefined,
+    },
+  });
   return data;
 }
 
@@ -1008,9 +1059,12 @@ export async function deleteHqVenue(id: number) {
   return data;
 }
 
-export async function fetchHqPromotions(branchId?: number) {
+export async function fetchHqPromotions(branchId?: number, kind?: 'SALE' | 'COMPENSATION') {
   const { data } = await staffApi.get<ApiResponse<Promotion[]>>('/hq/promotions', {
-    params: branchId ? { branchId } : undefined,
+    params: {
+      ...(branchId ? { branchId } : {}),
+      ...(kind ? { kind } : {}),
+    },
   });
   return data;
 }
@@ -1020,6 +1074,7 @@ export async function createPromotion(payload: {
   name: string;
   price: number;
   bonusGiven?: number;
+  kind?: 'SALE' | 'COMPENSATION';
   usageType?: 'TIMED' | 'UNLIMITED';
   planMode?: 'STANDING' | 'CAMPAIGN';
   saleStartAt?: string | null;
@@ -1029,6 +1084,7 @@ export async function createPromotion(payload: {
   periodCount?: number | null;
   requiresMemberContract?: boolean;
   enableCardRecurring?: boolean;
+  recurringAmount?: number | null;
   contractIds?: number[];
 }) {
   const { data } = await staffApi.post<ApiResponse<Promotion | Promotion[]>>('/hq/promotions', payload);
@@ -1041,6 +1097,7 @@ export async function updateHqPromotion(
     name: string;
     price: number;
     bonusGiven: number;
+    kind: 'SALE' | 'COMPENSATION';
     usageType: 'TIMED' | 'UNLIMITED';
     planMode: 'STANDING' | 'CAMPAIGN';
     saleStartAt: string | null;
@@ -1050,11 +1107,103 @@ export async function updateHqPromotion(
     periodCount: number | null;
     requiresMemberContract: boolean;
     enableCardRecurring: boolean;
+    recurringAmount: number | null;
     isActive: boolean;
     contractIds: number[];
   }>,
 ) {
   const { data } = await staffApi.patch<ApiResponse<Promotion>>(`/hq/promotions/${id}`, payload);
+  return data;
+}
+
+export async function searchHqMembers(q: string) {
+  const { data } = await staffApi.get<
+    ApiResponse<
+      Pick<
+        OpsMember,
+        | 'id'
+        | 'memberNo'
+        | 'name'
+        | 'phone'
+        | 'plan'
+        | 'expireDate'
+        | 'cashWallet'
+        | 'bonusWallet'
+        | 'isAlert'
+      >[]
+    >
+  >('/hq/members/search', { params: { q } });
+  return data;
+}
+
+export async function fetchHqCompensationLogs(params?: {
+  memberId?: number;
+  action?: string;
+  limit?: number;
+}) {
+  const { data } = await staffApi.get<ApiResponse<HqCompensationLog[]>>('/hq/compensation-logs', {
+    params,
+  });
+  return data;
+}
+
+export async function compensateHqMemberBonus(
+  memberId: number,
+  payload: { promotionId: number; reason: string },
+) {
+  const { data } = await staffApi.post<
+    ApiResponse<{
+      member: OpsMember;
+      bonusAdded: number;
+      promotion: Promotion;
+      log: HqCompensationLog;
+    }>
+  >(`/hq/members/${memberId}/compensate-bonus`, payload);
+  return data;
+}
+
+export async function compensateHqMemberExpire(
+  memberId: number,
+  payload: { days: number; reason: string },
+) {
+  const { data } = await staffApi.post<
+    ApiResponse<{
+      member: OpsMember;
+      days: number;
+      expireDateBefore?: string | null;
+      expireDateAfter?: string | null;
+      log: HqCompensationLog;
+    }>
+  >(`/hq/members/${memberId}/compensate-expire`, payload);
+  return data;
+}
+
+export async function clearHqMemberAlert(memberId: number, payload: { reason: string }) {
+  const { data } = await staffApi.post<
+    ApiResponse<{ member: OpsMember; alreadyCleared: boolean; log: HqCompensationLog }>
+  >(`/hq/members/${memberId}/clear-alert`, payload);
+  return data;
+}
+
+export async function compensateHqMemberCourse(
+  memberId: number,
+  payload: { coursePlanId: number; trainerId: number; reason: string },
+) {
+  const { data } = await staffApi.post<
+    ApiResponse<{
+      member: OpsMember;
+      contract: {
+        id: number;
+        source: string;
+        totalSessions: number;
+        pricePaid: number;
+        coursePlanId?: number | null;
+      };
+      sessions: number;
+      coursePlan: CoursePlan;
+      log: HqCompensationLog;
+    }>
+  >(`/hq/members/${memberId}/compensate-course`, payload);
   return data;
 }
 
@@ -1065,9 +1214,12 @@ export async function deleteHqPromotion(id: number) {
   return data;
 }
 
-export async function fetchHqCoursePlans(branchId?: number) {
+export async function fetchHqCoursePlans(branchId?: number, kind?: 'SALE' | 'COMPENSATION') {
   const { data } = await staffApi.get<ApiResponse<CoursePlan[]>>('/hq/course-plans', {
-    params: branchId ? { branchId } : undefined,
+    params: {
+      ...(branchId ? { branchId } : {}),
+      ...(kind ? { kind } : {}),
+    },
   });
   return data;
 }
@@ -1075,6 +1227,7 @@ export async function fetchHqCoursePlans(branchId?: number) {
 export async function createHqCoursePlan(payload: {
   branchIds: number[];
   name: string;
+  kind?: 'SALE' | 'COMPENSATION';
   planType: 'CUSTOM_PT' | 'GROUP';
   planMode?: 'STANDING' | 'CAMPAIGN';
   saleStartAt?: string | null;
@@ -1084,9 +1237,14 @@ export async function createHqCoursePlan(payload: {
   capacity?: number | null;
   description?: string | null;
   enableCardRecurring?: boolean;
+  recurringPeriods?: number | null;
+  recurringAmount?: number | null;
+  recurringAmount4?: number | null;
+  recurringAmountFinal?: number | null;
   requiresMemberContract?: boolean;
   enableSecondPerson?: boolean;
   giftLabel?: string | null;
+  giftQty?: number | null;
   contractIds?: number[];
 }) {
   const { data } = await staffApi.post<ApiResponse<CoursePlan | CoursePlan[]>>(
@@ -1100,6 +1258,7 @@ export async function updateHqCoursePlan(
   id: number,
   payload: Partial<{
     name: string;
+    kind: 'SALE' | 'COMPENSATION';
     planType: 'CUSTOM_PT' | 'GROUP';
     planMode: 'STANDING' | 'CAMPAIGN';
     saleStartAt: string | null;
@@ -1109,9 +1268,14 @@ export async function updateHqCoursePlan(
     capacity: number | null;
     description: string | null;
     enableCardRecurring: boolean;
+    recurringPeriods: number | null;
+    recurringAmount: number | null;
+    recurringAmount4: number | null;
+    recurringAmountFinal: number | null;
     requiresMemberContract: boolean;
     enableSecondPerson: boolean;
     giftLabel: string | null;
+    giftQty: number | null;
     contractIds: number[];
     isActive: boolean;
   }>,
@@ -1353,6 +1517,7 @@ export async function posCheckout(payload: {
   return data;
 }
 
+/** 幕前金流：同頁導向（一次付清／分期） */
 function redirectToCheckOut(actionUrl: string, payload: Record<string, string>) {
   const form = document.createElement('form');
   form.method = 'POST';
@@ -1368,7 +1533,52 @@ function redirectToCheckOut(actionUrl: string, payload: Record<string, string>) 
   form.submit();
 }
 
-export { redirectToCheckOut };
+/**
+ * 續期收款：另開分頁送 PayUNi（該支付頁不回流 ReturnURL）
+ * 原頁靠 Notify + 輪詢完成交易收尾
+ */
+function openPayuniCheckoutInNewTab(actionUrl: string, payload: Record<string, string>) {
+  const win = window.open('about:blank', 'payuni_period_checkout');
+  const form = document.createElement('form');
+  form.method = 'POST';
+  form.action = actionUrl;
+  form.target = win ? 'payuni_period_checkout' : '_blank';
+  for (const key of Object.keys(payload)) {
+    const input = document.createElement('input');
+    input.type = 'hidden';
+    input.name = key;
+    input.value = payload[key];
+    form.appendChild(input);
+  }
+  document.body.appendChild(form);
+  form.submit();
+  form.remove();
+  return win;
+}
+
+export async function fetchOpsCheckoutStatus(ref: string) {
+  const id = encodeURIComponent(String(ref || '').trim());
+  const { data } = await staffApi.get<
+    ApiResponse<{
+      kind: 'checkout' | 'order';
+      checkoutId?: string | null;
+      orderId?: string | null;
+      saleId?: string | null;
+      payStatus: string;
+      amount: number;
+      cardAmount?: number;
+      cardMode?: string | null;
+      merchantNo?: string | null;
+      invoiceNumber?: string | null;
+      ptFulfilled?: boolean | null;
+      hasCreditHash?: boolean;
+      updatedAt?: string;
+    }>
+  >(`/ops/checkout/${id}`);
+  return data;
+}
+
+export { redirectToCheckOut, openPayuniCheckoutInNewTab };
 
 // ── PT／團課管理 ──
 export async function fetchPtDashboard() {
@@ -1466,6 +1676,21 @@ export async function schedulePrivateSession(payload: {
   viewAsTrainerId?: number;
 }) {
   const { data } = await staffApi.post('/trainer/schedule-private', payload);
+  return data;
+}
+
+/** 拖拉改期：僅改時間／場地，不重扣堂 */
+export async function rescheduleTrainerClass(
+  classId: number,
+  payload: {
+    startAt: string;
+    endAt: string;
+    venueId?: number;
+    stationId?: number | null;
+    viewAsTrainerId?: number;
+  },
+) {
+  const { data } = await staffApi.patch(`/trainer/classes/${classId}/reschedule`, payload);
   return data;
 }
 

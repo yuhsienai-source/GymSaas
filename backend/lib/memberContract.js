@@ -331,14 +331,24 @@ export async function memberHasSignedNewMemberContract(memberId, db = prisma) {
 /** 進場／門禁碼：未簽會員契約則拒絕（有啟用中範本時） */
 export async function assertMemberSignedNewMemberContract(memberId, db = prisma) {
   const contract = await findNewMemberContract(db);
-  if (!contract?.versions?.[0]) return null;
-  const ok = await memberHasSignedNewMemberContract(memberId, db);
-  if (!ok) {
+  const version = contract?.versions?.[0];
+  if (!version) return null;
+  const signed = await db.memberContractSignature.findFirst({
+    where: {
+      memberId,
+      contractVersionId: version.id,
+      status: 'SIGNED',
+    },
+    select: { id: true },
+  });
+  if (!signed) {
     const label = contract.shortName || contract.title || '會員契約';
     const err = new Error(
       `⚖️ 請先完成「${label}」電子簽名，始可進場（必簽未簽）`,
     );
     err.statusCode = 403;
+    err.memberId = memberId;
+    err.code = 'CONTRACT_UNSIGNED';
     throw err;
   }
   return contract;

@@ -101,12 +101,9 @@ function memberPublic(m) {
 
 async function buildOnboardingStatus(decoded) {
   const phone = decoded.phone;
-  let member = null;
-  if (decoded.memberId) {
-    member = await prisma.member.findUnique({ where: { id: decoded.memberId } });
-  } else {
-    member = await prisma.member.findUnique({ where: { phone } });
-  }
+  const member = decoded.memberId
+    ? await prisma.member.findUnique({ where: { id: decoded.memberId } })
+    : await prisma.member.findUnique({ where: { phone } });
 
   const isRegister = decoded.purpose === 'REGISTER';
   const isLogin = decoded.purpose === 'LOGIN';

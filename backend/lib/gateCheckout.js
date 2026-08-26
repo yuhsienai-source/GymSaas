@@ -75,7 +75,7 @@ export async function processCheckOut({ memberId, exitMethod, branchId, logId = 
     );
     const totalFee = parseFloat((durationInMinutes * FEE_PER_MINUTE).toFixed(1));
 
-    let deductBonus = 0;
+    let deductBonus;
     let deductCash = 0;
     if (member.bonusWallet >= totalFee) {
       deductBonus = totalFee;

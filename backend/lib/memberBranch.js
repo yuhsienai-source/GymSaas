@@ -163,7 +163,7 @@ export async function assertMemberBoundGateAccess(memberId, gateBranchId, db = p
 
   try {
     assertGateAccessAllowed(bound, gateBranch);
-  } catch (err) {
+  } catch (_err) {
     const gate = staffBranchLabel(gateBranch) || gateBranch.id;
     const boundLabels = bound.map((b) => staffBranchLabel(b) || b.id).join('、');
     throw httpError(

@@ -281,7 +281,9 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
         subscription?: { id?: string; originOrderId?: string | null };
         unusedDays?: number;
         periodDays?: number;
+        usedDays?: number;
         estimatedAllowance?: number;
+        refundDetail?: { note?: string; fee?: number; ratio?: number } | null;
         latestOrder?: { id: string; invoiceNumber?: string | null; amount: number } | null;
         member?: { expireDate?: string | null; name?: string };
       };
@@ -295,9 +297,10 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
             : null,
           `會員：${d.member?.name || '—'}`,
           `效期至：${fmtDate(d.member?.expireDate)}（剩餘約 ${d.unusedDays ?? 0} 天）`,
-          `本期天數：${d.periodDays ?? '—'}`,
+          `本期天數：${d.periodDays ?? '—'}／已使用約 ${d.usedDays ?? '—'} 天`,
           `最近訂單：${d.latestOrder?.id || '無'}／發票 ${d.latestOrder?.invoiceNumber || '無'}／$${d.latestOrder?.amount ?? 0}`,
           `預估折讓：$${d.estimatedAllowance ?? 0}（僅 CUT_UNUSED + 開折讓）`,
+          d.refundDetail?.note ? `計算說明：${d.refundDetail.note}` : null,
         ]
           .filter(Boolean)
           .join('\n'),
@@ -315,7 +318,7 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
       expirePolicy === 'KEEP'
         ? '停續扣並保留已付效期'
         : expirePolicy === 'CUT_UNUSED'
-          ? '停續扣、截斷效期，並對未使用天數開立 ezPay 折讓'
+          ? '停續扣、截斷效期，並依月卡退費基準開立 ezPay 折讓（未滿十五日可退、手續費$500）'
           : '停續扣並截斷效期（不開折讓）';
     if (!window.confirm(`確定取消訂閱 ${selectedSubId}？\n${label}`)) return;
     setBusy(true);
@@ -432,6 +435,7 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
           branchId={branchId}
           onBranchIdChange={setBranchId}
           hideBranchField
+          pageDesc="於列表列執行取消沖回／退費折讓；規則見頁面上方說明 · CSV 最多 1000 筆"
         />
       )}
 
@@ -618,7 +622,7 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
       {subTab === 'subscription' && (
         <PageSection
           title="月卡訂閱／請假"
-          desc="取消訂閱可保留或截斷效期，並對未使用天數開立 ezPay 折讓；請假會順延效期與定期定額扣款日"
+          desc="取消訂閱可保留或截斷效期；退費折讓依 30 日一期基準（未滿十五日＝已繳×存續比例−$500；滿／逾十五日不可退）；請假會順延效期與定期定額扣款日"
         >
           <div className="form-stack" style={{ gap: '1rem' }}>
             <Card title="訂閱一覽" subtitle="定期定額 CRS…">
@@ -739,7 +743,7 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
 
             <Card
               title="取消訂閱結算"
-              subtitle="可貼訂閱編號 CRS，或首期／續扣訂單號（CRS／舊 TYK）自動反查；KEEP=保留效期｜CUT_UNUSED=截斷並折讓｜CUT_NO_ALLOWANCE=截斷不折讓"
+              subtitle="可貼訂閱編號 CRS，或首期／續扣訂單號（CRS／舊 TYK）自動反查；KEEP=保留效期｜CUT_UNUSED=截斷並依月卡基準折讓｜CUT_NO_ALLOWANCE=截斷不折讓"
             >
               <div className="form-stack">
                 <Field label="訂閱編號／訂單編號">
@@ -755,7 +759,7 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
                     onChange={(e) => setExpirePolicy(e.target.value as ExpirePolicy)}
                   >
                     <option value="KEEP">KEEP：停續扣，保留已付效期</option>
-                    <option value="CUT_UNUSED">CUT_UNUSED：截斷效期 + 未使用折讓</option>
+                    <option value="CUT_UNUSED">CUT_UNUSED：截斷效期 + 月卡退費折讓</option>
                     <option value="CUT_NO_ALLOWANCE">CUT_NO_ALLOWANCE：截斷效期、不開折讓</option>
                   </Select>
                 </Field>
@@ -766,7 +770,7 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
                       checked={doAllowance}
                       onChange={(e) => setDoAllowance(e.target.checked)}
                     />{' '}
-                    呼叫 ezPay 開立折讓（依未使用天數／本期天數比例）
+                    呼叫 ezPay 開立折讓（未滿十五日：已繳×存續比例−手續費$500；滿／逾十五日不可退）
                   </label>
                 )}
                 <Field label="原因（選填）">

@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Button, Card, Field, Input, PageSection, Select } from '../../../components/ui';
+import MonoLineChart from '../../../components/staff/MonoLineChart';
 import { useToast } from '../../../contexts/ToastContext';
 import {
   fetchSalesAnalytics,
@@ -199,6 +200,38 @@ export default function HqSalesAnalyticsTab({ branches, trainers }: Props) {
   const summary = payload?.summary;
   const rows = payload?.rows ?? [];
 
+  const chartPoints = useMemo(() => {
+    if (kind === 'daily') {
+      return rows.map((r) => ({
+        label: String(r.date ?? ''),
+        value: Number(r.total) || 0,
+        detail: `儲值 ${fmtMoney(r.topupAmount)} · 商品 ${fmtMoney(r.salesAmount)} · 進出場 ${fmtMoney(r.gateFee)} · 私教 ${fmtMoney(r.ptRevenue)}`,
+      }));
+    }
+    if (kind === 'overview') {
+      return rows.map((r) => ({
+        label: String(r.metric ?? ''),
+        value: Number(r.amount) || 0,
+        detail: `筆數 ${Number(r.count) || 0}`,
+      }));
+    }
+    if (kind === 'pay-mix') {
+      return rows.map((r) => ({
+        label: String(r.method ?? ''),
+        value: Number(r.amount) || 0,
+        detail: `占比 ${Number(r.share) || 0}%`,
+      }));
+    }
+    if (kind === 'branch') {
+      return rows.map((r) => ({
+        label: String(r.branchName ?? r.branchId ?? ''),
+        value: Number(r.salesAmount) || 0,
+        detail: `單數 ${Number(r.salesCount) || 0}`,
+      }));
+    }
+    return [];
+  }, [kind, rows]);
+
   return (
     <PageSection title="銷售分析" desc="依期間／分店彙總各渠道營收與結構，明細請至「一般報表」">
       <div className="hq-tabs hq-tabs--desktop" role="tablist" aria-label="銷售分析項目">
@@ -299,10 +332,7 @@ export default function HqSalesAnalyticsTab({ branches, trainers }: Props) {
       </Card>
 
       {summary && (
-        <div
-          className="wallet-row"
-          style={{ margin: '0.75rem 0', gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 1fr))' }}
-        >
+        <div className="bento-grid bento-grid--stats" style={{ margin: '0.75rem 0' }}>
           {kind === 'overview' && (
             <>
               <div className="stat-card">
@@ -396,6 +426,12 @@ export default function HqSalesAnalyticsTab({ branches, trainers }: Props) {
             </>
           )}
         </div>
+      )}
+
+      {chartPoints.length > 0 && (
+        <Card title="趨勢圖" subtitle="預設只看大趨勢 · 游標懸停資料點才顯示細分" padding="md">
+          <MonoLineChart points={chartPoints} />
+        </Card>
       )}
 
       <div className="table-wrap">

@@ -18,19 +18,24 @@ import { formatGateAccessNo } from '../lib/gateAccessNo.js';
 const router = express.Router();
 const MIN_BALANCE_FOR_TIMED = 10;
 
-function httpError(message, statusCode) {
+function httpError(message, statusCode, extra = {}) {
   const err = new Error(message);
   err.statusCode = statusCode;
+  if (extra.memberId != null) err.memberId = extra.memberId;
+  if (extra.code) err.code = extra.code;
   return err;
 }
 
 function sendGateError(res, error, fallbackMessage) {
   console.error(error);
   const statusCode = error.statusCode || 500;
-  return res.status(statusCode).json({
+  const body = {
     status: 'error',
     message: error.statusCode ? error.message : fallbackMessage,
-  });
+  };
+  if (error.memberId != null) body.memberId = error.memberId;
+  if (error.code) body.code = error.code;
+  return res.status(statusCode).json(body);
 }
 
 // ==========================================
@@ -112,44 +117,64 @@ function assertQrNotBlockedByAlert(member) {
 async function processCheckIn(memberId, entryMethod, branchId, gateDeviceId = null) {
   const now = new Date();
 
+  // 交易外預檢：契約／人臉同意（縮短進場交易持鎖時間）
+  try {
+    await assertMemberSignedNewMemberContract(memberId);
+  } catch (err) {
+    if (err && typeof err === 'object') {
+      err.memberId = err.memberId ?? memberId;
+      err.code = err.code || 'CONTRACT_UNSIGNED';
+    }
+    throw err;
+  }
+  if (entryMethod === 'FACE') {
+    if (!(await memberHasSignedBiometricsConsent(memberId))) {
+      throw httpError(
+        '⚖️ 拒絕開啟：會員未臨櫃簽署「生物辨識同意書」，依法系統不得處理其人臉特徵。',
+        403,
+        { memberId, code: 'BIOMETRICS_CONSENT' },
+      );
+    }
+  }
+
   return prisma.$transaction(async (tx) => {
     const member = await tx.member.findUnique({ where: { id: memberId } });
     if (!member) throw httpError('無此會員', 404);
 
-    // 會員契約（入會）必簽：未簽不得進場
-    await assertMemberSignedNewMemberContract(memberId, tx);
-
     if (member.isAlert && entryMethod === 'QR') {
       throw httpError(
         '🚨 警示帳號：動態 QR Code 已失效！強制要求人工查驗或限用實名生物辨識進場。',
-        403
+        403,
+        { memberId, code: 'ALERT_BLOCK' },
       );
     }
 
-    if (entryMethod === 'FACE') {
-      if (!(await memberHasSignedBiometricsConsent(memberId))) {
-        throw httpError(
-          '⚖️ 拒絕開啟：會員未臨櫃簽署「生物辨識同意書」，依法系統不得處理其人臉特徵。',
-          403
-        );
-      }
-      if (!member.papagoFaceId) {
-        throw httpError('⛔ 此會員尚未完成 PAPAGO 人臉註冊，請至櫃檯辦理綁定。', 403);
-      }
+    if (entryMethod === 'FACE' && !member.papagoFaceId) {
+      throw httpError('⛔ 此會員尚未完成 PAPAGO 人臉註冊，請至櫃檯辦理綁定。', 403, {
+        memberId,
+        code: 'FACE_UNBOUND',
+      });
     }
 
     const unfinishedLog = await tx.checkInLog.findFirst({
       where: { memberId, checkOutAt: null, status: 'ACTIVE' },
     });
     if (unfinishedLog) {
-      throw httpError('⛔ 防卡單：會員已在場內，請先完成出場結算。', 400);
+      throw httpError('⛔ 防卡單：會員已在場內，請先完成出場結算。', 400, {
+        memberId,
+        code: 'ALREADY_IN',
+      });
     }
 
     // 請假中不可用無限／月費通行；期滿自動清 leaveUntil
-    let memberForGate = member;
+    let memberForGate;
     try {
       memberForGate = await assertMemberNotOnLeave(member, { now, tx });
     } catch (leaveErr) {
+      if (leaveErr && typeof leaveErr === 'object') {
+        leaveErr.memberId = memberId;
+        leaveErr.code = leaveErr.code || 'ON_LEAVE';
+      }
       throw leaveErr;
     }
 
@@ -174,7 +199,11 @@ async function processCheckIn(memberId, entryMethod, branchId, gateDeviceId = nu
       if (totalAvailable < MIN_BALANCE_FOR_TIMED) {
         throw httpError(
           `方案已過期或為計時制，餘額不足無法進場！(總額: ${totalAvailable})`,
-          403
+          403,
+          {
+            memberId,
+            code: downgraded ? 'EXPIRED_BALANCE' : 'BALANCE_INSUFFICIENT',
+          },
         );
       }
     }

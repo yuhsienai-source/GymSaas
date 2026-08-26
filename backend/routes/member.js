@@ -3,7 +3,7 @@ import express from 'express';
 import prisma from '../lib/prisma.js';
 import { verifyMember, verifyMemberDevice } from '../middleware/jwtAuth.js';
 import { signGateQrToken, QR_TTL_MS } from '../lib/qrToken.js';
-import { buildUPPPayload, parseCardPayOptions, PAYUNI_UPP_URL } from '../lib/payuni.js';
+import { buildCardCheckoutRequest, parseCardPayOptions } from '../lib/payuni.js';
 import { assertPromotionSellable, promotionSellablePrismaWhere, buildTopupItemDesc } from '../lib/promotion.js';
 import {
   assertMemberSignedPromotionContracts,
@@ -377,6 +377,7 @@ router.get('/pt-contracts', async (req, res) => {
       where: { memberId },
       include: {
         trainer: { select: { id: true, name: true, displayName: true } },
+        coursePlan: { select: { id: true, name: true, kind: true } },
       },
       orderBy: { createdAt: 'desc' },
     });
@@ -388,6 +389,9 @@ router.get('/pt-contracts', async (req, res) => {
         trainer: c.trainer
           ? { id: c.trainer.id, name: resolveDisplayName(c.trainer) }
           : null,
+        source: c.source || 'PURCHASE',
+        coursePlanId: c.coursePlanId ?? null,
+        coursePlanName: c.coursePlan?.name || null,
         totalSessions: c.totalSessions,
         usedSessions: c.usedSessions,
         remainingSessions: c.totalSessions - c.usedSessions,
@@ -663,7 +667,7 @@ router.post('/orders', async (req, res) => {
       },
     });
 
-    const payuniPayload = buildUPPPayload({
+    const { actionUrl, payload: payuniPayload } = buildCardCheckoutRequest({
       id: newOrder.id,
       amount: newOrder.amount,
       itemDesc: newOrder.itemDesc,
@@ -671,13 +675,15 @@ router.post('/orders', async (req, res) => {
       cardInst: cardOpts.cardInst,
       periodType: cardOpts.periodType,
       periodTimes: cardOpts.periodTimes,
+      periodAmt: newOrder.amount,
+      recurringAmount: newOrder.amount,
     });
 
     res.json({
       status: 'success',
       message: '訂單建立成功，準備導向金流',
       data: {
-        actionUrl: PAYUNI_UPP_URL,
+        actionUrl,
         payload: payuniPayload,
         orderId: newOrder.id,
         promotionId: promotion.id,

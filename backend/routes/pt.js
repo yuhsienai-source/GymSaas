@@ -542,6 +542,8 @@ router.post('/buy-contract', async (req, res) => {
             usedSessions: 0,
             pricePaid: priceLine,
             isActive: true,
+            source: 'PURCHASE',
+            coursePlanId: plan.id,
             branchId: plan.branchId,
           },
           include: {

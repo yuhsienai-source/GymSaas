@@ -40,6 +40,48 @@ function parseDateRange(query) {
   return Object.keys(where).length ? where : undefined;
 }
 
+/** 銷售分析專用：必有區間，預設近 30 日，最長 366 日 */
+const ANALYTICS_MAX_DAYS = 366;
+const ANALYTICS_DEFAULT_DAYS = 30;
+
+function parseAnalyticsDateRange(query) {
+  const now = new Date();
+  let to = query.to ? new Date(query.to) : new Date(now);
+  let from = query.from ? new Date(query.from) : null;
+
+  if (Number.isNaN(to.getTime())) {
+    const err = new Error('to 日期格式無效');
+    err.statusCode = 400;
+    throw err;
+  }
+  if (from && Number.isNaN(from.getTime())) {
+    const err = new Error('from 日期格式無效');
+    err.statusCode = 400;
+    throw err;
+  }
+  if (!from) {
+    from = new Date(to);
+    from.setDate(from.getDate() - (ANALYTICS_DEFAULT_DAYS - 1));
+    from.setHours(0, 0, 0, 0);
+  }
+  to.setHours(23, 59, 59, 999);
+
+  const spanMs = to.getTime() - from.getTime();
+  if (spanMs < 0) {
+    const err = new Error('from 不可晚於 to');
+    err.statusCode = 400;
+    throw err;
+  }
+  const maxMs = ANALYTICS_MAX_DAYS * 24 * 60 * 60 * 1000;
+  if (spanMs > maxMs) {
+    from = new Date(to);
+    from.setDate(from.getDate() - (ANALYTICS_MAX_DAYS - 1));
+    from.setHours(0, 0, 0, 0);
+  }
+
+  return { gte: from, lte: to };
+}
+
 function parseOptionalInt(value, fieldName) {
   if (value === undefined || value === null || value === '') return null;
   const n = parseInt(value, 10);
@@ -1421,7 +1463,7 @@ router.get('/analytics', requireAdmin, async (req, res) => {
       });
     }
 
-    const createdAt = parseDateRange(req.query);
+    const createdAt = parseAnalyticsDateRange(req.query);
     const branchId = parseOptionalInt(req.query.branchId, 'branchId');
     const trainerId = parseOptionalInt(req.query.trainerId, 'trainerId');
     const q = String(req.query.q || '').trim();
@@ -1443,6 +1485,7 @@ router.get('/analytics', requireAdmin, async (req, res) => {
 
       const trainers = await prisma.trainer.findMany({
         where: trainerWhere,
+        take: 200,
         select: {
           id: true,
           name: true,
@@ -1450,7 +1493,7 @@ router.get('/analytics', requireAdmin, async (req, res) => {
           role: true,
           isActive: true,
           ptContracts: {
-            where: createdAt ? { createdAt } : undefined,
+            where: { createdAt },
             select: {
               id: true,
               totalSessions: true,
@@ -1462,7 +1505,7 @@ router.get('/analytics', requireAdmin, async (req, res) => {
             },
           },
           classes: {
-            where: createdAt ? { startAt: createdAt } : undefined,
+            where: { startAt: createdAt },
             select: {
               id: true,
               title: true,
@@ -1522,8 +1565,9 @@ router.get('/analytics', requireAdmin, async (req, res) => {
           select: { id: true },
         }),
         prisma.checkoutSession.findMany({
-          where: { branchId },
+          where: { branchId, createdAt },
           select: { id: true },
+          take: 5000,
         }),
       ]);
       const or = [];
@@ -1539,22 +1583,22 @@ router.get('/analytics', requireAdmin, async (req, res) => {
     const topupWhere = {
       status: 'PAID',
       itemDesc: { contains: '商品#' },
-      ...(createdAt ? { createdAt } : {}),
+      createdAt,
       ...topupBranchClause,
     };
     const salesWhere = {
       status: 'PAID',
-      ...(createdAt ? { createdAt } : {}),
+      createdAt,
       ...(branchId ? { branchId } : {}),
     };
     // 進出場依 CheckInLog.branchId 篩選（舊資料無分店則僅在「全部分店」時列入）
     const gateWhere = {
       status: 'ACTIVE',
-      ...(createdAt ? { checkInAt: createdAt } : {}),
+      checkInAt: createdAt,
       ...(branchId ? { branchId } : {}),
     };
     const ptWhere = {
-      ...(createdAt ? { createdAt } : {}),
+      createdAt,
       ...(branchId
         ? { trainer: { branches: { some: { branchId } } } }
         : {}),

@@ -19,10 +19,18 @@ import {
 /**
  * 效期政策：
  * - KEEP：只停續扣，已付效期保留（預設）
- * - CUT_UNUSED：立刻截斷效期並降為計時；可搭配 doAllowance 對最近一期訂單折讓未使用天數
+ * - CUT_UNUSED：立刻截斷效期並降為計時；可搭配 doAllowance 對最近一期訂單折讓（30 日月卡退費基準）
  * - CUT_NO_ALLOWANCE：立刻截斷效期，不呼叫 ezPay（人工退款）
  */
 export const EXPIRE_POLICIES = ['KEEP', 'CUT_UNUSED', 'CUT_NO_ALLOWANCE'];
+
+/** 30 日月卡／訂閱終止退費手續費（新台幣） */
+export const MONTHLY_CARD_REFUND_FEE = 500;
+/**
+ * 本期已使用天數門檻：未滿十五日可退；滿／逾十五日以一期計、無法退費
+ * （不以每 15 日為半期）
+ */
+export const MONTHLY_CARD_MID_PERIOD_DAYS = 15;
 
 function roundMoney(n) {
   return Math.round((Number(n) || 0) * 100) / 100;
@@ -58,19 +66,104 @@ export async function findLatestPaidOrderForSubscription(sub) {
 }
 
 /**
- * 依未使用天數比例計算應折讓金額（以本期天數為分母，上限為訂單金額）
+ * 30 日月卡／訂閱制終止契約退費基準：
+ * - 30 日為一期；不每 15 日以半期計，逾 15 日以一期計
+ * - 未滿十五日：退費 =（已繳金額）×（契約存續比例）− 手續費 $500
+ * - 逾／滿十五日：以一個月計，無法辦理退費
+ * 契約存續比例 = min(剩餘天數, 契約總天數) / 契約總天數
+ * （訂閱每期請款：契約總天數＝本期天數；一次付清多期：契約總天數＝durationDays）
+ *
+ * @returns {{
+ *   amount: number,
+ *   usedDays: number,
+ *   unusedInPeriod: number,
+ *   periodDays: number,
+ *   contractDays: number,
+ *   ratio: number,
+ *   fee: number,
+ *   eligible: boolean,
+ *   note: string,
+ * }}
  */
-export function computeUnusedAllowanceAmount({
+export function computeMonthlyCardRefundDetail({
   orderAmount,
   unusedDays,
   periodDays,
+  contractDays,
+  fee = MONTHLY_CARD_REFUND_FEE,
 }) {
-  const amount = roundMoney(orderAmount);
+  const paid = roundMoney(orderAmount);
+  const period = Math.max(1, Number(periodDays) || 30);
+  const contract = Math.max(period, Number(contractDays) || period);
   const unused = Math.max(0, Number(unusedDays) || 0);
-  const period = Math.max(1, Number(periodDays) || 1);
-  if (amount <= 0 || unused <= 0) return 0;
-  const ratioDays = Math.min(unused, period);
-  return roundMoney((amount * ratioDays) / period);
+  const unusedCapped = Math.min(unused, contract);
+  const usedTotal = Math.max(0, contract - unusedCapped);
+  const usedDays = usedTotal % period; // 本期已使用天數（0～period-1；恰滿整期時為 0）
+  const refundFee = Math.max(0, Number(fee) || 0);
+
+  if (paid <= 0) {
+    return {
+      amount: 0,
+      usedDays,
+      unusedInPeriod: Math.min(unusedCapped, period),
+      periodDays: period,
+      contractDays: contract,
+      ratio: 0,
+      fee: refundFee,
+      eligible: false,
+      note: '訂單金額無效',
+    };
+  }
+  if (unusedCapped <= 0) {
+    return {
+      amount: 0,
+      usedDays: period,
+      unusedInPeriod: 0,
+      periodDays: period,
+      contractDays: contract,
+      ratio: 0,
+      fee: refundFee,
+      eligible: false,
+      note: '未使用天數為 0，無可退費',
+    };
+  }
+  // 滿／逾十五日：本期以一期計，無法辦理退費
+  if (usedDays >= MONTHLY_CARD_MID_PERIOD_DAYS) {
+    return {
+      amount: 0,
+      usedDays,
+      unusedInPeriod: period - usedDays,
+      periodDays: period,
+      contractDays: contract,
+      ratio: 0,
+      fee: refundFee,
+      eligible: false,
+      note: `本期已使用 ${usedDays} 日（≥${MONTHLY_CARD_MID_PERIOD_DAYS} 日），以一期計，無法辦理退費`,
+    };
+  }
+
+  const ratio = unusedCapped / contract;
+  const gross = roundMoney(paid * ratio);
+  const amount = Math.max(0, roundMoney(gross - refundFee));
+  return {
+    amount,
+    usedDays,
+    unusedInPeriod: period - usedDays,
+    periodDays: period,
+    contractDays: contract,
+    ratio: Math.round(ratio * 10000) / 10000,
+    fee: refundFee,
+    eligible: amount > 0,
+    note:
+      amount > 0
+        ? `未滿十五日：$${paid} × ${(ratio * 100).toFixed(1)}% − 手續費$${refundFee} = $${amount}`
+        : `折讓計算後 ≤ 0（$${paid} × 存續比例 − 手續費$${refundFee}）`,
+  };
+}
+
+/** @deprecated 請優先用 computeMonthlyCardRefundDetail；此函式僅回傳金額 */
+export function computeUnusedAllowanceAmount(opts) {
+  return computeMonthlyCardRefundDetail(opts).amount;
 }
 
 /**
@@ -132,20 +225,27 @@ export async function settleCancelSubscription(
 
   if (wantAllowance && latest.order) {
     if (!isUnlimitedPromotion(sub.promotion) && !String(latest.order.itemDesc || '').includes('UNLIMITED')) {
-      // 非無限方案：取消訂閱通常不走此折讓；仍允許依未使用天數比例
+      // 非無限方案：取消訂閱通常不走此折讓；仍允許依月卡退費基準計算
     }
-    const allowanceAmt = computeUnusedAllowanceAmount({
+    const refundDetail = computeMonthlyCardRefundDetail({
       orderAmount: latest.order.amount,
       unusedDays,
       periodDays,
     });
+    const allowanceAmt = refundDetail.amount;
     allowanceMeta = {
       orderId: latest.order.id,
       periodIndex: latest.periodIndex,
       periodDays,
+      contractDays: refundDetail.contractDays,
       unusedDays,
+      usedDays: refundDetail.usedDays,
+      unusedInPeriod: refundDetail.unusedInPeriod,
+      ratio: refundDetail.ratio,
+      fee: refundDetail.fee,
       allowanceAmt,
       invoiceNumber: latest.order.invoiceNumber || null,
+      note: refundDetail.note,
     };
 
     if (allowanceAmt > 0 && latest.order.invoiceNumber) {
@@ -159,7 +259,7 @@ export async function settleCancelSubscription(
         skip: false,
         prefer: 'allowance',
         amount: allowanceAmt,
-        itemDesc: `${latest.order.itemDesc || '月卡'}｜取消訂閱未使用折讓`,
+        itemDesc: `${latest.order.itemDesc || '月卡'}｜取消訂閱退費折讓`,
         invoiceNumber: latest.order.invoiceNumber,
         merchantOrderNo: ctx.merchantOrderNo,
       };
@@ -173,9 +273,7 @@ export async function settleCancelSubscription(
         throw err;
       }
     } else if (allowanceAmt > 0 && !latest.order.invoiceNumber) {
-      allowanceMeta.note = '最近一期訂單無發票，略過 ezPay；請人工退款';
-    } else {
-      allowanceMeta.note = '未使用天數為 0 或無可折讓金額';
+      allowanceMeta.note = `${refundDetail.note}；最近一期訂單無發票，略過 ezPay；請人工退款`;
     }
   }
 
@@ -244,6 +342,7 @@ export async function settleCancelSubscription(
 
 /**
  * 解析月卡訂單的方案天數（一次付清／現金無訂閱）
+ * periodDays＝每期天數（15 日門檻用）；contractDays＝整約天數（存續比例分母）
  */
 async function resolveUnlimitedOrderPeriodDays(order) {
   const promoMatch = String(order.itemDesc || '').match(/商品#(\d+)/);
@@ -256,10 +355,17 @@ async function resolveUnlimitedOrderPeriodDays(order) {
   const periodDays =
     resolveRecurringPeriodDays(promotion) ||
     promotion?.unitDays ||
+    (daysFromDesc && promotion?.periodCount > 1
+      ? null
+      : daysFromDesc
+        ? parseInt(daysFromDesc[1], 10)
+        : null) ||
+    30;
+  const contractDays =
     promotion?.durationDays ||
     (daysFromDesc ? parseInt(daysFromDesc[1], 10) : null) ||
-    30;
-  return { promotion, periodDays };
+    periodDays;
+  return { promotion, periodDays, contractDays };
 }
 
 /**
@@ -289,12 +395,13 @@ export async function previewCancelUnlimitedOrder(orderId, { now = new Date() } 
     throw httpError(`訂單狀態為 [${order.status}]，僅已付款可取消結算`);
   }
 
-  const { promotion, periodDays } = await resolveUnlimitedOrderPeriodDays(order);
+  const { promotion, periodDays, contractDays } = await resolveUnlimitedOrderPeriodDays(order);
   const unusedDays = remainingExpireDays(order.member?.expireDate, now);
-  const estimatedAllowance = computeUnusedAllowanceAmount({
+  const refundDetail = computeMonthlyCardRefundDetail({
     orderAmount: order.amount,
     unusedDays,
     periodDays,
+    contractDays,
   });
 
   return {
@@ -322,6 +429,9 @@ export async function previewCancelUnlimitedOrder(orderId, { now = new Date() } 
     expirePolicies: EXPIRE_POLICIES,
     unusedDays,
     periodDays,
+    contractDays,
+    usedDays: refundDetail.usedDays,
+    refundDetail,
     latestOrder: {
       id: order.id,
       amount: order.amount,
@@ -329,14 +439,14 @@ export async function previewCancelUnlimitedOrder(orderId, { now = new Date() } 
       status: order.status,
       periodIndex: 1,
     },
-    estimatedAllowance,
+    estimatedAllowance: refundDetail.amount,
   };
 }
 
 /**
  * 取消一次付清／現金月卡（無定期定額訂閱）
  * - KEEP：僅標記訂單 CANCELLED，效期保留
- * - CUT_UNUSED：截斷效期；可對未使用天數開立折讓，訂單 REFUNDED
+ * - CUT_UNUSED：截斷效期；可依月卡退費基準開立折讓，訂單 REFUNDED
  * - CUT_NO_ALLOWANCE：截斷效期，訂單 CANCELLED，不呼叫 ezPay
  */
 export async function settleCancelUnlimitedOrder(
@@ -385,7 +495,7 @@ export async function settleCancelUnlimitedOrder(
     });
   }
 
-  const { periodDays } = await resolveUnlimitedOrderPeriodDays(order);
+  const { periodDays, contractDays } = await resolveUnlimitedOrderPeriodDays(order);
   const unusedDays = remainingExpireDays(order.member?.expireDate, now);
   const wantAllowance =
     policy === 'CUT_UNUSED' && (doAllowance === undefined ? true : Boolean(doAllowance));
@@ -394,18 +504,26 @@ export async function settleCancelUnlimitedOrder(
   let allowanceMeta = null;
 
   if (wantAllowance) {
-    const allowanceAmt = computeUnusedAllowanceAmount({
+    const refundDetail = computeMonthlyCardRefundDetail({
       orderAmount: order.amount,
       unusedDays,
       periodDays,
+      contractDays,
     });
+    const allowanceAmt = refundDetail.amount;
     allowanceMeta = {
       orderId: order.id,
       periodIndex: 1,
       periodDays,
+      contractDays,
       unusedDays,
+      usedDays: refundDetail.usedDays,
+      unusedInPeriod: refundDetail.unusedInPeriod,
+      ratio: refundDetail.ratio,
+      fee: refundDetail.fee,
       allowanceAmt,
       invoiceNumber: order.invoiceNumber || null,
+      note: refundDetail.note,
     };
 
     if (allowanceAmt > 0 && order.invoiceNumber) {
@@ -415,7 +533,7 @@ export async function settleCancelUnlimitedOrder(
         skip: false,
         prefer: 'allowance',
         amount: allowanceAmt,
-        itemDesc: `${order.itemDesc || '月卡'}｜取消月卡未使用折讓`,
+        itemDesc: `${order.itemDesc || '月卡'}｜取消月卡退費折讓`,
         invoiceNumber: order.invoiceNumber,
         merchantOrderNo: ctx.merchantOrderNo,
       };
@@ -431,9 +549,7 @@ export async function settleCancelUnlimitedOrder(
         throw err;
       }
     } else if (allowanceAmt > 0 && !order.invoiceNumber) {
-      allowanceMeta.note = '訂單無發票，略過 ezPay；請人工退款';
-    } else {
-      allowanceMeta.note = '未使用天數為 0 或無可折讓金額';
+      allowanceMeta.note = `${refundDetail.note}；訂單無發票，略過 ezPay；請人工退款`;
     }
   } else if (policy === 'CUT_NO_ALLOWANCE' || policy === 'KEEP') {
     // 取消沖回：有整張發票且無合併存活子單時嘗試作廢
@@ -500,6 +616,7 @@ export async function settleCancelUnlimitedOrder(
     expirePolicy: policy,
     unusedDays,
     periodDays,
+    contractDays,
     allowance: allowanceMeta,
     invoice: invoiceReverse,
     alreadyCancelled: false,

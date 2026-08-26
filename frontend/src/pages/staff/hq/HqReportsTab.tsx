@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
-import { Button, Card, Field, Input, Modal, PageSection, Select } from '../../../components/ui';
+import { Alert, Button, Card, Field, Input, Modal, PageSection, Select } from '../../../components/ui';
 import { useToast } from '../../../contexts/ToastContext';
 import {
   cancelOpsCardSubscription,
@@ -300,7 +300,7 @@ export default function HqReportsTab({
     if (
       !window.confirm(
         isUnlimited && !isRecurring
-          ? `確定取消沖回月卡購案 ${orderId}？\n將截斷效期並降為計時（不開折讓）；若要按未使用天數折讓請用「退費折讓」。`
+          ? `確定取消沖回月卡購案 ${orderId}？\n將截斷效期並降為計時（不開折讓）；若要依月卡退費基準折讓請用「退費折讓」。`
           : `確定取消沖回訂閱／月卡相關單號 ${orderId}？\n（定期定額將停續扣並保留效期；計時儲值請改用退費折讓）`,
       )
     )
@@ -326,7 +326,8 @@ export default function HqReportsTab({
     if (isUnlimited) {
       if (
         !window.confirm(
-          `確定對月卡 ${orderId} 執行退費折讓？將截斷效期，並依未使用天數開立 ezPay 折讓。`,
+          `確定對月卡 ${orderId} 執行退費折讓？\n` +
+            `將截斷效期。退費基準：30 日為一期；未滿十五日＝已繳×存續比例−手續費$500；滿／逾十五日以一期計不可退。`,
         )
       )
         return;
@@ -346,7 +347,9 @@ export default function HqReportsTab({
     }
     if (
       !window.confirm(
-        `確定對 ${orderId} 執行退費折讓？將回收運動金並對已開立發票開立 ezPay 折讓。`,
+        `確定對 ${orderId} 執行退費折讓？\n` +
+          `公式：實付金額 − 實際使用額度 − 手續費 $100 = 退費金額\n` +
+          `將回收剩餘本金／運動金，並對已開立發票開立 ezPay 折讓。`,
       )
     )
       return;
@@ -627,31 +630,88 @@ export default function HqReportsTab({
     pageDesc ||
     (fixedKind === 'orders'
       ? '依分店查詢合併結帳／獨立訂單 · 明細與 CSV（最多 1000 筆）'
-      : '明細列表查詢與 CSV 輸出（最多 1000 筆）');
+      : '明細列表查詢與 CSV 輸出；列上可執行取消沖回／退費折讓（最多 1000 筆）');
+
+  const reverseRulesByKind: Record<Exclude<ReportKind, 'orders'>, string> = {
+    topup:
+      '儲值／月卡：計時儲值僅能「退費折讓」，公式＝實付金額 − 實際使用額度 − 手續費$100。無限月卡／訂閱「退費折讓」＝截斷效期；未滿十五日＝已繳金額×契約存續比例−手續費$500，滿／逾十五日以一期計不可退。無限月卡「取消沖回」＝截斷效期、不開折讓。定期定額「取消沖回」＝停續扣並保留效期。',
+    sales:
+      '銷貨：兩者皆回補庫存並退回零錢包。「取消沖回」優先作廢發票；「退費折讓」優先開立折讓單（應退現金＞0 且有真實發票時）。已結案列不可再操作。',
+    gate:
+      '進出場：僅「取消沖回」。在場可取消不計費；已出場則退回已扣費用至零錢包（已出場退費限 DUTY 以上）。無退費折讓按鈕。',
+    coursePurchases:
+      '私教購案：「取消沖回」優先作廢／沖回發票；「退費折讓」開立折讓單。兩者皆停用未使用合約；若已使用堂數則無法取消沖回。合併結帳請盡量用列上的訂單號操作，避免一次沖掉整筆 CHK。',
+  };
 
   return (
     <PageSection title={sectionTitle} desc={sectionDesc}>
       {!fixedKind ? (
-        <div className="hq-tabs" role="tablist" aria-label="一般報表類型" style={{ marginBottom: '1rem' }}>
-          {REPORT_KINDS.map((item) => (
-            <button
-              key={item.key}
-              type="button"
-              role="tab"
-              aria-selected={kind === item.key}
-              className={`hq-tabs__btn ${kind === item.key ? 'is-active' : ''}`}
-              onClick={() => {
-                setLoading(true);
-                setKind(item.key);
-                setDetailRow(null);
-                if (item.key === 'topup') setStatus('PAID');
-                else if (item.key === 'sales' || item.key === 'coursePurchases') setStatus('ALL');
-              }}
-            >
-              {item.label}
-            </button>
-          ))}
-        </div>
+        <>
+          <Card
+            title="取消沖回與退費折讓｜使用規則"
+            subtitle="權限：DUTY（值星）以上 · 實際異動請於下方報表列操作；「折讓單據」分頁僅供查詢／列印"
+          >
+            <div className="form-stack" style={{ gap: '0.65rem' }}>
+              <p className="text-sm" style={{ margin: 0 }}>
+                <strong>取消沖回</strong>
+                ：交易當下作廢／沖銷為主（盡量不作折讓單）。適用「當日誤開、整筆撤銷、停定期定額但保留效期」等。
+              </p>
+              <p className="text-sm" style={{ margin: 0 }}>
+                <strong>退費折讓</strong>
+                ：已開發票後需退現金／部分退費時開立 ezPay 折讓單；完成後可至「折讓單據」查詢或列印號碼。
+              </p>
+              <ul className="text-sm" style={{ margin: 0, paddingLeft: '1.2rem' }}>
+                <li>
+                  <strong>一般儲值（計時）</strong>
+                  ：僅「退費折讓」；公式＝實付金額 − 實際使用額度 − 手續費$100。勿用取消沖回。
+                </li>
+                <li>
+                  <strong>無限月卡（非定期定額）</strong>
+                  ：取消沖回＝截斷效期不開折讓；退費折讓＝截斷效期＋30
+                  日一期基準（未滿十五日可退、手續費$500；滿／逾十五日不可退）。
+                </li>
+                <li>
+                  <strong>定期定額訂閱</strong>
+                  ：取消沖回＝停續扣、保留效期；要退本期請改退費折讓（同上月卡基準）。
+                </li>
+                <li>
+                  <strong>銷貨</strong>：兩者皆可；沖回優先作廢發票，折讓優先開折讓單。
+                </li>
+                <li>
+                  <strong>進出場</strong>：僅取消沖回（無折讓）。
+                </li>
+                <li>
+                  <strong>私教購案</strong>：兩者皆可，但已使用堂數不可取消沖回；有發票時折讓才會開折讓單。
+                </li>
+              </ul>
+            </div>
+          </Card>
+
+          <div className="hq-tabs" role="tablist" aria-label="一般報表類型" style={{ marginBottom: '1rem' }}>
+            {REPORT_KINDS.map((item) => (
+              <button
+                key={item.key}
+                type="button"
+                role="tab"
+                aria-selected={kind === item.key}
+                className={`hq-tabs__btn ${kind === item.key ? 'is-active' : ''}`}
+                onClick={() => {
+                  setLoading(true);
+                  setKind(item.key);
+                  setDetailRow(null);
+                  if (item.key === 'topup') setStatus('PAID');
+                  else if (item.key === 'sales' || item.key === 'coursePurchases') setStatus('ALL');
+                }}
+              >
+                {item.label}
+              </button>
+            ))}
+          </div>
+
+          {kind !== 'orders' && (
+            <Alert tone="info">{reverseRulesByKind[kind as Exclude<ReportKind, 'orders'>]}</Alert>
+          )}
+        </>
       ) : null}
 
       <Card title="查詢條件">

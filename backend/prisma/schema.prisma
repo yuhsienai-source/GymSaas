@@ -146,6 +146,8 @@ model Member {
   phoneOtps         PhoneOtp[]
   /// 會員綁定分店（進出場須符合綁定場館；AC↔HP 可互進）
   branches          MemberBranch[]
+  /// 總部合規補償異動日誌
+  hqCompensationLogs HqCompensationLog[]
 }
 
 /// 會員 ↔ 分店綁定（進出場閘機驗證）
@@ -216,6 +218,8 @@ model CheckInLog {
   @@index([gateDeviceId, checkInAt])
   @@index([checkInAt])
   @@index([memberId, status, checkOutAt])
+  /// 容留／在場列表：status=ACTIVE AND checkOutAt IS NULL
+  @@index([status, checkOutAt])
 }
 
 /// 進出場閘機／掃碼裝置（綁定分店；憑 deviceKey 驗證，不可由前端任意選店）
@@ -248,6 +252,8 @@ model Promotion {
   branchId    Int       // 【4.0 新增】這個方案屬於哪間店
   branch      Branch    @relation(fields: [branchId], references: [id], onDelete: Cascade)
   name        String    // 商品名稱，例如："迎新儲值500送100"
+  /// SALE＝可售方案｜COMPENSATION＝客訴補償專案（price 必須 0；禁出現在櫃檯／會員購案列表）
+  kind        String    @default("SALE")
   usageType   String    @default("TIMED") // TIMED(分鐘計費) | UNLIMITED(無限使用)
   planMode    String    @default("STANDING") // STANDING(長註) | CAMPAIGN(活動檔期)
   saleStartAt DateTime? // 活動上架時間（長註為 null）
@@ -259,14 +265,19 @@ model Promotion {
   /// 無限使用：有效天數＝unitDays × periodCount（購案延長用）
   durationDays Int?
   requiresMemberContract Boolean @default(false) // 需簽署會員合約
-  enableCardRecurring    Boolean @default(false) // 啟用信用卡定期定額
-  price       Float     // 實際要收取的現金 (500)
-  bonusGiven  Float     // TIMED：贈送運動金；UNLIMITED 固定 0（不入錢包）
+  enableCardRecurring    Boolean @default(false) // 啟用信用卡定期定額（無限使用：每期＝price、總期數＝periodCount）
+  /// 定期定額每期金額（啟用時後端強制＝price）
+  recurringAmount        Float?
+  price       Float     // 實際要收取的現金 (500)；COMPENSATION 強制 0
+  bonusGiven  Float     // TIMED：贈送運動金；UNLIMITED 固定 0（不入錢包）；COMPENSATION 必須 > 0
   isActive    Boolean   @default(true) // 上下架狀態 (老闆隨時可停賣)
   createdAt   DateTime  @default(now())
 
   contractLinks PromotionMembershipContract[]
   cardSubscriptions CardSubscription[]
+  hqCompensationLogs HqCompensationLog[]
+
+  @@index([kind, isActive])
 }
 
 // ==========================================
@@ -277,25 +288,42 @@ model CoursePlan {
   branchId    Int
   branch      Branch    @relation(fields: [branchId], references: [id], onDelete: Cascade)
   name        String
+  /// SALE＝可售方案｜COMPENSATION＝客訴補償課程（price 必須 0；禁出現在櫃檯／POS 購案）
+  kind        String    @default("SALE")
   planType    String    // CUSTOM_PT(客製化私教) | GROUP(團體課程)
   planMode    String    @default("STANDING") // STANDING(長註) | CAMPAIGN(活動檔期)
   saleStartAt DateTime?
   saleEndAt   DateTime?
-  price       Float     // 方案售價
-  sessions    Int?      // 堂數（私教／套票）
+  price       Float     // 方案售價；COMPENSATION 強制 0
+  sessions    Int?      // 堂數（私教／套票）；COMPENSATION 必須 > 0
   capacity    Int?      // 團體課建議人數上限（參考）
   description String?
   requiresMemberContract Boolean @default(false) // 需簽署會員合約
-  enableCardRecurring Boolean @default(false) // 啟用信用卡批次扣款
+  enableCardRecurring Boolean @default(false) // 啟用信用卡定期定額
+  /// 可選期數 bitmask：2＝可選2期、4＝可選4期、6＝可選2或4期；null＝無
+  recurringPeriods    Int?
+  /// 2 期方案：第2期扣款金額（第1期＝price−本欄；需第1+第2＝price）
+  recurringAmount     Float?
+  /// 4 期方案：第1~3期共用扣款金額（需 ×3 + recurringAmountFinal ＝ price）
+  recurringAmount4    Float?
+  /// 4 期方案：第4期扣款金額
+  recurringAmountFinal Float?
   /// 是否提供「課程第二人+$500(課程當日現場支付)」選項（結帳不入應付金額）
   enableSecondPerson Boolean @default(false)
   /// 加贈禮名稱；入購物車／訂單快照，金額 $0
   giftLabel   String?
+  /// 加贈禮數量（預設 1）
+  giftQty     Int?
   isActive    Boolean   @default(true)
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
 
   contractLinks CoursePlanMembershipContract[]
+  cardSubscriptions CardSubscription[]
+  ptContracts       PTContract[]
+  hqCompensationLogs HqCompensationLog[]
+
+  @@index([kind, isActive])
 }
 
 // ==========================================
@@ -489,16 +517,23 @@ model PTContract {
   /// 購買分店（課程方案所屬）；私教上課僅限此店或 HP↔HR 共享場地
   branchId      Int?
   branch        Branch?   @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  /// 來源方案（補償／購案追溯）；可空＝舊資料
+  coursePlanId  Int?
+  coursePlan    CoursePlan? @relation(fields: [coursePlanId], references: [id], onDelete: SetNull)
+  /// PURCHASE＝付費購案｜COMPENSATION＝總部合規補償贈送（與購買區隔）
+  source        String    @default("PURCHASE")
 
-  totalSessions Int       // 購買總堂數 (如: 24堂)
+  totalSessions Int       // 購買／補償總堂數 (如: 24堂)
   usedSessions  Int       @default(0) // 已扣堂數
-  pricePaid     Float     // 實際支付總金額
+  pricePaid     Float     // 實際支付總金額；補償贈送為 0
 
   expiresAt     DateTime? // 合約到期日
   isActive      Boolean   @default(true)
   createdAt     DateTime  @default(now())
 
   @@index([branchId])
+  @@index([coursePlanId])
+  @@index([source, isActive])
 }
 
 // ==========================================
@@ -564,6 +599,7 @@ model Class {
 
   @@index([seriesId])
   @@index([trainerId, startAt])
+  @@index([venueId, startAt])
 }
 
 model Reservation {
@@ -626,6 +662,8 @@ model Order {
   periodTimes   Int?
   /// 續扣基準金額（定期定額）；未設則用 cardAmount／amount
   recurringAmount Float?
+  /// 最末期扣款金額（課程 4 期）；未設則續扣皆用 recurringAmount
+  recurringAmountFinal Float?
   /// PayUNi CreditHash（約定扣款 Token）
   creditHash    String?
   carrierNum    String?  // 發票載具（手機條碼／自然人憑證）
@@ -655,12 +693,19 @@ model CardSubscription {
   id             String   @id // CRS...
   memberId       Int
   member         Member   @relation(fields: [memberId], references: [id], onDelete: Cascade)
-  promotionId    Int
-  promotion      Promotion @relation(fields: [promotionId], references: [id])
-  /// 首期訂單編號（TYK…）
+  /// 儲值方案訂閱（與 coursePlanId 擇一）
+  promotionId    Int?
+  promotion      Promotion? @relation(fields: [promotionId], references: [id])
+  /// 課程方案分期（與 promotionId 擇一）
+  coursePlanId   Int?
+  coursePlan     CoursePlan? @relation(fields: [coursePlanId], references: [id])
+  /// 首期訂單編號（TYK…／CRS…）
   originOrderId  String?
   creditHash     String
-  amount         Float // 每期扣款金額
+  /// 續扣基準金額（課程 2 期＝第2期；4 期＝第2~3期；儲值＝每期）
+  amount         Float
+  /// 最末期扣款金額（課程 4 期第4期；其餘可空＝沿用 amount）
+  amountFinal    Float?
   periodType     String // W | M | Y
   /// 總扣款期數；0＝不限（含首期）
   periodTimes    Int      @default(0)
@@ -679,6 +724,7 @@ model CardSubscription {
 
   @@index([status, nextChargeAt])
   @@index([memberId])
+  @@index([coursePlanId])
   @@unique([originOrderId])
 }
 
@@ -848,6 +894,8 @@ model CheckoutSession {
   periodTimes     Int?
   /// 定期定額續扣金額（可與首期刷卡額不同）
   recurringAmount Float?
+  /// 最末期扣款金額（課程 4 期）
+  recurringAmountFinal Float?
   creditHash      String?
   carrierNum      String?
   buyerUbn        String?
@@ -943,9 +991,38 @@ model Staff {
 
   /// 若此員工為教練，一對一綁定 Trainer 個人工作區
   trainerProfile Trainer?
-  
+
+  hqCompensationLogs HqCompensationLog[]
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+}
+
+/// 總部合規補償異動日誌（append-only；運動金／效期／解鎖警示／補償課程）
+model HqCompensationLog {
+  id           String   @id // HCL…
+  action       String   // BONUS | EXPIRE | CLEAR_ALERT | COURSE
+  memberId     Int
+  member       Member   @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  actorStaffId Int
+  actorStaff   Staff    @relation(fields: [actorStaffId], references: [id])
+  /// BONUS：綁定的客訴補償 Promotion
+  promotionId  Int?
+  promotion    Promotion? @relation(fields: [promotionId], references: [id], onDelete: SetNull)
+  /// COURSE：綁定的客訴補償 CoursePlan
+  coursePlanId Int?
+  coursePlan   CoursePlan? @relation(fields: [coursePlanId], references: [id], onDelete: SetNull)
+  /// 客訴結案單號或原因（必填）
+  reason       String
+  detail       Json?
+  ipAddress    String?
+  userAgent    String?
+  createdAt    DateTime @default(now())
+
+  @@index([memberId, createdAt])
+  @@index([actorStaffId, createdAt])
+  @@index([action, createdAt])
+  @@index([coursePlanId])
 }
 
 /// 櫃檯交接班結算（錢櫃現金對帳）

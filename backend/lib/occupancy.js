@@ -3,8 +3,10 @@ import { WebSocketServer } from 'ws';
 import prisma from './prisma.js';
 
 const DEFAULT_CAPACITY = parseInt(process.env.BOARD_CAPACITY || '80', 10);
+const HEARTBEAT_MS = parseInt(process.env.OCCUPANCY_WS_HEARTBEAT_MS || '30000', 10);
 
 let wss = null;
+let heartbeatTimer = null;
 
 export function getBoardCapacity() {
   return DEFAULT_CAPACITY;
@@ -56,6 +58,11 @@ export function attachOccupancyWebSocket(server) {
   wss = new WebSocketServer({ server, path: '/ws/occupancy' });
 
   wss.on('connection', async (socket) => {
+    socket.isAlive = true;
+    socket.on('pong', () => {
+      socket.isAlive = true;
+    });
+
     try {
       const snapshot = await getOccupancySnapshot();
       socket.send(JSON.stringify({ type: 'occupancy', data: snapshot }));
@@ -66,7 +73,25 @@ export function attachOccupancyWebSocket(server) {
     socket.on('error', (err) => console.error('WS client error:', err.message));
   });
 
-  console.log('[體育客] WebSocket 容留看板已掛載：/ws/occupancy');
+  if (heartbeatTimer) clearInterval(heartbeatTimer);
+  heartbeatTimer = setInterval(() => {
+    if (!wss) return;
+    for (const client of wss.clients) {
+      if (client.isAlive === false) {
+        client.terminate();
+        continue;
+      }
+      client.isAlive = false;
+      try {
+        client.ping();
+      } catch {
+        client.terminate();
+      }
+    }
+  }, HEARTBEAT_MS);
+  if (typeof heartbeatTimer.unref === 'function') heartbeatTimer.unref();
+
+  console.log('[體育客] WebSocket 容留看板已掛載：/ws/occupancy（heartbeat）');
   return wss;
 }
 

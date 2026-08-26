@@ -51,26 +51,130 @@ export function decryptInfo(encryptStr) {
     return querystring.parse(decipherText);
   } catch (error) {
     console.error("PayUNi 解密失敗:", error);
-    throw new Error("解密失敗");
+    throw new Error("解密失敗", { cause: error });
   }
 }
 
 export const PAYUNI_UPP_URL = 'https://sandbox-api.payuni.com.tw/api/upp';
 
-/** 金流 Notify／Return 必須打回「後端」公開網址，不是前端網域 */
-function getApiPublicBaseUrl() {
-  const base = (
-    process.env.API_PUBLIC_URL ||
-    process.env.BASE_URL ||
-    ''
-  )
-    .trim()
-    .replace(/\/$/, '');
-
-  if (!base) {
-    throw new Error('API_PUBLIC_URL（或 BASE_URL）未設定：無法組 PayUNi ReturnURL／NotifyURL');
+/** 測試／正式 API 根網址 */
+export function getPayuniApiBase() {
+  const explicit = (process.env.PAYUNI_API_BASE || '').trim().replace(/\/$/, '');
+  if (explicit) return explicit;
+  const mode = String(process.env.PAYUNI_TEST_MODE ?? 'true').toLowerCase();
+  if (mode === 'false' || mode === '0' || mode === 'prod' || mode === 'production') {
+    return 'https://api.payuni.com.tw';
   }
-  return base;
+  return 'https://sandbox-api.payuni.com.tw';
+}
+
+export function getPayuniUppUrl() {
+  return (process.env.PAYUNI_UPP_URL || '').trim() || `${getPayuniApiBase()}/api/upp`;
+}
+
+/**
+ * 續期收款（定期定額）幕前支付頁
+ * 例：https://sandbox-api.payuni.com.tw/api/period/{MerID}/{Hash}
+ * Hash 由商店後台「續期收款」串接資訊提供（PAYUNI_PERIOD_HASH 或完整 PAYUNI_PERIOD_URL）
+ */
+export function getPayuniPeriodPayUrl() {
+  const full = (process.env.PAYUNI_PERIOD_URL || '').trim().replace(/\/$/, '');
+  if (full) return full;
+  const hash = (process.env.PAYUNI_PERIOD_HASH || '').trim();
+  if (!hash) {
+    const err = new Error(
+      '定期定額（續期收款）未設定：請在 .env 填 PAYUNI_PERIOD_HASH 或 PAYUNI_PERIOD_URL',
+    );
+    err.statusCode = 500;
+    throw err;
+  }
+  if (!MERCHANT_ID) {
+    const err = new Error('PAYUNI_MERCHANT_ID 未設定');
+    err.statusCode = 500;
+    throw err;
+  }
+  return `${getPayuniApiBase()}/api/period/${MERCHANT_ID}/${hash}`;
+}
+
+function stripEnvUrl(raw) {
+  return String(raw || '')
+    .trim()
+    .replace(/^['"]|['"]$/g, '')
+    .replace(/\/$/, '');
+}
+
+function isLoopbackBase(url) {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return host === 'localhost' || host === '127.0.0.1' || host === '::1';
+  } catch {
+    return /localhost|127\.0\.0\.1/i.test(String(url || ''));
+  }
+}
+
+/**
+ * PayUNi Return／Notify 必須是「外網可達」的 HTTPS／公網位址。
+ * 若 API_PUBLIC_URL 為 localhost，改走 FRONTEND_URL（Vite proxy `/api` → :8000）。
+ */
+export function getPayuniCallbackBaseUrl() {
+  const api = stripEnvUrl(process.env.API_PUBLIC_URL || process.env.BASE_URL || '');
+  if (!api) {
+    const err = new Error('API_PUBLIC_URL（或 BASE_URL）未設定：無法組 PayUNi ReturnURL／NotifyURL');
+    err.statusCode = 500;
+    throw err;
+  }
+  if (!isLoopbackBase(api)) return api;
+
+  const fe = stripEnvUrl(process.env.FRONTEND_URL || '');
+  if (fe && !isLoopbackBase(fe)) {
+    console.warn(
+      `[PayUNi] API_PUBLIC_URL 為本機（${api}），Return/Notify 改走 FRONTEND_URL=${fe}（需 Vite proxy /api → 後端）`,
+    );
+    return fe;
+  }
+
+  const err = new Error(
+    'PayUNi 無法回呼 localhost，所以不會自動跳回系統。請將 API_PUBLIC_URL 設成公網 HTTPS（ngrok 打到 :8000），或把 FRONTEND_URL 設成公網前端並確認 Vite 有 proxy /api',
+  );
+  err.statusCode = 500;
+  throw err;
+}
+
+/**
+ * NotifyURL：PayUNi 伺服器背景通知，必須公網可達。
+ * ReturnURL：使用者瀏覽器回流，優先走 FRONTEND_URL（本機或 Vite／ngrok + /api proxy）。
+ */
+export function getPayuniNotifyBaseUrl() {
+  return getPayuniCallbackBaseUrl();
+}
+
+export function getPayuniReturnBaseUrl() {
+  const fe = stripEnvUrl(process.env.FRONTEND_URL || '');
+  if (fe) return fe;
+  return getPayuniCallbackBaseUrl();
+}
+
+/** @deprecated 請改用 getPayuniNotifyBaseUrl / getPayuniReturnBaseUrl */
+function getApiPublicBaseUrl() {
+  return getPayuniCallbackBaseUrl();
+}
+
+function getPayuniBackUrl() {
+  const fe = stripEnvUrl(process.env.FRONTEND_URL || '');
+  if (!fe) return null;
+  return `${fe}/staff/ops`;
+}
+
+function packEncryptPayload(innerParams) {
+  const plaintext = querystring.stringify(innerParams);
+  const encryptInfo = encrypt(plaintext, HASH_KEY, HASH_IV);
+  const hashInfo = sha256(encryptInfo, HASH_KEY, HASH_IV);
+  return {
+    MerID: MERCHANT_ID,
+    Version: '1.0',
+    EncryptInfo: encryptInfo,
+    HashInfo: hashInfo,
+  };
 }
 
 /**
@@ -131,64 +235,119 @@ export function parseCardPayOptions(body = {}, opts = {}) {
 }
 
 /**
- * 🛒 建立幕前支付 (UPP) 跳轉參數
- * orderData 可含 cardMode / cardInst / periodType / periodTimes
+ * 🛒 建立幕前支付 (UPP) 跳轉參數 — 一次付清／分期
+ * 定期定額請用 buildPeriodPayload／buildCardCheckoutRequest
  */
 export function buildUPPPayload(orderData) {
-  const apiBase = getApiPublicBaseUrl();
+  const returnBase = getPayuniReturnBaseUrl();
+  const notifyBase = getPayuniNotifyBaseUrl();
   const cardMode = String(orderData.cardMode || 'LUMP').toUpperCase();
   const tradeAmt = Math.round(orderData.amount).toString();
+  const backUrl = getPayuniBackUrl();
 
-  // 整理要傳給金流的內層參數
   const innerParams = {
     MerID: MERCHANT_ID,
     MerTradeNo: orderData.id,
     TradeAmt: tradeAmt,
     Timestamp: Math.floor(Date.now() / 1000).toString(),
     ProdDesc: String(orderData.itemDesc || '訂單').substring(0, 50),
-    // Return／Notify → 後端；瀏覽器再由 return handler 導向獨立前端
-    ReturnURL: `${apiBase}/api/ops/payuni/return`,
-    NotifyURL: `${apiBase}/api/ops/payuni/webhook`,
+    ReturnURL: `${returnBase}/api/ops/payuni/return`,
+    NotifyURL: `${notifyBase}/api/ops/payuni/webhook`,
   };
+  if (backUrl) innerParams.BackURL = backUrl;
 
   if (cardMode === 'INSTALLMENT') {
-    // 僅開信用卡分期；指定期數時帶 CardInst（幕前／幕後共通欄位）
     innerParams.CreditInst = '1';
     const inst = parseInt(orderData.cardInst, 10);
     if (Number.isInteger(inst) && inst > 1) {
       innerParams.CardInst = String(inst);
     }
-  } else if (cardMode === 'RECURRING') {
-    // 一次付清＋約定 Token（首次綁定），供後續定期扣款
-    innerParams.Credit = '1';
-    innerParams.UseTokenType = '1';
-    innerParams.UseTokenStatus = '1';
-    const pt = String(orderData.periodType || 'M').toUpperCase();
-    if (['W', 'M', 'Y'].includes(pt)) {
-      innerParams.PeriodType = pt;
-      innerParams.PeriodAmt = tradeAmt;
-      const times = parseInt(orderData.periodTimes, 10);
-      if (Number.isInteger(times) && times > 0) {
-        innerParams.PeriodTimes = String(times);
-      }
-    }
   } else {
-    // 預設：僅信用卡一次付清
     innerParams.Credit = '1';
   }
 
-  // 1. 嚴格使用官方指定的 querystring 進行編碼
-  const plaintext = querystring.stringify(innerParams);
-  
-  // 2. 執行 AES-GCM 加密與 SHA256 壓碼
-  const encryptInfo = encrypt(plaintext, HASH_KEY, HASH_IV);
-  const hashInfo = sha256(encryptInfo, HASH_KEY, HASH_IV);
+  return packEncryptPayload(innerParams);
+}
 
-  return {
+/**
+ * 續期收款支付頁（PayUNi 定期定額幕前）
+ * TradeAmt＝本次首期；PeriodAmt＝後續每期（可與首期不同，例如課程 2／4 期）
+ * @see https://docs.payuni.com.tw — 續期收款 › 續期收款支付頁
+ */
+export function buildPeriodPayload(orderData) {
+  const returnBase = getPayuniReturnBaseUrl();
+  const notifyBase = getPayuniNotifyBaseUrl();
+  const tradeAmt = Math.round(Number(orderData.amount));
+  if (!Number.isFinite(tradeAmt) || tradeAmt <= 0) {
+    const err = new Error('定期定額首期金額無效');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const periodRaw =
+    orderData.periodAmt != null && orderData.periodAmt !== ''
+      ? orderData.periodAmt
+      : orderData.recurringAmount != null && orderData.recurringAmount !== ''
+        ? orderData.recurringAmount
+        : tradeAmt;
+  const periodAmt = Math.round(Number(periodRaw));
+  if (!Number.isFinite(periodAmt) || periodAmt <= 0) {
+    const err = new Error('定期定額每期金額無效');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const pt = String(orderData.periodType || 'M').toUpperCase();
+  if (!['W', 'M', 'Y'].includes(pt)) {
+    const err = new Error('定期定額週期僅支援 W／M／Y');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const times = parseInt(orderData.periodTimes, 10);
+  if (!Number.isInteger(times) || times <= 0) {
+    const err = new Error('續期收款總期數須為正整數');
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const innerParams = {
     MerID: MERCHANT_ID,
-    Version: '1.0', 
-    EncryptInfo: encryptInfo,
-    HashInfo: hashInfo
+    MerTradeNo: orderData.id,
+    TradeAmt: String(tradeAmt),
+    PeriodAmt: String(periodAmt),
+    PeriodType: pt,
+    PeriodTimes: String(times),
+    Timestamp: Math.floor(Date.now() / 1000).toString(),
+    ProdDesc: String(orderData.itemDesc || '定期定額').substring(0, 50),
+    ReturnURL: `${returnBase}/api/ops/payuni/return`,
+    NotifyURL: `${notifyBase}/api/ops/payuni/webhook`,
+  };
+  const backUrl = getPayuniBackUrl();
+  if (backUrl) innerParams.BackURL = backUrl;
+
+  console.log(
+    `[PayUNi] 續期收款 ReturnURL=${innerParams.ReturnURL} NotifyURL=${innerParams.NotifyURL}`,
+  );
+
+  return packEncryptPayload(innerParams);
+}
+
+/**
+ * 依刷卡模式回傳幕前 actionUrl + 表單 payload
+ * RECURRING → 續期收款支付頁；其餘 → UPP
+ */
+export function buildCardCheckoutRequest(orderData) {
+  const cardMode = String(orderData.cardMode || 'LUMP').toUpperCase();
+  if (cardMode === 'RECURRING') {
+    return {
+      actionUrl: getPayuniPeriodPayUrl(),
+      payload: buildPeriodPayload(orderData),
+    };
+  }
+  return {
+    actionUrl: getPayuniUppUrl(),
+    payload: buildUPPPayload(orderData),
   };
 }
 

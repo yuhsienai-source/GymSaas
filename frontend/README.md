@@ -2,6 +2,10 @@
 
 獨立 Vite + React 前端。**不內嵌後端**；開發時透過 proxy 呼叫 `backend`。
 
+視覺語言為 **Adaptive Tech-Sport**（`src/index.css`）：管理端／閘機用運動海軍藍 `#1A2332`＋玻璃擬態；會員端亮灰透氣＋深色頂欄＋螢光Mint 漸層錢包／門禁卡。員工後台支援 Ctrl/⌘K、教練週曆拖拉改期。
+
+分流：`landing--member`（`/`、`/auth*`、`/pay*`）與 `.member-app` 為亮色；`/portal`、`/staff/*`、閘機為深色。
+
 ## 啟動
 
 ```bash
@@ -10,6 +14,7 @@ npm run dev
 # 手機請用電腦區網 IP：https://192.168.x.x:5173（勿用手機上的 localhost）
 # 首次請先開啟 /api/health 並信任自簽憑證，再登入
 # /api、/ws → http://127.0.0.1:8000
+npm run lint   # ESLint（eslint.config.js）
 ```
 
 ## 與後端契約

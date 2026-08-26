@@ -39,6 +39,7 @@ export default function HqPromotionsTab({
     activeBranches[0] ? [activeBranches[0].id] : [],
   );
   const [promoName, setPromoName] = useState('');
+  const [promoKind, setPromoKind] = useState<'SALE' | 'COMPENSATION'>('SALE');
   const [promoUsageType, setPromoUsageType] = useState<PromotionUsageType>('TIMED');
   const [promoPlanMode, setPromoPlanMode] = useState<PromotionPlanMode>('STANDING');
   const [promoSaleStart, setPromoSaleStart] = useState('');
@@ -48,6 +49,7 @@ export default function HqPromotionsTab({
   const [promoUnitDays, setPromoUnitDays] = useState('30');
   const [promoPeriodCount, setPromoPeriodCount] = useState('1');
   const [promoRequiresContract, setPromoRequiresContract] = useState(false);
+  const [promoCardRecurring, setPromoCardRecurring] = useState(false);
   const [promoContractIds, setPromoContractIds] = useState<number[]>([]);
   const [filterBranchId, setFilterBranchId] = useState<number | ''>('');
   const [activeContracts, setActiveContracts] = useState<MembershipContract[]>([]);
@@ -96,7 +98,8 @@ export default function HqPromotionsTab({
     ? promotions.filter((p) => p.branchId === filterBranchId)
     : promotions;
 
-  const isUnlimited = promoUsageType === 'UNLIMITED';
+  const isCompensation = promoKind === 'COMPENSATION';
+  const isUnlimited = !isCompensation && promoUsageType === 'UNLIMITED';
   const editIsUnlimited = editUsageType === 'UNLIMITED';
   const promoEffectiveDays =
     Math.max(0, parseInt(promoUnitDays, 10) || 0) *
@@ -143,30 +146,54 @@ export default function HqPromotionsTab({
       toast('簽署合約時，請至少選擇一份合約', 'error');
       return;
     }
+    if (promoCardRecurring) {
+      if (isCompensation) {
+        toast('客訴補償專案不可啟用定期定額', 'error');
+        return;
+      }
+      if (!isUnlimited) {
+        toast('定期定額僅限「無限使用」方案', 'error');
+        return;
+      }
+      if (!promoPeriodCount || parseInt(promoPeriodCount, 10) <= 0) {
+        toast('啟用定期定額時必須設定有效期期數', 'error');
+        return;
+      }
+    }
+    if (isCompensation) {
+      if (parseFloat(promoBonus) <= 0) {
+        toast('客訴補償專案必須設定運動金額度（bonusGiven > 0）', 'error');
+        return;
+      }
+    }
     try {
       const result = await createPromotion({
         branchIds: promoBranchIds,
         name: promoName,
-        price: parseFloat(promoPrice),
+        kind: promoKind,
+        price: isCompensation ? 0 : parseFloat(promoPrice),
         bonusGiven: isUnlimited ? 0 : parseFloat(promoBonus),
-        usageType: promoUsageType,
+        usageType: isCompensation ? 'TIMED' : promoUsageType,
         planMode: promoPlanMode,
         saleStartAt: promoPlanMode === 'CAMPAIGN' ? toIsoOrNull(promoSaleStart) : null,
         saleEndAt: promoPlanMode === 'CAMPAIGN' ? toIsoOrNull(promoSaleEnd) : null,
         unitDays: isUnlimited ? parseInt(promoUnitDays, 10) : null,
         periodCount: isUnlimited ? parseInt(promoPeriodCount, 10) : null,
-        requiresMemberContract: promoRequiresContract,
-        enableCardRecurring: false,
-        contractIds: promoRequiresContract ? promoContractIds : [],
+        requiresMemberContract: isCompensation ? false : promoRequiresContract,
+        enableCardRecurring: isCompensation ? false : promoCardRecurring,
+        recurringAmount: !isCompensation && promoCardRecurring ? parseFloat(promoPrice) || null : null,
+        contractIds: !isCompensation && promoRequiresContract ? promoContractIds : [],
       });
       toast(result.message || '方案上架成功', 'success');
       setPromoName('');
+      setPromoKind('SALE');
       setPromoSaleStart('');
       setPromoSaleEnd('');
       setPromoUnitDays('30');
       setPromoPeriodCount('1');
       setPromoContractIds([]);
       setPromoRequiresContract(false);
+      setPromoCardRecurring(false);
       await onReload();
     } catch (err) {
       toast(getErrorMessage(err, '建立方案失敗'), 'error');
@@ -219,6 +246,16 @@ export default function HqPromotionsTab({
       toast('需簽署會員合約時，請至少選擇一份合約', 'error');
       return;
     }
+    if (editCardRecurring) {
+      if (!editIsUnlimited) {
+        toast('定期定額僅限「無限使用」方案', 'error');
+        return;
+      }
+      if (!editPeriodCount || parseInt(editPeriodCount, 10) <= 0) {
+        toast('啟用定期定額時必須設定有效期期數', 'error');
+        return;
+      }
+    }
     try {
       const result = await updateHqPromotion(editingPromo.id, {
         name: editName,
@@ -232,6 +269,7 @@ export default function HqPromotionsTab({
         periodCount: editIsUnlimited ? parseInt(editPeriodCount, 10) : null,
         requiresMemberContract: editRequiresContract,
         enableCardRecurring: editCardRecurring,
+        recurringAmount: editCardRecurring ? parseFloat(editPrice) || null : null,
         isActive: editActive,
         contractIds: editRequiresContract ? editContractIds : [],
       });
@@ -264,7 +302,7 @@ export default function HqPromotionsTab({
   return (
     <PageSection
       title="儲值方案"
-      desc="分鐘計費：金額進錢包 · 無限使用：收取方案費、延長效期（不入錢包）"
+      desc="分鐘計費：金額進錢包 · 無限使用：收取方案費、延長效期 · 客訴補償：price $0、僅總部合規配發"
     >
       <div className="staff-grid">
         <Card title="新增方案">
@@ -296,9 +334,30 @@ export default function HqPromotionsTab({
                 )}
               </div>
             </Field>
+            <Field label="方案用途" hint="客訴補償專案不出現在櫃檯／會員購案；僅「合規補償」可配發">
+              <Select
+                value={promoKind}
+                onChange={(e) => {
+                  const next = e.target.value as 'SALE' | 'COMPENSATION';
+                  setPromoKind(next);
+                  if (next === 'COMPENSATION') {
+                    setPromoUsageType('TIMED');
+                    setPromoPrice('0');
+                    setPromoCardRecurring(false);
+                    setPromoRequiresContract(false);
+                  } else if (promoPrice === '0') {
+                    setPromoPrice('500');
+                  }
+                }}
+              >
+                <option value="SALE">可售方案（SALE）</option>
+                <option value="COMPENSATION">客訴補償專案（COMPENSATION）</option>
+              </Select>
+            </Field>
             <Field label="方案類型" hint="無限使用：方案費不入會員錢包，改延長有效期限">
               <Select
                 value={promoUsageType}
+                disabled={isCompensation}
                 onChange={(e) => setPromoUsageType(e.target.value as PromotionUsageType)}
               >
                 <option value="TIMED">計時</option>
@@ -383,14 +442,26 @@ export default function HqPromotionsTab({
                 </div>
               </Field>
             ) : null}
-            <Field label={isUnlimited ? '方案費用' : '現金本金'}>
-              <Input type="number" value={promoPrice} onChange={(e) => setPromoPrice(e.target.value)} />
+            <Field
+              label={isCompensation ? '售價（固定 $0）' : isUnlimited ? '方案費用' : '現金本金'}
+              hint={isCompensation ? '禁止自填補償現金；額度請設於下方 SC' : undefined}
+            >
+              <Input
+                type="number"
+                value={promoPrice}
+                disabled={isCompensation}
+                onChange={(e) => setPromoPrice(e.target.value)}
+              />
             </Field>
             {!isUnlimited && (
-              <Field label="贈送 SC" hint="會員錢包仍顯示為運動金；方案文案為 SC $金額">
+              <Field
+                label={isCompensation ? '補償運動金（SC）' : '贈送 SC'}
+                hint="會員錢包仍顯示為運動金；方案文案為 SC $金額"
+              >
                 <Input type="number" value={promoBonus} onChange={(e) => setPromoBonus(e.target.value)} />
               </Field>
             )}
+            {!isCompensation && (
             <label className="checkbox-item">
               <input
                 type="checkbox"
@@ -402,7 +473,8 @@ export default function HqPromotionsTab({
               />
               簽署合約
             </label>
-            {promoRequiresContract && (
+            )}
+            {!isCompensation && promoRequiresContract && (
               <Field label="綁定合約" hint="勾選後必選至少一份；請先至「合約」頁籤建立範本">
                 {activeContracts.length === 0 ? (
                   <p className="text-muted text-sm">尚無啟用中合約</p>
@@ -429,6 +501,25 @@ export default function HqPromotionsTab({
                   </div>
                 )}
               </Field>
+            )}
+            {!isCompensation && (
+            <label className="checkbox-item">
+              <input
+                type="checkbox"
+                checked={promoCardRecurring}
+                onChange={(e) => setPromoCardRecurring(e.target.checked)}
+              />
+              啟用信用卡定期定額
+            </label>
+            )}
+            {!isCompensation && promoCardRecurring && (
+              <p className="text-muted text-sm">
+                每期扣款＝方案費用
+                {promoPrice ? ` $${Number(promoPrice).toLocaleString('zh-TW')}` : ''}
+                ；總期數＝有效期期數
+                {promoPeriodCount ? ` ${promoPeriodCount} 期` : '（請先設定期數）'}
+                。僅限無限使用方案。
+              </p>
             )}
             <Button type="submit" disabled={promoBranchIds.length === 0}>
               建立方案{promoBranchIds.length > 1 ? `（${promoBranchIds.length} 間分店）` : ''}
@@ -457,6 +548,7 @@ export default function HqPromotionsTab({
               <thead>
                 <tr>
                   <th>分店</th>
+                  <th>用途</th>
                   <th>類型</th>
                   <th>名稱</th>
                   <th>費用／儲值</th>
@@ -471,7 +563,7 @@ export default function HqPromotionsTab({
               <tbody>
                 {filtered.length === 0 ? (
                   <tr>
-                    <td colSpan={10} className="text-muted text-center">
+                    <td colSpan={11} className="text-muted text-center">
                       {promotions.length === 0 ? '尚無方案' : '此分店尚無方案'}
                     </td>
                   </tr>
@@ -487,6 +579,7 @@ export default function HqPromotionsTab({
                     return (
                       <tr key={p.id}>
                         <td>{staffBranchLabel(p.branch) || `#${p.branchId}`}</td>
+                        <td>{p.kind === 'COMPENSATION' ? '補償' : '可售'}</td>
                         <td>{USAGE_TYPE_LABELS[p.usageType === 'UNLIMITED' ? 'UNLIMITED' : 'TIMED']}</td>
                         <td>{p.name}</td>
                         <td>{formatPromotionValue(p)}</td>
@@ -498,7 +591,13 @@ export default function HqPromotionsTab({
                                 : '需合約')
                             : '—'}
                         </td>
-                        <td className="text-sm">{p.enableCardRecurring ? '是' : '否'}</td>
+                        <td className="text-sm">
+                          {p.enableCardRecurring
+                            ? `是 · 每期 $${Number(p.price).toLocaleString('zh-TW')}${
+                                p.periodCount ? ` · ${p.periodCount} 期` : ''
+                              }`
+                            : '否'}
+                        </td>
                         <td className="text-sm">
                           {formatPromotionSchedule(p.planMode, p.saleStartAt, p.saleEndAt)}
                         </td>
@@ -666,6 +765,15 @@ export default function HqPromotionsTab({
             />
             啟用信用卡定期定額
           </label>
+          {editCardRecurring && (
+            <p className="text-muted text-sm">
+              每期扣款＝方案費用
+              {editPrice ? ` $${Number(editPrice).toLocaleString('zh-TW')}` : ''}
+              ；總期數＝有效期期數
+              {editPeriodCount ? ` ${editPeriodCount} 期` : '（請先設定期數）'}
+              。僅限無限使用方案。
+            </p>
+          )}
           {editPlanMode === 'CAMPAIGN' && (
             <label className="checkbox-item">
               <input type="checkbox" checked={editActive} onChange={(e) => setEditActive(e.target.checked)} />

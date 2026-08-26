@@ -8,10 +8,13 @@ import {
   gateCheckInFace,
   gateCheckOut,
   gateCheckOutFace,
+  getApiErrorDetails,
   getErrorMessage,
   isGatePairAuthError,
   pairGateDevice,
 } from '../../lib/api';
+import { useToast } from '../../contexts/ToastContext';
+import type { GateFlashResult } from '../../components/layout/GateLayout';
 import { startGateQrScanLoop } from '../../lib/gateQrFromVideo';
 import { parseGatePairQr } from '../../lib/gatePairQr';
 import { formatGateAccessNo } from '../../lib/gateAccessNo';
@@ -157,11 +160,12 @@ function PairingForm({
 }
 
 export default function GateScannerPage() {
+  const { toast } = useToast();
   const [mode, setMode] = useState<GateMode>('check-in');
   const [logs, setLogs] = useState<GateLogEntry[]>([]);
   const [isScanning, setIsScanning] = useState(true);
   const [busy, setBusy] = useState(false);
-  const [lastResult, setLastResult] = useState<{ ok: boolean; message: string } | null>(null);
+  const [lastResult, setLastResult] = useState<GateFlashResult | null>(null);
   const [pair, setPair] = useState<StoredGatePair | null>(() => getGatePair());
   const [pairPhase, setPairPhase] = useState<PairPhase>(() =>
     getGatePair() ? 'restoring' : 'unpaired',
@@ -501,6 +505,35 @@ export default function GateScannerPage() {
       addLog(`🟢 ${result.message}（${name}${idTag}）`);
     }
     setLastResult({ ok: true, message: msg });
+    toast(msg, 'success');
+  }
+
+  function applyGateError(err: unknown, fallback: string) {
+    const details = getApiErrorDetails(err);
+    const msg = details.message || getErrorMessage(err, fallback);
+    const renewable =
+      details.code === 'EXPIRED_BALANCE' || details.code === 'BALANCE_INSUFFICIENT';
+    addLog(`🔴 ${msg}`, true);
+    setLastResult({
+      ok: false,
+      message: msg,
+      memberId: details.memberId,
+      code: details.code,
+      renewable: Boolean(renewable && details.memberId),
+    });
+    toast(msg, 'error', {
+      action:
+        renewable && details.memberId
+          ? {
+              label: '續約／儲值',
+              onClick: () => {
+                window.location.assign(
+                  `/staff/ops?tab=checkout&memberId=${details.memberId}`,
+                );
+              },
+            }
+          : undefined,
+    });
   }
 
   async function handleScan(scannedText: string) {
@@ -518,9 +551,7 @@ export default function GateScannerPage() {
           : await gateCheckOut(scannedText, auth);
       applyGateResult(result);
     } catch (err) {
-      const msg = getErrorMessage(err, '掃描連線失敗');
-      addLog(`🔴 ${msg}`, true);
-      setLastResult({ ok: false, message: msg });
+      applyGateError(err, '掃描連線失敗');
     }
     cooldown();
   }
@@ -555,9 +586,7 @@ export default function GateScannerPage() {
           : await gateCheckOutFace(faceImage, auth);
       applyGateResult(result);
     } catch (err) {
-      const msg = getErrorMessage(err, '人臉辨識失敗');
-      addLog(`🔴 ${msg}`, true);
-      setLastResult({ ok: false, message: msg });
+      applyGateError(err, '人臉辨識失敗');
     }
     cooldown();
   }

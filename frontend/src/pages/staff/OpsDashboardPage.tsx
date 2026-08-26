@@ -25,8 +25,10 @@ import {
   fetchMemberContracts,
   openMemberContract,
   getErrorMessage,
+  fetchOpsCheckoutStatus,
   opsBindFace,
   opsCheckout,
+  openPayuniCheckoutInNewTab,
   redirectToCheckOut,
   resignMemberContract,
   signMemberContract,
@@ -139,6 +141,7 @@ type CartPromoLine = {
   price: number;
   usageType?: string;
   enableCardRecurring?: boolean;
+  recurringAmount?: number | null;
   periodCount?: number | null;
   unitDays?: number | null;
   durationDays?: number | null;
@@ -157,6 +160,13 @@ type CartCourseLine = {
   secondPersonOnSite?: boolean;
   /** 方案加贈禮；入車金額 $0 */
   giftLabel?: string | null;
+  giftQty?: number | null;
+  enableCardRecurring?: boolean;
+  /** bitmask：2／4／6 */
+  recurringPeriods?: number | null;
+  recurringAmount?: number | null;
+  recurringAmount4?: number | null;
+  recurringAmountFinal?: number | null;
 };
 
 type CartLine = CartProductLine | CartPromoLine | CartCourseLine;
@@ -176,9 +186,24 @@ export default function OpsDashboardPage() {
   const [tab, setTab] = useState<OpsTab>(() => {
     const params = new URLSearchParams(window.location.search);
     if (params.get('pay') === 'done') return 'checkout';
+    const t = params.get('tab');
+    if (t === 'members' || t === 'checkins' || t === 'orders' || t === 'shift' || t === 'checkout') {
+      return t;
+    }
     return 'checkout';
   });
+  const deepLinkMemberId = useMemo(() => {
+    const raw = new URLSearchParams(window.location.search).get('memberId');
+    const n = raw ? Number(raw) : NaN;
+    return Number.isInteger(n) && n > 0 ? n : null;
+  }, []);
+  const deepLinkConsumed = useRef(false);
   const [members, setMembers] = useState<OpsMember[]>([]);
+  const [membersTotal, setMembersTotal] = useState(0);
+  const [membersLoading, setMembersLoading] = useState(false);
+  const [membersLoadingMore, setMembersLoadingMore] = useState(false);
+  const membersFetchGen = useRef(0);
+  const MEMBERS_PAGE_SIZE = 50;
   const [promotions, setPromotions] = useState<Promotion[]>([]);
   const [branches, setBranches] = useState<Branch[]>([]);
   const [posProducts, setPosProducts] = useState<Product[]>([]);
@@ -197,7 +222,15 @@ export default function OpsDashboardPage() {
   const [cart, setCart] = useState<CartLine[]>([]);
   const [addQtyByProduct, setAddQtyByProduct] = useState<Record<number, number>>({});
   const [checkoutBusy, setCheckoutBusy] = useState(false);
+  /** 續期收款無 ReturnURL：另開分頁後在此輪詢 Notify 入帳 */
+  const [pendingPeriodPay, setPendingPeriodPay] = useState<{
+    ref: string;
+    label: string;
+  } | null>(null);
+  const [pendingPeriodStatus, setPendingPeriodStatus] = useState<string>('PENDING');
+  const [pendingPeriodChecking, setPendingPeriodChecking] = useState(false);
   const [search, setSearch] = useState('');
+  const [debouncedSearch, setDebouncedSearch] = useState('');
   const [promotionId, setPromotionId] = useState<number | ''>('');
   const [topupQty, setTopupQty] = useState(1);
   const [coursePlans, setCoursePlans] = useState<CoursePlan[]>([]);
@@ -227,26 +260,110 @@ export default function OpsDashboardPage() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const checkoutInFlight = useRef(false);
+  const pendingPeriodSettled = useRef(false);
 
-  const loadData = useCallback(async () => {
+
+  // 閘機／Cmd+K 續約深連結：?tab=checkout&memberId=
+  useEffect(() => {
+    if (!deepLinkMemberId || deepLinkConsumed.current) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await fetchOpsMembers({ id: deepLinkMemberId, take: 1 });
+        if (cancelled || deepLinkConsumed.current) return;
+        deepLinkConsumed.current = true;
+        const found = res.status === 'success' ? res.data?.items?.[0] : undefined;
+        if (found) {
+          setSelectedMember(found);
+          setTab('checkout');
+          toast(`已帶入會員 ${found.name}，可直接辦理續約／儲值`, 'info');
+        } else {
+          toast(`找不到會員 #${deepLinkMemberId}`, 'error');
+        }
+        const url = new URL(window.location.href);
+        url.searchParams.delete('memberId');
+        window.history.replaceState({}, '', `${url.pathname}${url.search}`);
+      } catch (err) {
+        if (!cancelled && !deepLinkConsumed.current) {
+          deepLinkConsumed.current = true;
+          toast(getErrorMessage(err, `找不到會員 #${deepLinkMemberId}`), 'error');
+          const url = new URL(window.location.href);
+          url.searchParams.delete('memberId');
+          window.history.replaceState({}, '', `${url.pathname}${url.search}`);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [deepLinkMemberId, toast]);
+
+  useEffect(() => {
+    const t = window.setTimeout(() => setDebouncedSearch(search.trim()), 300);
+    return () => window.clearTimeout(t);
+  }, [search]);
+
+  const syncMemberSelections = useCallback((items: OpsMember[]) => {
+    setSelectedMember((prev) => {
+      if (!prev) return prev;
+      return items.find((m) => m.id === prev.id) || prev;
+    });
+    setEditingMember((prev) => {
+      if (!prev) return prev;
+      return items.find((m) => m.id === prev.id) || prev;
+    });
+  }, []);
+
+  const patchMember = useCallback((updated: OpsMember) => {
+    setMembers((prev) => {
+      const idx = prev.findIndex((m) => m.id === updated.id);
+      if (idx < 0) return prev;
+      const next = [...prev];
+      next[idx] = { ...prev[idx], ...updated };
+      return next;
+    });
+    setSelectedMember((prev) => (prev?.id === updated.id ? { ...prev, ...updated } : prev));
+    setEditingMember((prev) => (prev?.id === updated.id ? { ...prev, ...updated } : prev));
+  }, []);
+
+  const loadMembers = useCallback(
+    async (opts?: { append?: boolean; skip?: number }) => {
+      const append = Boolean(opts?.append);
+      const skip = opts?.skip ?? 0;
+      const gen = append ? membersFetchGen.current : ++membersFetchGen.current;
+      if (append) setMembersLoadingMore(true);
+      else setMembersLoading(true);
+      try {
+        const res = await fetchOpsMembers({
+          q: debouncedSearch || undefined,
+          take: MEMBERS_PAGE_SIZE,
+          skip,
+        });
+        if (!append && gen !== membersFetchGen.current) return;
+        if (res.status === 'success' && res.data) {
+          const { items, total } = res.data;
+          setMembers((prev) => (append ? [...prev, ...items] : items));
+          setMembersTotal(total);
+          if (!append) syncMemberSelections(items);
+        }
+      } catch (err) {
+        if (!append && gen !== membersFetchGen.current) return;
+        toast(getErrorMessage(err, '載入會員失敗'), 'error');
+      } finally {
+        if (append) setMembersLoadingMore(false);
+        else if (gen === membersFetchGen.current) setMembersLoading(false);
+      }
+    },
+    [debouncedSearch, syncMemberSelections, toast],
+  );
+
+  const loadCatalog = useCallback(async () => {
     try {
-      const [membersRes, promosRes, branchesRes, trainersRes] = await Promise.all([
-        fetchOpsMembers(),
+      const [promosRes, branchesRes, trainersRes] = await Promise.all([
         fetchOpsPromotions(),
         fetchOpsBranches(),
         fetchOpsTrainers(),
       ]);
-      if (membersRes.status === 'success' && membersRes.data) {
-        setMembers(membersRes.data);
-        setSelectedMember((prev) => {
-          if (!prev) return prev;
-          return membersRes.data?.find((m) => m.id === prev.id) || prev;
-        });
-        setEditingMember((prev) => {
-          if (!prev) return prev;
-          return membersRes.data?.find((m) => m.id === prev.id) || prev;
-        });
-      }
       if (promosRes.status === 'success' && promosRes.data) {
         setPromotions(promosRes.data);
         if (promosRes.data[0]) setPromotionId(promosRes.data[0].id);
@@ -268,55 +385,19 @@ export default function OpsDashboardPage() {
     }
   }, [toast, posBranchId, branchLocked, staff]);
 
+  const loadData = useCallback(async () => {
+    await Promise.all([loadMembers({ skip: 0 }), loadCatalog()]);
+  }, [loadMembers, loadCatalog]);
+
   useEffect(() => {
-    let cancelled = false;
-    async function run() {
-      try {
-        const [membersRes, promosRes, branchesRes, trainersRes] = await Promise.all([
-          fetchOpsMembers(),
-          fetchOpsPromotions(),
-          fetchOpsBranches(),
-          fetchOpsTrainers(),
-        ]);
-        if (cancelled) return;
-        if (membersRes.status === 'success' && membersRes.data) {
-          setMembers(membersRes.data);
-          setSelectedMember((prev) => {
-            if (!prev) return prev;
-            return membersRes.data?.find((m) => m.id === prev.id) || prev;
-          });
-          setEditingMember((prev) => {
-            if (!prev) return prev;
-            return membersRes.data?.find((m) => m.id === prev.id) || prev;
-          });
-        }
-        if (promosRes.status === 'success' && promosRes.data) {
-          setPromotions(promosRes.data);
-          if (promosRes.data[0]) setPromotionId(promosRes.data[0].id);
-        }
-        if (branchesRes.status === 'success' && branchesRes.data) {
-          setBranches(branchesRes.data);
-          if (branchLocked && staff?.branchId) {
-            setPosBranchId(staff.branchId);
-          } else if (branchesRes.data[0] && !posBranchId) {
-            setPosBranchId(branchesRes.data[0].id);
-          }
-        }
-        if (trainersRes.status === 'success' && trainersRes.data) {
-          setTrainers(trainersRes.data);
-          setTrainerId((prev) => prev || trainersRes.data?.[0]?.id || '');
-        }
-      } catch (err) {
-        if (!cancelled) toast(getErrorMessage(err, '載入資料失敗'), 'error');
-      }
-    }
-    void run();
-    return () => {
-      cancelled = true;
-    };
-    // 僅初次掛載；之後由操作後 loadData() 刷新
+    void loadCatalog();
+    // 僅初次掛載目錄；會員列表由 debouncedSearch effect 載入
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    void loadMembers({ skip: 0 });
+  }, [loadMembers]);
 
   useEffect(() => {
     if (!posBranchId) return;
@@ -378,18 +459,66 @@ export default function OpsDashboardPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- 僅處理一次刷卡回流
   }, []);
 
-  const filteredMembers = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    if (!q) return members;
-    return members.filter(
-      (m) =>
-        m.name.toLowerCase().includes(q) ||
-        m.phone.includes(q) ||
-        String(m.id).includes(q) ||
-        (m.lineId || '').toLowerCase().includes(q) ||
-        (m.deviceId || '').toLowerCase().includes(q),
+  async function finalizeAfterPeriodPaid(ref: string, invoiceNumber?: string | null) {
+    toast(
+      `續期收款入帳完成 · ${ref}${invoiceNumber ? ` · 發票 ${invoiceNumber}` : ''}`,
+      'success',
     );
-  }, [members, search]);
+    setPendingPeriodPay(null);
+    setPendingPeriodStatus('PAID');
+    clearCart();
+    setTopupQty(1);
+    resetSharedCheckoutPay();
+    void loadMembers({ skip: 0 });
+    if (posBranchId) {
+      try {
+        const prodRes = await fetchOpsProducts(Number(posBranchId));
+        if (prodRes.status === 'success' && prodRes.data) setPosProducts(prodRes.data);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  const pollPendingPeriodPay = useCallback(
+    async (opts?: { manual?: boolean }) => {
+      if (!pendingPeriodPay?.ref || pendingPeriodSettled.current) return;
+      if (opts?.manual) setPendingPeriodChecking(true);
+      try {
+        const res = await fetchOpsCheckoutStatus(pendingPeriodPay.ref);
+        if (res.status !== 'success' || !res.data) return;
+        const st = String(res.data.payStatus || '').toUpperCase();
+        setPendingPeriodStatus(st || 'PENDING');
+        if (st === 'PAID' && !pendingPeriodSettled.current) {
+          pendingPeriodSettled.current = true;
+          await finalizeAfterPeriodPaid(
+            pendingPeriodPay.ref,
+            res.data.invoiceNumber || null,
+          );
+        } else if (opts?.manual && st !== 'PAID') {
+          toast('尚未收到金流 Notify 入帳，請稍候再試（或確認 ngrok／NotifyURL）', 'info');
+        }
+      } catch (err) {
+        if (opts?.manual) toast(getErrorMessage(err, '查詢付款狀態失敗'), 'error');
+      } finally {
+        if (opts?.manual) setPendingPeriodChecking(false);
+      }
+    },
+    // finalize uses stable setters + loadMembers; keep deps minimal
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- poll only keyed by pending ref
+    [pendingPeriodPay?.ref],
+  );
+
+  useEffect(() => {
+    if (!pendingPeriodPay?.ref) return;
+    pendingPeriodSettled.current = false;
+    setPendingPeriodStatus('PENDING');
+    void pollPendingPeriodPay();
+    const timer = window.setInterval(() => {
+      void pollPendingPeriodPay();
+    }, 2500);
+    return () => window.clearInterval(timer);
+  }, [pendingPeriodPay?.ref, pollPendingPeriodPay]);
 
   async function loadMemberContracts(memberId: number) {
     try {
@@ -491,7 +620,7 @@ export default function OpsDashboardPage() {
         setHistoryPreviewId(null);
         setSignatureData(null);
       }
-      void loadData();
+      void loadMembers({ skip: 0 });
       if (editingMember?.id === signMember.id) await loadMemberContracts(signMember.id);
     } catch (err) {
       toast(getErrorMessage(err, '合約重簽失敗'), 'error');
@@ -518,7 +647,7 @@ export default function OpsDashboardPage() {
         closeSignModal();
       }
       if (editingMember?.id === memberId) await loadMemberContracts(memberId);
-      void loadData();
+      void loadMembers({ skip: 0 });
     } catch (err) {
       toast(getErrorMessage(err, '簽署失敗'), 'error');
     } finally {
@@ -547,9 +676,14 @@ export default function OpsDashboardPage() {
       toast(result.message || '開卡成功', 'success');
       const created = result.data;
       closeMemberModals();
-      void loadData();
-      if (wantFace && created?.id) {
+      if (created?.id) {
+        setMembers((prev) => [created, ...prev.filter((m) => m.id !== created.id)]);
+        setMembersTotal((t) => t + 1);
         setSelectedMember(created);
+      } else {
+        void loadMembers({ skip: 0 });
+      }
+      if (wantFace && created?.id) {
         try {
           const contractsRes = await fetchMemberContracts(created.id);
           const board = contractsRes.data?.board || [];
@@ -595,8 +729,9 @@ export default function OpsDashboardPage() {
         branchIds: form.branchIds,
       });
       toast(result.message || '會員資料已更新', 'success');
+      if (result.data) patchMember(result.data);
+      else void loadMembers({ skip: 0 });
       closeMemberModals();
-      void loadData();
     } catch (err) {
       toast(getErrorMessage(err, '更新失敗'), 'error');
       setSaving(false);
@@ -613,8 +748,12 @@ export default function OpsDashboardPage() {
       const result = await bindOpsMemberLine(editingMember.id, manualLineId.trim());
       toast(result.message || 'LINE 已綁定', 'success');
       setManualLineId('');
-      if (result.data) setEditingMember(result.data);
-      void loadData();
+      if (result.data) {
+        setEditingMember(result.data);
+        patchMember(result.data);
+      } else {
+        void loadMembers({ skip: 0 });
+      }
     } catch (err) {
       toast(getErrorMessage(err, '綁定 LINE 失敗'), 'error');
     } finally {
@@ -629,8 +768,12 @@ export default function OpsDashboardPage() {
     try {
       const result = await unbindOpsMemberLine(editingMember.id);
       toast(result.message || '已解除 LINE', 'success');
-      if (result.data) setEditingMember(result.data);
-      void loadData();
+      if (result.data) {
+        setEditingMember(result.data);
+        patchMember(result.data);
+      } else {
+        void loadMembers({ skip: 0 });
+      }
     } catch (err) {
       toast(getErrorMessage(err, '解除 LINE 失敗'), 'error');
     } finally {
@@ -648,8 +791,12 @@ export default function OpsDashboardPage() {
       const result = await bindOpsMemberDevice(editingMember.id, manualDeviceId.trim());
       toast(result.message || '裝置已綁定', 'success');
       setManualDeviceId('');
-      if (result.data) setEditingMember(result.data);
-      void loadData();
+      if (result.data) {
+        setEditingMember(result.data);
+        patchMember(result.data);
+      } else {
+        void loadMembers({ skip: 0 });
+      }
     } catch (err) {
       toast(getErrorMessage(err, '綁定裝置失敗'), 'error');
     } finally {
@@ -664,8 +811,12 @@ export default function OpsDashboardPage() {
     try {
       const result = await unbindOpsMemberDevice(editingMember.id);
       toast(result.message || '已解除裝置', 'success');
-      if (result.data) setEditingMember(result.data);
-      void loadData();
+      if (result.data) {
+        setEditingMember(result.data);
+        patchMember(result.data);
+      } else {
+        void loadMembers({ skip: 0 });
+      }
     } catch (err) {
       toast(getErrorMessage(err, '解除裝置失敗'), 'error');
     } finally {
@@ -715,12 +866,116 @@ export default function OpsDashboardPage() {
     [cart],
   );
 
-  const allowCardRecurring = Boolean(cartPromoLine?.enableCardRecurring);
-  const defaultRecurringAmount = cartPromoLine
-    ? cartPromoLine.usageType === 'UNLIMITED'
-      ? cartPromoLine.price
-      : cartPromoLine.price * Math.max(1, cartPromoLine.qty)
-    : undefined;
+  const allowCardRecurring =
+    Boolean(cartPromoLine?.enableCardRecurring) ||
+    cartCourseLines.some((c) => c.enableCardRecurring);
+  const recurringCourseLine = cartCourseLines.find((c) => c.enableCardRecurring);
+
+  function decodeCourseRecurringMask(raw: number | null | undefined) {
+    const n = Number(raw) || 0;
+    return { allow2: (n & 2) !== 0, allow4: (n & 4) !== 0 };
+  }
+
+  const courseAllowedPeriodTimes = (() => {
+    if (!recurringCourseLine || cartPromoLine?.enableCardRecurring) return undefined;
+    const { allow2, allow4 } = decodeCourseRecurringMask(recurringCourseLine.recurringPeriods);
+    const opts: number[] = [];
+    if (allow2) opts.push(2);
+    if (allow4) opts.push(4);
+    return opts.length > 0 ? opts : undefined;
+  })();
+
+  const courseDefaultPeriodTimes =
+    courseAllowedPeriodTimes && courseAllowedPeriodTimes.length === 1
+      ? courseAllowedPeriodTimes[0]
+      : courseAllowedPeriodTimes?.[0];
+
+  const resolveCourseRecurringAmount = (periodTimes: number | null | undefined) => {
+    if (!recurringCourseLine) return undefined;
+    const { allow2, allow4 } = decodeCourseRecurringMask(recurringCourseLine.recurringPeriods);
+    const pt = periodTimes ?? courseDefaultPeriodTimes;
+    if (pt === 2 && allow2 && recurringCourseLine.recurringAmount != null) {
+      return recurringCourseLine.recurringAmount;
+    }
+    if (pt === 4 && allow4) {
+      const base =
+        recurringCourseLine.recurringAmount4 != null
+          ? recurringCourseLine.recurringAmount4
+          : !allow2 && recurringCourseLine.recurringAmount != null
+            ? recurringCourseLine.recurringAmount
+            : null;
+      return base ?? undefined;
+    }
+    if (allow2 && recurringCourseLine.recurringAmount != null) {
+      return recurringCourseLine.recurringAmount;
+    }
+    if (allow4) {
+      return (
+        recurringCourseLine.recurringAmount4 ??
+        recurringCourseLine.recurringAmount ??
+        undefined
+      );
+    }
+    return undefined;
+  };
+
+  /** 課程定期定額：首期應付＝第1期金額（2期＝price−第2期；4期＝第1~3期共用） */
+  const resolveCourseFirstPeriodAmount = (periodTimes: number | null | undefined) => {
+    if (!recurringCourseLine) return undefined;
+    const { allow2, allow4 } = decodeCourseRecurringMask(recurringCourseLine.recurringPeriods);
+    const pt = periodTimes ?? courseDefaultPeriodTimes;
+    if (pt === 2 && allow2 && recurringCourseLine.recurringAmount != null) {
+      return Math.round((recurringCourseLine.price - recurringCourseLine.recurringAmount) * 100) / 100;
+    }
+    if (pt === 4 && allow4) {
+      const base =
+        recurringCourseLine.recurringAmount4 != null
+          ? recurringCourseLine.recurringAmount4
+          : !allow2 && recurringCourseLine.recurringAmount != null
+            ? recurringCourseLine.recurringAmount
+            : null;
+      return base ?? undefined;
+    }
+    return undefined;
+  };
+
+  const defaultRecurringAmount = cartPromoLine?.enableCardRecurring
+    ? cartPromoLine.price
+    : resolveCourseRecurringAmount(cardOptions.periodTimes) ??
+      (recurringCourseLine
+        ? cartCourseLines.reduce(
+            (s, c) => s + (c.enableCardRecurring ? c.price * c.qty : 0),
+            0,
+          )
+        : undefined);
+
+  const promoAllowedPeriodTimes =
+    cartPromoLine?.enableCardRecurring &&
+    cartPromoLine.periodCount != null &&
+    cartPromoLine.periodCount > 0
+      ? [cartPromoLine.periodCount]
+      : undefined;
+
+  /** 選定期定額時，課程首期只收第1期；其餘列維持原價 */
+  const payableTotal = useMemo(() => {
+    if (
+      cardOptions.cardMode !== 'RECURRING' ||
+      !recurringCourseLine ||
+      cartPromoLine?.enableCardRecurring
+    ) {
+      return cartTotal;
+    }
+    const first = resolveCourseFirstPeriodAmount(cardOptions.periodTimes);
+    if (first == null || !(first > 0)) return cartTotal;
+    const withoutRecurringCourse = cart.reduce((sum, c) => {
+      if (c.kind === 'COURSE' && c.coursePlanId === recurringCourseLine.coursePlanId) {
+        return sum;
+      }
+      if (c.kind === 'PROMO' && c.usageType === 'UNLIMITED') return sum + c.price;
+      return sum + c.price * c.qty;
+    }, 0);
+    return Math.round((withoutRecurringCourse + first * recurringCourseLine.qty) * 100) / 100;
+  }, [cart, cartTotal, cardOptions.cardMode, cardOptions.periodTimes, recurringCourseLine, cartPromoLine]);
 
   function resetSharedCheckoutPay() {
     setCarrier('');
@@ -806,6 +1061,7 @@ export default function OpsDashboardPage() {
       price: selectedPromotion.price,
       usageType: selectedPromotion.usageType,
       enableCardRecurring: selectedPromotion.enableCardRecurring,
+      recurringAmount: selectedPromotion.recurringAmount || null,
       periodCount: selectedPromotion.periodCount,
       unitDays: selectedPromotion.unitDays,
       durationDays: selectedPromotion.durationDays,
@@ -847,6 +1103,11 @@ export default function OpsDashboardPage() {
                 qty: c.qty + courseQty,
                 secondPersonOnSite: Boolean(c.secondPersonOnSite) || secondPersonOnSite,
                 giftLabel: gift || c.giftLabel || null,
+                enableCardRecurring: Boolean(selectedCoursePlan.enableCardRecurring),
+                recurringPeriods: selectedCoursePlan.recurringPeriods || null,
+                recurringAmount: selectedCoursePlan.recurringAmount || null,
+                recurringAmount4: selectedCoursePlan.recurringAmount4 || null,
+                recurringAmountFinal: selectedCoursePlan.recurringAmountFinal || null,
               }
             : c,
         );
@@ -863,6 +1124,12 @@ export default function OpsDashboardPage() {
           branchName: selectedCoursePlan.branchName || staffBranchLabel(selectedCoursePlan.branch),
           secondPersonOnSite,
           giftLabel: gift,
+          giftQty: selectedCoursePlan.giftQty || null,
+          enableCardRecurring: Boolean(selectedCoursePlan.enableCardRecurring),
+          recurringPeriods: selectedCoursePlan.recurringPeriods || null,
+          recurringAmount: selectedCoursePlan.recurringAmount || null,
+          recurringAmount4: selectedCoursePlan.recurringAmount4 || null,
+          recurringAmountFinal: selectedCoursePlan.recurringAmountFinal || null,
         },
       ];
     });
@@ -955,7 +1222,7 @@ export default function OpsDashboardPage() {
       toast('零錢包付款必須選擇會員', 'error');
       return;
     }
-    if (!isPaymentsBalanced(paySelected, payAmounts, cartTotal)) {
+    if (!isPaymentsBalanced(paySelected, payAmounts, payableTotal)) {
       toast('請至少選一種付款方式，且分攤合計須等於應付金額', 'error');
       return;
     }
@@ -1022,6 +1289,23 @@ export default function OpsDashboardPage() {
         return;
       }
       if (result.data?.actionUrl && result.data?.payload) {
+        const payRef =
+          result.data.checkoutId || result.data.orderId || result.data.saleId || '';
+        if (cardOptions.cardMode === 'RECURRING' && payRef) {
+          toast('已另開 PayUNi 續期收款分頁（該頁不會自動跳回）', 'info');
+          openPayuniCheckoutInNewTab(result.data.actionUrl, result.data.payload);
+          pendingPeriodSettled.current = false;
+          setPendingPeriodStatus('PENDING');
+          setPendingPeriodPay({
+            ref: payRef,
+            label: result.data.checkoutId
+              ? `合併結帳 ${payRef}`
+              : result.data.orderId
+                ? `購案 ${payRef}`
+                : `單號 ${payRef}`,
+          });
+          return;
+        }
         toast('導向 PayUNi 刷卡…', 'info');
         redirectToCheckOut(result.data.actionUrl, result.data.payload);
         return;
@@ -1042,7 +1326,7 @@ export default function OpsDashboardPage() {
       clearCart();
       setTopupQty(1);
       resetSharedCheckoutPay();
-      void loadData();
+      void loadMembers({ skip: 0 });
       if (posBranchId) {
         const prodRes = await fetchOpsProducts(Number(posBranchId));
         if (prodRes.status === 'success' && prodRes.data) setPosProducts(prodRes.data);
@@ -1098,7 +1382,7 @@ export default function OpsDashboardPage() {
       const result = await opsBindFace(faceMemberId, faceImage);
       toast(result.message || '人臉綁定成功', 'success');
       closeFaceModal();
-      void loadData();
+      void loadMembers({ skip: 0 });
     } catch (err) {
       toast(getErrorMessage(err, '人臉綁定失敗'), 'error');
     }
@@ -1364,12 +1648,21 @@ export default function OpsDashboardPage() {
             <input
               type="checkbox"
               checked={form.isAlert}
-              onChange={(e) => setForm((f) => ({ ...f, isAlert: e.target.checked }))}
+              disabled={Boolean(editingMember?.isAlert)}
+              onChange={(e) => {
+                if (!e.target.checked && editingMember?.isAlert) return;
+                setForm((f) => ({ ...f, isAlert: e.target.checked }));
+              }}
             />
             <span className="field__label" style={{ margin: 0 }}>
               警示黑名單（isAlert）
             </span>
           </label>
+          {editingMember?.isAlert ? (
+            <p className="text-muted text-sm" style={{ margin: '-0.35rem 0 0.5rem' }}>
+              解除警示請改由總部「合規補償 → 解鎖帳號」（須填原因並寫入日誌）。
+            </p>
+          ) : null}
         </>
       )}
       <Alert tone="info">
@@ -1570,7 +1863,11 @@ export default function OpsDashboardPage() {
                 )}
                 {selectedPromotion?.enableCardRecurring && (
                   <Alert tone="info">
-                    此方案已啟用定期定額：結帳選刷卡→定期定額後可輸入續扣金額。
+                    此方案已啟用定期定額：每期 ${selectedPromotion.price.toLocaleString('zh-TW')}
+                    {selectedPromotion.periodCount
+                      ? ` · 共 ${selectedPromotion.periodCount} 期（同有效期期數）`
+                      : ''}
+                    。結帳選刷卡→定期定額後自動帶入。
                   </Alert>
                 )}
                 <Button
@@ -1618,7 +1915,8 @@ export default function OpsDashboardPage() {
                         {p.branchName || staffBranchLabel(p.branch)
                           ? ` · ${p.branchName || staffBranchLabel(p.branch)}`
                           : ''}
-                        {p.giftLabel ? ` · 贈${p.giftLabel}` : ''}
+                        {p.giftLabel ? ` · 贈${p.giftLabel}${p.giftQty && p.giftQty > 1 ? ` ×${p.giftQty}` : ''}` : ''}
+                        {p.enableCardRecurring ? ' · 定期定額' : ''}
                       </option>
                     ))}
                   </Select>
@@ -1655,9 +1953,54 @@ export default function OpsDashboardPage() {
                     勾選後僅註記，不計入本次結帳；請於上課日現場另收 $500
                   </p>
                 )}
+                {selectedCoursePlan?.enableCardRecurring && (
+                  <Alert tone="info">
+                    此課程方案已啟用定期定額
+                    {(() => {
+                      const n = Number(selectedCoursePlan.recurringPeriods) || 0;
+                      const allow2 = (n & 2) !== 0;
+                      const allow4 = (n & 4) !== 0;
+                      const bits: string[] = [];
+                      if (allow2) {
+                        bits.push(
+                          selectedCoursePlan.recurringAmount != null
+                            ? `2期：第1期 $${(
+                                selectedCoursePlan.price - selectedCoursePlan.recurringAmount
+                              ).toLocaleString('zh-TW')} · 第2期 $${selectedCoursePlan.recurringAmount.toLocaleString(
+                                'zh-TW',
+                              )}`
+                            : '2期',
+                        );
+                      }
+                      if (allow4) {
+                        const base =
+                          selectedCoursePlan.recurringAmount4 != null
+                            ? selectedCoursePlan.recurringAmount4
+                            : !allow2
+                              ? selectedCoursePlan.recurringAmount
+                              : null;
+                        bits.push(
+                          selectedCoursePlan.recurringAmountFinal != null && base != null
+                            ? `4期：第1-3期 $${Number(base).toLocaleString(
+                                'zh-TW',
+                              )} · 第4期 $${selectedCoursePlan.recurringAmountFinal.toLocaleString(
+                                'zh-TW',
+                              )}`
+                            : '4期',
+                        );
+                      }
+                      return bits.length ? `（可選 ${bits.join(' ／ ')}）` : '';
+                    })()}
+                    ：結帳選刷卡→定期定額後自動帶入。
+                  </Alert>
+                )}
                 {selectedCoursePlan?.giftLabel && (
                   <Alert tone="info">
-                    加贈禮：{selectedCoursePlan.giftLabel}（入購物車 · $0 不收款）
+                    加贈禮：{selectedCoursePlan.giftLabel}
+                    {selectedCoursePlan.giftQty && selectedCoursePlan.giftQty > 1
+                      ? ` ×${selectedCoursePlan.giftQty}`
+                      : ''}
+                    （入購物車 · $0 不收款）
                   </Alert>
                 )}
                 {selectedCoursePlan?.requiresMemberContract && (
@@ -1678,7 +2021,7 @@ export default function OpsDashboardPage() {
             </Card>
           </div>
 
-          <Card title="購物車與結帳" subtitle={`應付約 $${cartTotal}（以後端為準）`}>
+          <Card title="購物車與結帳" subtitle={`應付約 $${payableTotal}（以後端為準）`}>
             <div className="form-stack">
               <ul className="cart-lines">
                 {cart.map((c) => {
@@ -1698,7 +2041,11 @@ export default function OpsDashboardPage() {
                   if (c.kind === 'COURSE') {
                     metaParts.push(`${c.sessions} 堂`);
                     if (c.secondPersonOnSite) metaParts.push('第二人 +$500（當日現場）');
-                    if (c.giftLabel) metaParts.push(`贈 ${c.giftLabel}（$0）`);
+                    if (c.giftLabel) {
+                      const qtyStr = c.giftQty && c.giftQty > 1 ? ` ×${c.giftQty}` : '';
+                      metaParts.push(`贈 ${c.giftLabel}${qtyStr}（$0）`);
+                    }
+                    if (c.enableCardRecurring) metaParts.push('定期定額');
                   }
                   if (c.kind === 'PROMO' && c.usageType === 'UNLIMITED') {
                     metaParts.push('無限方案');
@@ -1767,7 +2114,7 @@ export default function OpsDashboardPage() {
               )}
 
               <CompositePayFields
-                totalAmount={cartTotal}
+                totalAmount={payableTotal}
                 allowedMethods={['CASH', 'CARD', 'WALLET_CASH', 'VOUCHER']}
                 selected={paySelected}
                 onSelectedChange={setPaySelected}
@@ -1782,10 +2129,38 @@ export default function OpsDashboardPage() {
                 loveCode={loveCode}
                 onLoveCodeChange={setLoveCode}
                 cardOptions={cardOptions}
-                onCardOptionsChange={setCardOptions}
+                onCardOptionsChange={(opts) => {
+                  if (opts.cardMode === 'RECURRING' && cartPromoLine?.enableCardRecurring) {
+                    setCardOptions({
+                      ...opts,
+                      periodTimes: cartPromoLine.periodCount || opts.periodTimes,
+                      recurringAmount: cartPromoLine.price,
+                    });
+                    return;
+                  }
+                  if (
+                    opts.cardMode === 'RECURRING' &&
+                    recurringCourseLine &&
+                    !cartPromoLine?.enableCardRecurring
+                  ) {
+                    const amt = resolveCourseRecurringAmount(opts.periodTimes);
+                    if (amt != null && amt > 0) {
+                      setCardOptions({ ...opts, recurringAmount: amt });
+                      return;
+                    }
+                  }
+                  setCardOptions(opts);
+                }}
                 allowCardRecurring={allowCardRecurring}
-                defaultPeriodTimes={cartPromoLine?.periodCount ?? undefined}
+                allowedPeriodTimes={promoAllowedPeriodTimes ?? courseAllowedPeriodTimes}
+                defaultPeriodTimes={
+                  cartPromoLine?.periodCount ?? courseDefaultPeriodTimes ?? undefined
+                }
                 defaultRecurringAmount={defaultRecurringAmount}
+                lockRecurringAmount={
+                  Boolean(cartPromoLine?.enableCardRecurring) ||
+                  Boolean(recurringCourseLine && !cartPromoLine?.enableCardRecurring)
+                }
                 hint={
                   selectedMember
                     ? `會員 ${selectedMember.memberNo || `#${selectedMember.id}`} ${selectedMember.name} · 零錢包 $${selectedMember.cashWallet}`
@@ -1807,7 +2182,7 @@ export default function OpsDashboardPage() {
                     (Boolean(cartPromoLine) && !selectedMember) ||
                     (cartCourseLines.length > 0 && (!selectedMember || !trainerId)) ||
                     (paySelected.includes('WALLET_CASH') && !selectedMember) ||
-                    !isPaymentsBalanced(paySelected, payAmounts, cartTotal)
+                    !isPaymentsBalanced(paySelected, payAmounts, payableTotal)
                   }
                 >
                   {paySelected.includes('CARD') ? '確認並刷卡' : '確認結帳'}
@@ -1852,9 +2227,12 @@ export default function OpsDashboardPage() {
           <Input
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            placeholder="搜尋姓名、電話、ID、LINE、裝置…"
+            placeholder="搜尋姓名、電話、ID、LINE、會員編號…"
             style={{ maxWidth: 320 }}
           />
+          <span className="text-muted text-sm" style={{ marginLeft: '0.75rem' }}>
+            {membersLoading ? '載入中…' : `共 ${membersTotal} 位`}
+          </span>
           <div style={{ display: 'flex', gap: '0.5rem', marginLeft: 'auto' }}>
             <Button variant="ghost" size="sm" onClick={() => void loadData()}>
               重新整理
@@ -1886,14 +2264,14 @@ export default function OpsDashboardPage() {
               </tr>
             </thead>
             <tbody>
-              {filteredMembers.length === 0 ? (
+              {members.length === 0 ? (
                 <tr>
                   <td colSpan={14} className="text-center text-muted" style={{ padding: '2rem' }}>
-                    找不到符合的會員
+                    {membersLoading ? '載入中…' : '找不到符合的會員'}
                   </td>
                 </tr>
               ) : (
-                filteredMembers.map((m) => (
+                members.map((m) => (
                   <tr
                     key={m.id}
                     className={`${m.isAlert ? 'row-alert' : ''}${selectedMember?.id === m.id ? ' row-selected' : ''}`}
@@ -1991,11 +2369,67 @@ export default function OpsDashboardPage() {
             </tbody>
           </table>
         </div>
+        {members.length < membersTotal ? (
+          <div style={{ display: 'flex', justifyContent: 'center', marginTop: '1rem' }}>
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={membersLoadingMore}
+              onClick={() => void loadMembers({ append: true, skip: members.length })}
+            >
+              {membersLoadingMore ? '載入中…' : '載入更多'}
+            </Button>
+          </div>
+        ) : null}
       </PageSection>
       )}
 
       {tab === 'orders' && <OrdersQueryPage />}
       </div>
+
+      <Modal
+        open={pendingPeriodPay !== null}
+        title="等待續期收款入帳"
+        onClose={() => {
+          if (pendingPeriodStatus === 'PAID') {
+            setPendingPeriodPay(null);
+            return;
+          }
+          setPendingPeriodPay(null);
+          toast('已關閉等待視窗；若稍後 Notify 入帳，可至訂單查詢確認', 'info');
+        }}
+        footer={
+          <>
+            <Button
+              variant="ghost"
+              onClick={() => setPendingPeriodPay(null)}
+              disabled={pendingPeriodChecking}
+            >
+              稍後再查
+            </Button>
+            <Button
+              loading={pendingPeriodChecking}
+              onClick={() => void pollPendingPeriodPay({ manual: true })}
+            >
+              我已完成付款
+            </Button>
+          </>
+        }
+      >
+        <Alert tone="info">
+          PayUNi「續期收款」成功頁<strong>不會</strong>回流本系統（僅有買家專區連結）。請保持此櫃檯頁開啟；金流會以
+          Notify 背景通知入帳，本頁每 2.5 秒自動查詢狀態。
+        </Alert>
+        <p style={{ marginTop: '0.75rem' }}>
+          單號：<strong>{pendingPeriodPay?.label || pendingPeriodPay?.ref}</strong>
+        </p>
+        <p>
+          狀態：{' '}
+          <Badge tone={pendingPeriodStatus === 'PAID' ? 'success' : 'warning'}>
+            {pendingPeriodStatus === 'PAID' ? '已入帳' : '等待 Notify…'}
+          </Badge>
+        </p>
+      </Modal>
 
       <Modal
         open={createOpen}

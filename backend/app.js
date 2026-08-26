@@ -25,14 +25,39 @@ const app = express();
 const PORT = process.env.PORT || 8000;
 
 function parseCorsAllowlist() {
-  const raw = String(process.env.CORS_ORIGIN || '').trim();
-  if (raw) {
-    return raw
-      .split(',')
-      .map((s) => s.trim().replace(/\/$/, ''))
-      .filter(Boolean);
+  const strip = (s) =>
+    String(s || '')
+      .trim()
+      .replace(/^['"]|['"]$/g, '')
+      .replace(/\/$/, '');
+
+  const fromEnv = String(process.env.CORS_ORIGIN || '')
+    .split(',')
+    .map(strip)
+    .filter(Boolean);
+
+  const frontend = strip(process.env.FRONTEND_URL);
+  const merged = [...fromEnv];
+  if (frontend && !merged.includes(frontend)) merged.push(frontend);
+
+  const isProd = String(process.env.NODE_ENV || '').toLowerCase() === 'production';
+  if (!isProd) {
+    for (const o of [
+      'http://localhost:5173',
+      'http://127.0.0.1:5173',
+      'https://localhost:5173',
+      'https://127.0.0.1:5173',
+      'http://localhost:4173',
+      'https://localhost:4173',
+    ]) {
+      if (!merged.includes(o)) merged.push(o);
+    }
   }
-  if (String(process.env.NODE_ENV || '').toLowerCase() !== 'production') {
+
+  if (merged.length === 0) {
+    if (isProd) {
+      throw new Error('CORS_ORIGIN 未設定（正式環境必填，逗號分隔）');
+    }
     return [
       'http://localhost:5173',
       'http://127.0.0.1:5173',
@@ -40,22 +65,42 @@ function parseCorsAllowlist() {
       'https://127.0.0.1:5173',
     ];
   }
-  throw new Error('CORS_ORIGIN 未設定（正式環境必填，逗號分隔）');
+  return merged;
 }
 
-/** 開發環境：允許區網 IP 的 Vite 前端 Origin（手機連 https://192.168.x.x:5173） */
+/** 開發環境：允許區網 IP／.local 的 Vite 前端 Origin（手機連 https://192.168.x.x:5173） */
 function isDevLanFrontendOrigin(origin) {
   if (String(process.env.NODE_ENV || '').toLowerCase() === 'production') return false;
   try {
     const u = new URL(origin);
-    if (u.port !== '5173' && u.port !== '4173') return false;
+    const port = u.port || (u.protocol === 'https:' ? '443' : '80');
+    // Vite dev / preview；亦允許透過 ngrok 等反代時的預設埠
+    if (port !== '5173' && port !== '4173' && port !== '443' && port !== '80') return false;
     const h = u.hostname;
     return (
       h === 'localhost' ||
       h === '127.0.0.1' ||
+      h.endsWith('.local') ||
       /^192\.168\.\d{1,3}\.\d{1,3}$/.test(h) ||
       /^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h) ||
       /^172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}$/.test(h)
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** 開發環境：ngrok／cloudflare tunnel 等臨時公開 Origin */
+function isDevTunnelOrigin(origin) {
+  if (String(process.env.NODE_ENV || '').toLowerCase() === 'production') return false;
+  try {
+    const h = new URL(origin).hostname.toLowerCase();
+    return (
+      h.endsWith('.ngrok-free.dev') ||
+      h.endsWith('.ngrok-free.app') ||
+      h.endsWith('.ngrok.io') ||
+      h.endsWith('.loca.lt') ||
+      h.endsWith('.trycloudflare.com')
     );
   } catch {
     return false;
@@ -69,8 +114,13 @@ app.use(
       if (!origin) return cb(null, true);
       const normalized = String(origin).replace(/\/$/, '');
       const ok =
-        corsAllowlist.includes(normalized) || isDevLanFrontendOrigin(normalized);
-      return cb(ok ? null : new Error('CORS origin denied'), ok);
+        corsAllowlist.includes(normalized) ||
+        isDevLanFrontendOrigin(normalized) ||
+        isDevTunnelOrigin(normalized);
+      if (!ok) {
+        console.warn(`[CORS] denied origin=${normalized} allowlist=${corsAllowlist.join(',')}`);
+      }
+      return cb(null, ok);
     },
     credentials: true,
   }),
@@ -132,6 +182,13 @@ attachOccupancyWebSocket(server);
 
 server.listen(PORT, () => {
   console.log(`[體育客 API] Port ${PORT}｜純後端｜WS /ws/occupancy`);
+  const apiPub = String(process.env.API_PUBLIC_URL || process.env.BASE_URL || '').trim();
+  const fe = String(process.env.FRONTEND_URL || '').trim();
+  if (/localhost|127\.0\.0\.1/i.test(apiPub) && /localhost|127\.0\.0\.1/i.test(fe || 'localhost')) {
+    console.warn(
+      '[PayUNi] API_PUBLIC_URL／FRONTEND_URL 皆為本機：金流付款後無法自動跳回。請用 ngrok 等把 API 或前端公開，並更新 .env',
+    );
+  }
   startCardRecurringScheduler();
   backfillMissingMemberNos()
     .then((n) => {

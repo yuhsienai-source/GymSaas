@@ -11,22 +11,34 @@ import {
 
 type ToastTone = 'success' | 'error' | 'info';
 
+export type ToastAction = {
+  label: string;
+  onClick: () => void;
+};
+
 interface Toast {
   id: number;
   message: string;
   tone: ToastTone;
+  action?: ToastAction;
+}
+
+interface ToastOptions {
+  action?: ToastAction;
+  durationMs?: number;
 }
 
 interface ToastContextValue {
-  toast: (message: string, tone?: ToastTone) => void;
+  toast: (message: string, tone?: ToastTone, options?: ToastOptions) => void;
 }
 
 const ToastContext = createContext<ToastContextValue | null>(null);
 
 let toastId = 0;
 
-/** success／info 約 8 秒；error 約 12 秒（較長訊息需閱讀） */
-function durationForTone(tone: ToastTone) {
+/** success／info 約 8 秒；error 約 12 秒（有 action 再延長） */
+function durationForTone(tone: ToastTone, hasAction: boolean) {
+  if (hasAction) return 16000;
   return tone === 'error' ? 12000 : 8000;
 }
 
@@ -44,13 +56,15 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const toast = useCallback(
-    (message: string, tone: ToastTone = 'info') => {
+    (message: string, tone: ToastTone = 'info', options?: ToastOptions) => {
       const id = ++toastId;
-      setToasts((prev) => [...prev, { id, message, tone }]);
+      const action = options?.action;
+      setToasts((prev) => [...prev, { id, message, tone, action }]);
+      const ms = options?.durationMs ?? durationForTone(tone, Boolean(action));
       const timer = window.setTimeout(() => {
         timersRef.current.delete(id);
         setToasts((prev) => prev.filter((t) => t.id !== id));
-      }, durationForTone(tone));
+      }, ms);
       timersRef.current.set(id, timer);
     },
     [],
@@ -75,6 +89,18 @@ export function ToastProvider({ children }: { children: ReactNode }) {
         {toasts.map((t) => (
           <div key={t.id} className={`toast toast--${t.tone}`} role="status">
             <span className="toast__message">{t.message}</span>
+            {t.action ? (
+              <button
+                type="button"
+                className="toast__action"
+                onClick={() => {
+                  t.action?.onClick();
+                  dismiss(t.id);
+                }}
+              >
+                {t.action.label}
+              </button>
+            ) : null}
             <button
               type="button"
               className="toast__close"

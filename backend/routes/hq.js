@@ -16,10 +16,20 @@ import {
 import {
   normalizePlanMode,
   normalizeUsageType,
+  normalizePromotionKind,
   resolvePromotionFields,
   resolvePromotionSchedule,
   isUnlimitedPromotion,
 } from '../lib/promotion.js';
+import {
+  grantCompensationBonus,
+  grantCompensationExpire,
+  grantCompensationCourse,
+  clearMemberAlert,
+  listHqCompensationLogs,
+  HQ_COMPENSATION_ACTIONS,
+} from '../lib/hqCompensation.js';
+import { normalizePhone } from '../lib/memberIdentify.js';
 import { normalizeBranchSellerUbn } from '../lib/invoiceAllowance.js';
 import { normalizeBranchCode, staffBranchLabel } from '../lib/branchLabel.js';
 import { normalizeDisplayName } from '../lib/displayName.js';
@@ -37,6 +47,7 @@ import {
 } from '../lib/venueStation.js';
 import {
   normalizeCoursePlanType,
+  normalizeCoursePlanKind,
   resolveCoursePlanFields,
   resolveCoursePlanSchedule,
 } from '../lib/coursePlan.js';
@@ -525,6 +536,8 @@ router.post('/promotions', async (req, res) => {
     name,
     price,
     bonusGiven,
+    kind,
+    type,
     usageType,
     planMode,
     saleStartAt,
@@ -534,6 +547,7 @@ router.post('/promotions', async (req, res) => {
     periodCount,
     requiresMemberContract,
     enableCardRecurring,
+    recurringAmount,
     contractIds,
   } = req.body;
 
@@ -574,6 +588,7 @@ router.post('/promotions', async (req, res) => {
     const normalizedMode = normalizePlanMode(planMode);
     const fields = resolvePromotionFields(
       {
+        kind: kind ?? type,
         usageType,
         price,
         bonusGiven,
@@ -582,6 +597,7 @@ router.post('/promotions', async (req, res) => {
         periodCount,
         requiresMemberContract,
         enableCardRecurring,
+        recurringAmount,
       },
       { partial: false },
     );
@@ -593,6 +609,7 @@ router.post('/promotions', async (req, res) => {
           data: {
             branchId: bid,
             name: name.trim(),
+            kind: fields.kind,
             usageType: fields.usageType,
             planMode: normalizedMode,
             saleStartAt: schedule.saleStartAt,
@@ -602,6 +619,7 @@ router.post('/promotions', async (req, res) => {
             durationDays: fields.durationDays,
             requiresMemberContract: fields.requiresMemberContract,
             enableCardRecurring: fields.enableCardRecurring,
+            recurringAmount: fields.recurringAmount,
             price: fields.price,
             bonusGiven: fields.bonusGiven,
             isActive: true,
@@ -621,9 +639,12 @@ router.post('/promotions', async (req, res) => {
     });
 
     const sample = promotions[0];
-    const detail = isUnlimitedPromotion(sample)
-      ? `無限使用 ${fields.unitDays} 天×${fields.periodCount} 期＝${fields.durationDays} 天 · 方案費 $${fields.price}（不入錢包）`
-      : `現金 $${fields.price} + 運動金 $${fields.bonusGiven}`;
+    const detail =
+      fields.kind === 'COMPENSATION'
+        ? `客訴補償 · 運動金 $${fields.bonusGiven}（price $0，禁銷售通路）`
+        : isUnlimitedPromotion(sample)
+          ? `無限使用 ${fields.unitDays} 天×${fields.periodCount} 期＝${fields.durationDays} 天 · 方案費 $${fields.price}（不入錢包）`
+          : `現金 $${fields.price} + 運動金 $${fields.bonusGiven}`;
     const branchNames = branches.map((b) => staffBranchLabel(b)).join('、');
     const mapped = promotions.map(withPromotionContracts);
 
@@ -641,12 +662,15 @@ router.post('/promotions', async (req, res) => {
   }
 });
 
-// GET /api/hq/promotions?branchId=
+// GET /api/hq/promotions?branchId=&kind=SALE|COMPENSATION
 router.get('/promotions', async (req, res) => {
   try {
     const where = {};
     if (req.query.branchId !== undefined) {
       where.branchId = parsePositiveInt(req.query.branchId, 'branchId');
+    }
+    if (req.query.kind !== undefined && String(req.query.kind).trim() !== '') {
+      where.kind = normalizePromotionKind(req.query.kind);
     }
 
     const promotions = await prisma.promotion.findMany({
@@ -673,6 +697,8 @@ router.patch('/promotions/:id', async (req, res) => {
     name,
     price,
     bonusGiven,
+    kind,
+    type,
     isActive,
     usageType,
     planMode,
@@ -683,6 +709,7 @@ router.patch('/promotions/:id', async (req, res) => {
     periodCount,
     requiresMemberContract,
     enableCardRecurring,
+    recurringAmount,
     contractIds,
   } = req.body || {};
   const data = {};
@@ -702,19 +729,23 @@ router.patch('/promotions/:id', async (req, res) => {
       return res.status(404).json({ status: 'error', message: '找不到此促銷方案' });
     }
 
+    const kindInput = kind ?? type;
     const hasFieldUpdates =
       price !== undefined ||
       bonusGiven !== undefined ||
+      kindInput !== undefined ||
       usageType !== undefined ||
       durationDays !== undefined ||
       unitDays !== undefined ||
       periodCount !== undefined ||
       requiresMemberContract !== undefined ||
-      enableCardRecurring !== undefined;
+      enableCardRecurring !== undefined ||
+      recurringAmount !== undefined;
 
     if (hasFieldUpdates) {
       const fields = resolvePromotionFields(
         {
+          kind: kindInput ?? current.kind,
           usageType: usageType ?? current.usageType,
           price: price ?? current.price,
           bonusGiven: bonusGiven ?? current.bonusGiven,
@@ -727,9 +758,12 @@ router.patch('/promotions/:id', async (req, res) => {
               : current.requiresMemberContract,
           enableCardRecurring:
             enableCardRecurring !== undefined ? enableCardRecurring : current.enableCardRecurring,
+          recurringAmount:
+            recurringAmount !== undefined ? recurringAmount : current.recurringAmount,
         },
         { partial: true, current },
       );
+      data.kind = fields.kind;
       data.usageType = fields.usageType;
       data.price = fields.price;
       data.bonusGiven = fields.bonusGiven;
@@ -738,6 +772,7 @@ router.patch('/promotions/:id', async (req, res) => {
       data.durationDays = fields.durationDays;
       data.requiresMemberContract = fields.requiresMemberContract;
       data.enableCardRecurring = fields.enableCardRecurring;
+      data.recurringAmount = fields.recurringAmount;
     } else if (usageType !== undefined) {
       data.usageType = normalizeUsageType(usageType);
     }
@@ -924,6 +959,8 @@ router.post('/course-plans', async (req, res) => {
     branchId,
     branchIds,
     name,
+    kind,
+    type,
     planType,
     planMode,
     saleStartAt,
@@ -933,9 +970,14 @@ router.post('/course-plans', async (req, res) => {
     capacity,
     description,
     enableCardRecurring,
+    recurringPeriods,
+    recurringAmount,
+    recurringAmount4,
+    recurringAmountFinal,
     requiresMemberContract,
     enableSecondPerson,
     giftLabel,
+    giftQty,
     contractIds,
   } = req.body || {};
 
@@ -974,15 +1016,21 @@ router.post('/course-plans', async (req, res) => {
     const schedule = resolveCoursePlanSchedule({ planMode, saleStartAt, saleEndAt });
     const fields = resolveCoursePlanFields(
       {
+        kind: kind ?? type,
         planType,
         price,
         sessions,
         capacity,
         description,
         enableCardRecurring,
+        recurringPeriods,
+        recurringAmount,
+        recurringAmount4,
+        recurringAmountFinal,
         requiresMemberContract,
         enableSecondPerson,
         giftLabel,
+        giftQty,
       },
       { partial: false },
     );
@@ -998,6 +1046,7 @@ router.post('/course-plans', async (req, res) => {
           data: {
             branchId: bid,
             name: name.trim(),
+            kind: fields.kind,
             planType: fields.planType,
             planMode: normalizedMode,
             saleStartAt: schedule.saleStartAt,
@@ -1007,9 +1056,14 @@ router.post('/course-plans', async (req, res) => {
             capacity: fields.capacity,
             description: fields.description,
             enableCardRecurring: fields.enableCardRecurring,
+            recurringPeriods: fields.recurringPeriods,
+            recurringAmount: fields.recurringAmount,
+            recurringAmount4: fields.recurringAmount4,
+            recurringAmountFinal: fields.recurringAmountFinal,
             requiresMemberContract: fields.requiresMemberContract,
             enableSecondPerson: fields.enableSecondPerson,
             giftLabel: fields.giftLabel,
+            giftQty: fields.giftQty,
             isActive: true,
           },
         });
@@ -1042,12 +1096,15 @@ router.post('/course-plans', async (req, res) => {
   }
 });
 
-// GET /api/hq/course-plans?branchId=
+// GET /api/hq/course-plans?branchId=&kind=SALE|COMPENSATION
 router.get('/course-plans', async (req, res) => {
   try {
     const where = {};
     if (req.query.branchId !== undefined) {
       where.branchId = parsePositiveInt(req.query.branchId, 'branchId');
+    }
+    if (req.query.kind !== undefined && String(req.query.kind).trim() !== '') {
+      where.kind = normalizeCoursePlanKind(req.query.kind);
     }
     const plans = await prisma.coursePlan.findMany({
       where,
@@ -1071,6 +1128,8 @@ router.get('/course-plans', async (req, res) => {
 router.patch('/course-plans/:id', async (req, res) => {
   const {
     name,
+    kind,
+    type,
     planType,
     planMode,
     saleStartAt,
@@ -1080,9 +1139,14 @@ router.patch('/course-plans/:id', async (req, res) => {
     capacity,
     description,
     enableCardRecurring,
+    recurringPeriods,
+    recurringAmount,
+    recurringAmount4,
+    recurringAmountFinal,
     requiresMemberContract,
     enableSecondPerson,
     giftLabel,
+    giftQty,
     contractIds,
     isActive,
   } = req.body || {};
@@ -1106,20 +1170,28 @@ router.patch('/course-plans/:id', async (req, res) => {
       return res.status(404).json({ status: 'error', message: '找不到此課程方案' });
     }
 
+    const kindInput = kind ?? type;
     const hasFieldUpdates =
+      kindInput !== undefined ||
       planType !== undefined ||
       price !== undefined ||
       sessions !== undefined ||
       capacity !== undefined ||
       description !== undefined ||
       enableCardRecurring !== undefined ||
+      recurringPeriods !== undefined ||
+      recurringAmount !== undefined ||
+      recurringAmount4 !== undefined ||
+      recurringAmountFinal !== undefined ||
       requiresMemberContract !== undefined ||
       enableSecondPerson !== undefined ||
-      giftLabel !== undefined;
+      giftLabel !== undefined ||
+      giftQty !== undefined;
 
     if (hasFieldUpdates) {
       const fields = resolveCoursePlanFields(
         {
+          kind: kindInput ?? current.kind,
           planType: planType ?? current.planType,
           price: price ?? current.price,
           sessions: sessions !== undefined ? sessions : current.sessions,
@@ -1129,6 +1201,22 @@ router.patch('/course-plans/:id', async (req, res) => {
             enableCardRecurring !== undefined
               ? enableCardRecurring
               : current.enableCardRecurring,
+          recurringPeriods:
+            recurringPeriods !== undefined
+              ? recurringPeriods
+              : current.recurringPeriods,
+          recurringAmount:
+            recurringAmount !== undefined
+              ? recurringAmount
+              : current.recurringAmount,
+          recurringAmount4:
+            recurringAmount4 !== undefined
+              ? recurringAmount4
+              : current.recurringAmount4,
+          recurringAmountFinal:
+            recurringAmountFinal !== undefined
+              ? recurringAmountFinal
+              : current.recurringAmountFinal,
           requiresMemberContract:
             requiresMemberContract !== undefined
               ? requiresMemberContract
@@ -1138,18 +1226,25 @@ router.patch('/course-plans/:id', async (req, res) => {
               ? enableSecondPerson
               : current.enableSecondPerson,
           giftLabel: giftLabel !== undefined ? giftLabel : current.giftLabel,
+          giftQty: giftQty !== undefined ? giftQty : current.giftQty,
         },
         { partial: true, current },
       );
+      data.kind = fields.kind;
       data.planType = fields.planType;
       data.price = fields.price;
       data.sessions = fields.sessions;
       data.capacity = fields.capacity;
       data.description = fields.description;
       data.enableCardRecurring = fields.enableCardRecurring;
+      data.recurringPeriods = fields.recurringPeriods;
+      data.recurringAmount = fields.recurringAmount;
+      data.recurringAmount4 = fields.recurringAmount4;
+      data.recurringAmountFinal = fields.recurringAmountFinal;
       data.requiresMemberContract = fields.requiresMemberContract;
       data.enableSecondPerson = fields.enableSecondPerson;
       data.giftLabel = fields.giftLabel;
+      data.giftQty = fields.giftQty;
     } else if (planType !== undefined) {
       data.planType = normalizeCoursePlanType(planType);
     }
@@ -2036,6 +2131,174 @@ router.post('/gate-devices/:id/rotate-key', async (req, res) => {
     }
     console.error(error);
     res.status(500).json({ status: 'error', message: '輪替金鑰失敗' });
+  }
+});
+
+// ==========================================
+// 合規補償（ADMIN）：運動金／效期／解鎖警示
+// ==========================================
+
+// GET /api/hq/members/search?q= 手機或會員編號
+router.get('/members/search', async (req, res) => {
+  try {
+    const q = String(req.query.q || '').trim();
+    if (q.length < 2) {
+      return res.status(400).json({ status: 'error', message: '請輸入至少 2 字（手機或會員編號）' });
+    }
+    const phone = normalizePhone(q);
+    const members = await prisma.member.findMany({
+      where: {
+        OR: [
+          { memberNo: { equals: q.toUpperCase(), mode: 'insensitive' } },
+          ...(phone ? [{ phone }] : []),
+          { phone: { contains: q } },
+          { name: { contains: q } },
+        ],
+      },
+      take: 20,
+      orderBy: { id: 'desc' },
+      select: {
+        id: true,
+        memberNo: true,
+        name: true,
+        phone: true,
+        plan: true,
+        expireDate: true,
+        cashWallet: true,
+        bonusWallet: true,
+        isAlert: true,
+      },
+    });
+    res.json({ status: 'success', data: members });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ status: 'error', message: '搜尋會員失敗' });
+  }
+});
+
+// GET /api/hq/compensation-logs?memberId=&action=&limit=
+router.get('/compensation-logs', async (req, res) => {
+  try {
+    const logs = await listHqCompensationLogs({
+      memberId: req.query.memberId,
+      action: req.query.action,
+      limit: req.query.limit,
+    });
+    res.json({
+      status: 'success',
+      data: logs,
+      meta: { actions: HQ_COMPENSATION_ACTIONS },
+    });
+  } catch (error) {
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({ status: 'error', message: error.message });
+    }
+    console.error(error);
+    res.status(500).json({ status: 'error', message: '讀取補償日誌失敗' });
+  }
+});
+
+/**
+ * 補償運動金：僅 promotionId（kind=COMPENSATION）+ reason
+ * 禁止 amount／bonusAmount 等自由金額欄位
+ */
+router.post('/members/:id/compensate-bonus', async (req, res) => {
+  try {
+    const result = await grantCompensationBonus({
+      memberId: req.params.id,
+      promotionId: req.body?.promotionId,
+      reason: req.body?.reason,
+      actorStaffId: req.user?.staffId ?? req.user?.id,
+      req,
+      body: req.body || {},
+    });
+    res.json({
+      status: 'success',
+      message: `已配發運動金 $${result.bonusAdded}（專案：${result.promotion.name}）`,
+      data: result,
+    });
+  } catch (error) {
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({ status: 'error', message: error.message });
+    }
+    console.error(error);
+    res.status(500).json({ status: 'error', message: '補償運動金失敗' });
+  }
+});
+
+/** 補償效期：展延 expireDate + reason；寫入異動日誌 */
+router.post('/members/:id/compensate-expire', async (req, res) => {
+  try {
+    const result = await grantCompensationExpire({
+      memberId: req.params.id,
+      days: req.body?.days,
+      reason: req.body?.reason,
+      actorStaffId: req.user?.staffId ?? req.user?.id,
+      req,
+    });
+    res.json({
+      status: 'success',
+      message: `已補償效期 ${result.days} 天`,
+      data: result,
+    });
+  } catch (error) {
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({ status: 'error', message: error.message });
+    }
+    console.error(error);
+    res.status(500).json({ status: 'error', message: '補償效期失敗' });
+  }
+});
+
+/** 解鎖帳號：isAlert=false + reason */
+router.post('/members/:id/clear-alert', async (req, res) => {
+  try {
+    const result = await clearMemberAlert({
+      memberId: req.params.id,
+      reason: req.body?.reason,
+      actorStaffId: req.user?.staffId ?? req.user?.id,
+      req,
+    });
+    res.json({
+      status: 'success',
+      message: result.alreadyCleared ? '帳號本來就未警示' : '已解除警示，動態 QR 可重新生效',
+      data: result,
+    });
+  } catch (error) {
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({ status: 'error', message: error.message });
+    }
+    console.error(error);
+    res.status(500).json({ status: 'error', message: '解鎖帳號失敗' });
+  }
+});
+
+/**
+ * 補償課程：僅 coursePlanId（kind=COMPENSATION）+ trainerId + reason
+ * 建立 source=COMPENSATION 的 PTContract，與付費購案區隔
+ */
+router.post('/members/:id/compensate-course', async (req, res) => {
+  try {
+    const result = await grantCompensationCourse({
+      memberId: req.params.id,
+      coursePlanId: req.body?.coursePlanId,
+      trainerId: req.body?.trainerId,
+      reason: req.body?.reason,
+      actorStaffId: req.user?.staffId ?? req.user?.id,
+      req,
+      body: req.body || {},
+    });
+    res.json({
+      status: 'success',
+      message: `已補償贈送 ${result.sessions} 堂（${result.coursePlan.name}｜合約#${result.contract.id}）`,
+      data: result,
+    });
+  } catch (error) {
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({ status: 'error', message: error.message });
+    }
+    console.error(error);
+    res.status(500).json({ status: 'error', message: '補償課程失敗' });
   }
 });
 

@@ -12,6 +12,11 @@
     "db:seed": "node --env-file=.env prisma/seed.js",
     "db:studio": "prisma studio",
     "setup": "prisma generate && prisma db push && node --env-file=.env prisma/seed.js",
+    "check:syntax": "node --check app.js && find routes lib middleware -name '*.js' -print0 | xargs -0 -n1 node --check",
+    "check:prisma": "prisma validate",
+    "check:lint": "eslint .",
+    "lint": "npm run check:lint",
+    "doctor": "npm run check:prisma && npm run check:lint && npm run check:syntax",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "prisma": {
@@ -32,7 +37,10 @@
     "ws": "^8.21.1"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@prisma/config": "^7.8.0",
+    "eslint": "^10.8.0",
+    "globals": "^17.8.0",
     "prisma": "^7.9.0"
   }
 }

@@ -2,6 +2,21 @@
 
 export const UNLIMITED_MEMBER_PLAN = '無限會員';
 
+/** SALE＝可售｜COMPENSATION＝客訴補償專案（禁銷售通路） */
+export const PROMOTION_KINDS = ['SALE', 'COMPENSATION'];
+
+export function normalizePromotionKind(value) {
+  const raw = String(value || 'SALE').trim().toUpperCase();
+  if (raw === 'COMPENSATION' || raw === 'TYPE_COMPENSATION' || raw === 'COMP') {
+    return 'COMPENSATION';
+  }
+  return 'SALE';
+}
+
+export function isCompensationPromotion(promotion) {
+  return normalizePromotionKind(promotion?.kind) === 'COMPENSATION';
+}
+
 export function normalizeUsageType(value) {
   return value === 'UNLIMITED' ? 'UNLIMITED' : 'TIMED';
 }
@@ -63,9 +78,65 @@ export function resolvePromotionSchedule({ planMode, saleStartAt, saleEndAt }) {
  * 驗證並正規化 HQ 建立／更新方案欄位
  */
 export function resolvePromotionFields(body, { partial = false, current = null } = {}) {
+  const kind = normalizePromotionKind(
+    body.kind !== undefined ? body.kind : body.type !== undefined ? body.type : current?.kind,
+  );
   const usageType = normalizeUsageType(
     body.usageType !== undefined ? body.usageType : current?.usageType,
   );
+
+  if (kind === 'COMPENSATION') {
+    if (usageType === 'UNLIMITED') {
+      const err = new Error('客訴補償專案僅限分鐘計費（TIMED），不可為無限使用');
+      err.statusCode = 400;
+      throw err;
+    }
+    const priceRaw = body.price !== undefined ? body.price : current?.price;
+    const parsedPrice = parseFloat(priceRaw);
+    if (Number.isNaN(parsedPrice) || parsedPrice !== 0) {
+      const err = new Error('客訴補償專案 price 必須為 0（禁止自填補償現金）');
+      err.statusCode = 400;
+      throw err;
+    }
+    const bonusRaw = body.bonusGiven !== undefined ? body.bonusGiven : current?.bonusGiven;
+    const parsedBonus = parseFloat(bonusRaw);
+    if (Number.isNaN(parsedBonus) || parsedBonus <= 0) {
+      const err = new Error('客訴補償專案必須設定 bonusGiven（運動金）且大於 0');
+      err.statusCode = 400;
+      throw err;
+    }
+    for (const key of ['durationDays', 'unitDays', 'periodCount']) {
+      if (body[key] !== undefined && body[key] !== null && body[key] !== '') {
+        const err = new Error(`客訴補償專案不可設定 ${key}`);
+        err.statusCode = 400;
+        throw err;
+      }
+    }
+    if (
+      parseBooleanFlag(
+        body.enableCardRecurring !== undefined
+          ? body.enableCardRecurring
+          : current?.enableCardRecurring,
+        false,
+      )
+    ) {
+      const err = new Error('客訴補償專案不可啟用定期定額');
+      err.statusCode = 400;
+      throw err;
+    }
+    return {
+      kind,
+      usageType: 'TIMED',
+      price: 0,
+      bonusGiven: parsedBonus,
+      unitDays: null,
+      periodCount: null,
+      durationDays: null,
+      requiresMemberContract: false,
+      enableCardRecurring: false,
+      recurringAmount: null,
+    };
+  }
 
   const priceRaw = body.price !== undefined ? body.price : current?.price;
   const parsedPrice = parseFloat(priceRaw);
@@ -149,7 +220,19 @@ export function resolvePromotionFields(body, { partial = false, current = null }
     }
   }
 
+  // 儲值定期定額：每期金額固定＝方案費用；扣款期數＝有效期 periodCount（忽略前端自填金額）
+  let recurringAmount = null;
+  if (enableCardRecurring) {
+    if (usageType !== 'UNLIMITED' || !periodCount || periodCount <= 0) {
+      const err = new Error('啟用定期定額僅限「無限使用」方案，且必須設定有效期期數（periodCount）');
+      err.statusCode = 400;
+      throw err;
+    }
+    recurringAmount = parsedPrice;
+  }
+
   return {
+    kind,
     usageType,
     price: parsedPrice,
     bonusGiven,
@@ -158,11 +241,13 @@ export function resolvePromotionFields(body, { partial = false, current = null }
     durationDays,
     requiresMemberContract,
     enableCardRecurring,
+    recurringAmount,
   };
 }
 
 export function isPromotionSellable(promotion, now = new Date()) {
   if (!promotion?.isActive) return false;
+  if (isCompensationPromotion(promotion)) return false;
 
   if (normalizePlanMode(promotion.planMode) === 'STANDING') {
     return true;
@@ -189,12 +274,13 @@ export function assertPromotionSellable(promotion) {
   }
 }
 
-/** 櫃檯／會員端：只顯示當下可購買的方案 */
+/** 櫃檯／會員端：只顯示當下可購買的方案（排除客訴補償專案） */
 export function promotionSellablePrismaWhere(base = {}) {
   const now = new Date();
   return {
     ...base,
     isActive: true,
+    kind: 'SALE',
     OR: [
       { planMode: 'STANDING' },
       {

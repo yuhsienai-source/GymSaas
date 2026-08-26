@@ -50,6 +50,10 @@ export interface PtContract {
   id: number;
   member?: { id: number; name: string };
   trainer: { id: number; name: string };
+  /** PURCHASE＝付費｜COMPENSATION＝總部補償贈送 */
+  source?: 'PURCHASE' | 'COMPENSATION' | string;
+  coursePlanId?: number | null;
+  coursePlanName?: string | null;
   totalSessions: number;
   usedSessions: number;
   remainingSessions: number;
@@ -124,6 +128,8 @@ export interface Promotion {
   name: string;
   price: number;
   bonusGiven: number;
+  /** SALE＝可售｜COMPENSATION＝客訴補償（禁銷售通路） */
+  kind?: 'SALE' | 'COMPENSATION';
   usageType?: 'TIMED' | 'UNLIMITED';
   planMode?: 'STANDING' | 'CAMPAIGN';
   saleStartAt?: string | null;
@@ -133,11 +139,41 @@ export interface Promotion {
   periodCount?: number | null;
   requiresMemberContract?: boolean;
   enableCardRecurring?: boolean;
+  /** 定期定額每期扣款金額 */
+  recurringAmount?: number | null;
   contracts?: { id: number; title: string; shortName?: string | null; displayName?: string; status: string }[];
   branchId?: number;
   branch?: { id: number; name: string; code?: string | null };
   isActive?: boolean;
   createdAt?: string;
+}
+
+export interface HqCompensationLog {
+  id: string;
+  action: 'BONUS' | 'EXPIRE' | 'CLEAR_ALERT' | 'COURSE' | string;
+  memberId: number;
+  actorStaffId: number;
+  promotionId?: number | null;
+  coursePlanId?: number | null;
+  reason: string;
+  detail?: Record<string, unknown> | null;
+  createdAt: string;
+  member?: { id: number; memberNo?: string | null; name: string; phone?: string };
+  actorStaff?: { id: number; account: string; name: string };
+  promotion?: {
+    id: number;
+    name: string;
+    bonusGiven: number;
+    price: number;
+    kind?: string;
+  } | null;
+  coursePlan?: {
+    id: number;
+    name: string;
+    sessions?: number | null;
+    price: number;
+    kind?: string;
+  } | null;
 }
 
 export interface CardSubscriptionCharge {
@@ -327,6 +363,8 @@ export interface MemberContractSignature {
 export interface CoursePlan {
   id: number;
   name: string;
+  /** SALE＝可售｜COMPENSATION＝客訴補償課程（禁 POS／私教購案） */
+  kind?: 'SALE' | 'COMPENSATION';
   planType: 'CUSTOM_PT' | 'GROUP' | string;
   planMode?: 'STANDING' | 'CAMPAIGN' | string;
   saleStartAt?: string | null;
@@ -337,10 +375,20 @@ export interface CoursePlan {
   description?: string | null;
   requiresMemberContract?: boolean;
   enableCardRecurring?: boolean;
+  /** 定期定額可選期數 bitmask：2／4／6（2+4）；null＝無 */
+  recurringPeriods?: number | null;
+  /** 2 期：第2期扣款金額 */
+  recurringAmount?: number | null;
+  /** 4 期：第1~3期共用扣款金額 */
+  recurringAmount4?: number | null;
+  /** 4 期：第4期扣款金額 */
+  recurringAmountFinal?: number | null;
   /** 是否開放「課程第二人+$500(課程當日現場支付)」 */
   enableSecondPerson?: boolean;
   /** 加贈禮（入購物車，金額 $0） */
   giftLabel?: string | null;
+  /** 加贈禮數量 */
+  giftQty?: number | null;
   contracts?: { id: number; title: string; shortName?: string | null; displayName?: string; status: string }[];
   branchId?: number;
   branchName?: string;
@@ -447,6 +495,10 @@ export interface TrainerPtContract {
   branchId?: number | null;
   branchCode?: string | null;
   branchName?: string | null;
+  coursePlanId?: number | null;
+  coursePlanName?: string | null;
+  /** PURCHASE＝付費｜COMPENSATION＝總部補償贈送 */
+  source?: 'PURCHASE' | 'COMPENSATION' | string;
   totalSessions: number;
   usedSessions: number;
   remainingSessions: number;

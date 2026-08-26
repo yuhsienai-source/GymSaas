@@ -3,6 +3,7 @@ import { Link, Outlet, useLocation } from 'react-router-dom';
 import { Button } from '../ui';
 import { useStaffAuth } from '../../contexts/StaffAuthContext';
 import type { StaffPermission } from '../../lib/storage';
+import StaffCommandPalette from '../staff/StaffCommandPalette';
 
 const SIDEBAR_COLLAPSE_KEY = 'gymsaas.staff.sidebarCollapsed';
 
@@ -32,6 +33,7 @@ export default function StaffShell() {
     }
   });
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [cmdOpen, setCmdOpen] = useState(false);
 
   useEffect(() => {
     try {
@@ -41,7 +43,6 @@ export default function StaffShell() {
     }
   }, [collapsed]);
 
-  // 換頁後關閉手機抽屜
   useEffect(() => {
     setMobileMenuOpen(false);
   }, [location.pathname]);
@@ -60,6 +61,17 @@ export default function StaffShell() {
     };
   }, [mobileMenuOpen]);
 
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        setCmdOpen(true);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, []);
+
   const visibleNav = navItems.filter((item) => {
     if (item.adminOnly) return isAdmin;
     if (item.dutyOrAbove) return canAccessTx;
@@ -70,8 +82,8 @@ export default function StaffShell() {
   const activeLabel =
     visibleNav.find((n) => location.pathname.startsWith(n.to))?.label || '後台';
 
-  /** 手機抽屜開啟時一律顯示完整標籤（不受桌面收合影響） */
-  const showLabels = !collapsed || mobileMenuOpen;
+  /** 手機抽屜開啟時一律顯示完整標籤；桌面收合改由 CSS hover 展開 */
+  const forceLabels = mobileMenuOpen;
 
   return (
     <div className={`staff-app ${collapsed && !mobileMenuOpen ? 'staff-app--collapsed' : ''}`}>
@@ -87,17 +99,15 @@ export default function StaffShell() {
       <aside
         className={`staff-sidebar ${collapsed && !mobileMenuOpen ? 'staff-sidebar--collapsed' : ''} ${
           mobileMenuOpen ? 'is-open' : ''
-        }`}
+        } ${forceLabels ? 'staff-sidebar--labels' : ''}`}
       >
         <div className="staff-sidebar__head">
           <Link to="/portal" className="brand brand--compact" title="體育客員工後台">
             <span className="brand__mark">體</span>
-            {showLabels && (
-              <span className="brand__text">
-                體育客
-                <small>員工後台</small>
-              </span>
-            )}
+            <span className="brand__text">
+              體育客
+              <small>員工後台</small>
+            </span>
           </Link>
           <button
             type="button"
@@ -131,36 +141,33 @@ export default function StaffShell() {
               <span className="staff-sidebar__icon" aria-hidden>
                 {item.icon}
               </span>
-              {showLabels && <span className="staff-sidebar__label">{item.label}</span>}
+              <span className="staff-sidebar__label">{item.label}</span>
             </Link>
           ))}
         </nav>
 
         <div className="staff-sidebar__footer">
-          {showLabels ? (
-            <div className="staff-user">
-              <div className="avatar avatar--sm">{staff?.name?.charAt(0) || '?'}</div>
-              <div>
-                <strong>{staff?.name}</strong>
-                <span>
-                  {staff?.role}
-                  {staff?.branchName ? ` · ${staff.branchName}` : ''}
-                </span>
-              </div>
+          <div className="staff-user">
+            <div className="avatar avatar--sm">{staff?.name?.charAt(0) || '?'}</div>
+            <div className="staff-user__meta">
+              <strong>{staff?.name}</strong>
+              <span>
+                {staff?.role}
+                {staff?.branchName ? ` · ${staff.branchName}` : ''}
+              </span>
             </div>
-          ) : (
-            <div className="avatar avatar--sm" title={staff?.name || '員工'}>
-              {staff?.name?.charAt(0) || '?'}
-            </div>
-          )}
+          </div>
           <Button
             variant="ghost"
             size="sm"
             onClick={logout}
-            className={!showLabels ? 'staff-sidebar__logout-icon' : 'w-full'}
+            className="staff-sidebar__logout-btn w-full"
             title="登出"
           >
-            {!showLabels ? '⎋' : '登出'}
+            <span className="staff-sidebar__logout-icon-only" aria-hidden>
+              ⎋
+            </span>
+            <span className="staff-sidebar__logout-label">登出</span>
           </Button>
         </div>
       </aside>
@@ -188,6 +195,15 @@ export default function StaffShell() {
             <h1>{activeLabel}</h1>
           </div>
           <div className="staff-topbar__right">
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => setCmdOpen(true)}
+              title="全域搜尋 (Ctrl/⌘ K)"
+            >
+              搜尋
+              <kbd className="staff-topbar__kbd">⌘K</kbd>
+            </Button>
             <Button
               variant="ghost"
               size="sm"
@@ -229,6 +245,8 @@ export default function StaffShell() {
           <small>登出</small>
         </button>
       </nav>
+
+      <StaffCommandPalette open={cmdOpen} onClose={() => setCmdOpen(false)} />
     </div>
   );
 }

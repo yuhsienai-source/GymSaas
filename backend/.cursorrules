@@ -8,7 +8,7 @@
 2. **禁止靜態託管**：嚴禁 `express.static`、`res.render()`、`res.sendFile`、回傳 HTML 字串。根路徑與 404 一律 JSON。
 3. **純 RESTful / WS**：路由回傳 `{ "status": "success"|"error", "message": "...", "data": {} }`。WebSocket 只推業務事件（如容留），不推畫面。
 4. **視角鎖定**：前端是另一個網域／App。本服務只收 HTTP/WS、驗 JWT、跑商業與 DB。
-5. **回流例外**：OAuth／PayUNi 瀏覽器回流可用 `302` 到 `FRONTEND_URL`（見 `lib/frontendUrl.js`），**禁止** redirect 到本機 `.html`。
+5. **回流例外**：OAuth／PayUNi 瀏覽器回流可用 `302` 到 `FRONTEND_URL`（見 `lib/frontendUrl.js`），**禁止** redirect 到本機 `.html`。**續期收款支付頁不回流 ReturnURL**，入帳只認 Notify；櫃檯以 `GET /ops/checkout/:id` 輪詢。
 6. **網址職責**：
    - `API_PUBLIC_URL` / `BASE_URL` → 後端公開網址（PayUNi Notify/Return、LINE Callback）
    - `FRONTEND_URL` → 獨立前端（必須與 API 網址不同）
@@ -16,14 +16,16 @@
 
 ## 🏢 商業核心（最高營運準則）
 1. 進出場結算 1.3 元/分：先扣 `bonusWallet`，再扣 `cashWallet`。
-2. 退費強制收回贈送運動金；已消耗則從退款現金折讓。UNLIMITED 月卡不走錢包退費，改用取消訂閱結算（KEEP／CUT_UNUSED＋ezPay 折讓）或請假。
+2. 計時儲值退費：`退費金額 = 實付金額 − 實際使用額度 − 手續費$100`（實際使用＝已用本金＋已消耗運動金）；強制收回剩餘運動金。UNLIMITED 月卡不走錢包退費，改用取消訂閱結算（KEEP／CUT_UNUSED＋ezPay 折讓）或請假。
+2.1 **30 日月卡／訂閱終止退費**（CUT_UNUSED）：30 日為一期；不每 15 日以半期計，逾 15 日以一期計。未滿十五日：`退費 = 已繳金額 × 契約存續比例 − 手續費$500`（存續比例＝剩餘天數／契約總天數；訂閱每期請款則契約＝本期天數）；滿／逾十五日以一期計、無法退費。
 3. 儲值嚴禁任意金額：只收 `promotionId`，後端查表配發現金／運動金。
-4. 進場先查 `expireDate`；逾期靜默降級計時並清空效期。請假中（`leaveUntil`）禁止月費通行。
+3.1 **總部合規補償**（`routes/hq.js`，ADMIN）：（1）運動金：僅綁 `kind=COMPENSATION` 且 `price=0` 的 Promotion（`bonusGiven` 為表定額度），API 禁自由金額欄位、必填 `reason`；（2）效期：`POST .../compensate-expire` 展延 `expireDate` 並寫 `HqCompensationLog`；（3）解鎖：`POST .../clear-alert` 將 `isAlert=false`（櫃檯 PATCH 禁直接解除）；（4）補償課程：僅綁 `CoursePlan.kind=COMPENSATION`（`price=0`、CUSTOM_PT），`POST .../compensate-course` 建立 `PTContract.source=COMPENSATION`（與付費 `PURCHASE` 區隔），禁自填堂數／金額。補償專案／課程不出現在櫃檯／會員可售列表。
+4. 進場先查 `expireDate`；逾期靜默降級計時並清空效期。請假中（`leaveUntil`）禁止月費通行；**請假期滿自動銷假**（閘機／`settleExpiredLeave`）須同步將對應 `PAUSED` 訂閱 `resumeCardSubscription`，禁止只清 `leaveUntil` 而訂閱停在暫停。
 5. `CheckInLog.billingMode` 進場快照；出場禁止依 Member 當下方案。
 6. Venue / Promotion 綁 Branch；分店有 `name`（會員顯示）與 `code`（員工關聯顯示）；一般教練綁定指定分店（可多間）、主管教練不限分店。教練服務台含 inbox 與**排休**（`TrainerTimeOff`）；排課／私教預約重疊排休回 409；會員 `GET /member/trainers/:id/time-offs` 可查所屬教練排休。員工／教練有 `name`（真實姓名，總部／內部）與 `displayName`（對外顯示，預設「匿名」）；會員介面／LINE／員工側欄顯示用 `displayName`。**團課為期班**（`ClassSeries`）：開始～結束日期 × 每週幾 × 上課時間展開多堂 `Class`（GROUP）。**會員分店綁定**（`MemberBranch`）：開卡／編輯必綁至少一店；進出場掃碼須本機分店∈綁定場館（**AC↔HP** 可互進）。私教上課仍依購案分店（**HP↔HR** 共享）。`PTContract.branchId` 記私教購案分店。**進出場裝置**（`GateDevice`）：總部建立並綁定分店；閘機以 `deviceCode`＋`deviceKey`（僅存 SHA-256）配對；明文金鑰僅建立／輪替回傳一次；`CheckInLog.gateDeviceId` 可追溯。
-7. 私教不扣現金：合約堂數；排課教練＋場地雙重防衝堂。教練代約私教：`POST /api/trainer/schedule-private`（`contractId`＋場地＋自選時段，開 PRIVATE 堂並扣堂；場地須符合購案分店或 HP↔HR）。**諮詢客人**（`ConsultGuest` 姓名＋電話）`POST /api/trainer/schedule-consult` 自選時段開 CONSULT 堂代約，無需私教合約／無需選課程；`Reservation.memberId` 可空。會員經 LINE Login 後可 `GET/POST /member/classes|book-class` 自助約課並推播。
+7. 私教不扣現金：合約堂數；排課教練＋場地雙重防衝堂。教練代約私教：`POST /api/trainer/schedule-private`（`contractId`＋場地＋自選時段，開 PRIVATE 堂並扣堂；場地須符合購案分店或 HP↔HR）。**諮詢客人**（`ConsultGuest` 姓名＋電話）`POST /api/trainer/schedule-consult` 自選時段開 CONSULT 堂代約，無需私教合約／無需選課程；`Reservation.memberId` 可空。**改期**`PATCH /api/trainer/classes/:id/reschedule`（拖拉課表；僅改時間／場地，不重扣堂；防衝堂 409）。會員經 LINE Login 後可 `GET/POST /member/classes|book-class` 自助約課並推播。
 8. **進銷存與 Promotion 分離**：`Product`／進貨／銷貨獨立；`productKind` PHYSICAL｜SERVICE（服務不控庫存，POS 可售）；POS 付款 `CASH`｜`CARD`(PayUNi)｜`WALLET_CASH`（**只扣 cashWallet，禁 bonus**）；前端禁自填金額；成交開 ezPay 發票（刷卡於 Webhook）。`GET /ops/products` 須回傳 `productKind`。合併結帳（CHK）一次付款，**發票軟拆**：SAL／購案／私教各開一張（MerchantOrderNo＝子單號；session 存 `SPLIT:…` 僅標記，禁止當 ezPay 發票號）；異動不得作廢仍有存活兄弟單的舊版合併發票。`POST /ops/cancel-sale` 可帶 `prefer=void|allowance`；退費折讓僅在應退現金 > 0 且有真實子單發票時開立。**冪等**：軟拆開票略過已 stamp 子單；CHK fulfill 以 `updateMany(PENDING→PAID)` 搶佔；定期定額續扣 claim `nextChargeAt` + `@@unique([subscriptionId, periodIndex])`。**沖回後**：子單全關閉時 `reevaluateCheckoutSessionStatus` 將 CHK 標 CANCELLED；報表交易狀態以子單推導，課程列以私教 Order 狀態為準。
-9. **訂閱制月卡**：取消可 KEEP 效期或 CUT 截斷＋未使用天數折讓；請假預先順延 `expireDate` 並暫停／順延 `CardSubscription.nextChargeAt`。定期定額週期以天數遞延：W=+7 天、M=+30 天（起始日算第 1 天）。
+9. **訂閱制月卡**：取消可 KEEP 效期或 CUT 截斷＋月卡退費基準折讓（見 2.1）；請假預先順延 `expireDate` 並暫停／順延 `CardSubscription.nextChargeAt`。定期定額週期以天數遞延：W=+7 天、M=+30 天（起始日算第 1 天）。
 9.1 單號規則：一般儲值（TIMED）訂單使用 `TYK...`；訂閱制月卡（UNLIMITED）與定期定額（RECURRING）建立／續扣訂單使用 `CRS...`（訂閱紀錄 `CardSubscription.id` 亦為 `CRS...`）。取消訂閱可用訂閱編號或以訂單號（`CRS`／舊 `TYK`）反查；一次付清／現金月卡無訂閱紀錄時，以訂單號直接做效期結算。
 10. **交接班**：超商式三段（彙總→面額點鈔→對帳簽核）；盲點預設；`cashDenominations`／檢核清單入 `summarySnapshot`；支付分欄；操作人員紀錄；差額僅 MANAGER／ADMIN；可列印結算單。
 
@@ -43,9 +45,9 @@
 1. `app.js` + `lib/prisma.js` — API 總機（無 static）。**掛載順序**：較長路徑先於前綴（`/api/ops/inventory` 先於 `/api/ops`；`/api/hq/reports`・`/api/hq/contracts` 先於 `/api/hq`），否則會被 `requireAdmin`／ops 中介層誤擋 DUTY。
 2. `member.js` — 錢包、QR、線上訂單（Promotion → PayUNi）
 3. `gate.js` — QR／人臉進出、快照、雙錢包結算、容留廣播
-4. `ops.js` — 開卡、臨櫃儲值／退費、身分辨認、**在場進場列表**（`GET /ops/check-ins/active`）、**補登出場**（`POST /ops/check-ins/:logId/check-out`，依快照計費）、取消進場（`POST /ops/cancel-gate`；在場 ops 可取消、已出場退費限 DUTY+）、PayUNi webhook（含 SAL 銷貨分流）；交易異動（退費／取消／訂閱請假）限 DUTY+
+4. `ops.js` — 開卡、臨櫃儲值／退費、身分辨認、**會員列表分頁搜尋**（`GET /ops/members?q=&take=&skip=&id=&lite=` → `{ items, total, take, skip }`；`lite=1` 略過合約板／購案方案名）、**在場進場列表**（`GET /ops/check-ins/active`）、**補登出場**（`POST /ops/check-ins/:logId/check-out`，依快照計費）、取消進場（`POST /ops/cancel-gate`；在場 ops 可取消、已出場退費限 DUTY+）、PayUNi webhook（含 SAL 銷貨分流）、**結帳狀態輪詢**（`GET /ops/checkout/:id`，續期收款無 Return 時用）；交易異動（退費／取消／訂閱請假）限 DUTY+
 5. `pos.js` — 櫃檯購物結帳（掛於 `/api/ops`）；`inventoryOps.js` — 進銷存作業限 DUTY+（掛於 `/api/ops/inventory`）
-6. `hq.js` — 分店／場地（`DELETE /hq/branches|:venues/:id`：分店有關聯則軟刪停用、無關聯硬刪；場地無課可刪）／**儲值／課程方案刪除**（`DELETE /hq/promotions|:course-plans/:id`：有訂閱或上架中則下架，否則硬刪）／促銷／教練／**商品新增**／**進出場裝置**（`GateDevice` CRUD＋輪替金鑰）；報表見 `reports.js`（DUTY+／ops，掛於 `/api/hq/reports`）
+6. `hq.js` — 分店／場地（`DELETE /hq/branches|:venues/:id`：分店有關聯則軟刪停用、無關聯硬刪）；場地無課可刪）／**儲值／課程方案刪除**（`DELETE /hq/promotions|:course-plans/:id`：有訂閱或上架中則下架，否則硬刪）／促銷（含 `kind=COMPENSATION` 客訴補償專案）／**合規補償**（運動金／效期／解鎖警示＋`HqCompensationLog`）／教練／**商品新增**／**進出場裝置**（`GateDevice` CRUD＋輪替金鑰）；報表見 `reports.js`（DUTY+／ops，掛於 `/api/hq/reports`）；**銷售分析**必有日期區間（缺省近 30 日、最長 366 日）
 7. `pt.js` / `trainer.js` / `auth.js` / `admin.js`
 8. `board.js` + `lib/occupancy.js` + `/ws/occupancy`；`lib/inventory.js` 進銷存共用；`lib/gateDevice.js` 閘機金鑰驗證；`lib/gateCheckout.js` 出場結算共用
 

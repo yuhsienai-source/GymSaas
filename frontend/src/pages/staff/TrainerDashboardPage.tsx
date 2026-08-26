@@ -15,6 +15,7 @@ import TrainerInboxList from '../../components/staff/trainer/TrainerInboxList';
 import TrainerScheduleList from '../../components/staff/trainer/TrainerScheduleList';
 import TrainerStudentsPanel from '../../components/staff/trainer/TrainerStudentsPanel';
 import TrainerTimeOffPanel from '../../components/staff/trainer/TrainerTimeOffPanel';
+import TrainerWeekCalendar from '../../components/staff/trainer/TrainerWeekCalendar';
 import { isTodayClass } from '../../components/staff/trainer/trainerFormat';
 
 type TabKey = 'home' | 'schedule' | 'book' | 'students' | 'history' | 'inbox' | 'timeoff';
@@ -407,21 +408,35 @@ export default function TrainerDashboardPage() {
             {tab === 'schedule' && (
               <PageSection
                 title="我的課表"
-                desc="未來 14 天 · 列出此教練全部課程（團課／私教／諮詢）· 點選可看名單"
+                desc="週曆拖拉改時（私教／諮詢）· 衝突格變紅 · 下方為未來 14 天列表"
               >
-                <TrainerScheduleList
+                <TrainerWeekCalendar
                   classes={upcoming}
-                  selectedId={selectedClass?.id}
+                  viewAsTrainerId={
+                    viewAsTrainerId === '' ? undefined : Number(viewAsTrainerId)
+                  }
+                  onChanged={load}
                   onSelect={(c) => {
                     setSelectedClass(c);
-                    // 私教／諮詢可接續代約；團課僅展開名單
                     if (c.type === 'PRIVATE' || c.type === 'CONSULT') {
                       switchTab('book');
                     }
                   }}
-                  emptyTitle="近期沒有課程"
-                  emptyDesc="尚無未來排程（含團課、私教、諮詢）。團課請至「總部 HQ／團課管理」排程。"
                 />
+                <div className="mt-lg">
+                  <TrainerScheduleList
+                    classes={upcoming}
+                    selectedId={selectedClass?.id}
+                    onSelect={(c) => {
+                      setSelectedClass(c);
+                      if (c.type === 'PRIVATE' || c.type === 'CONSULT') {
+                        switchTab('book');
+                      }
+                    }}
+                    emptyTitle="近期沒有課程"
+                    emptyDesc="尚無未來排程（含團課、私教、諮詢）。團課請至「總部 HQ／團課管理」排程。"
+                  />
+                </div>
               </PageSection>
             )}
 

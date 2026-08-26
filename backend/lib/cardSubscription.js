@@ -47,7 +47,7 @@ export function computeNextChargeAt(periodType, from = new Date()) {
 /**
  * 解析總期數：訂單 periodTimes 優先；0 則用方案 periodCount；仍無則 0（不限）
  */
-export function resolveMaxPeriodTimes(order, promotion) {
+export function resolveMaxPeriodTimes(order, promotion, coursePlan = null) {
   const fromOrder = parseInt(order?.periodTimes, 10);
   if (Number.isInteger(fromOrder) && fromOrder > 0) return fromOrder;
   if (Number.isInteger(fromOrder) && fromOrder === 0) {
@@ -57,15 +57,37 @@ export function resolveMaxPeriodTimes(order, promotion) {
   }
   const fromPromo = parseInt(promotion?.periodCount, 10);
   if (Number.isInteger(fromPromo) && fromPromo > 0) return fromPromo;
+  const fromCourse = parseInt(coursePlan?.recurringPeriods, 10);
+  // course bitmask 2/4/6 不是「總期數」；總期數應來自 order.periodTimes
+  if (fromCourse === 2 || fromCourse === 4) return fromCourse;
   return 0;
+}
+
+/** 依期別決定本期扣款金額（最末期可用 amountFinal） */
+export function resolvePeriodChargeAmount(sub, periodIndex) {
+  const finalAmt = Number(sub?.amountFinal);
+  const times = parseInt(sub?.periodTimes, 10);
+  if (
+    Number.isFinite(finalAmt) &&
+    finalAmt > 0 &&
+    Number.isInteger(times) &&
+    times > 0 &&
+    periodIndex === times
+  ) {
+    return Math.round(finalAmt * 100) / 100;
+  }
+  return Math.round((Number(sub?.amount) || 0) * 100) / 100;
 }
 
 /**
  * 首期 UPP 成功後建立訂閱（idempotent：同 originOrderId 不重複）
+ * promotion 與 coursePlan 擇一
  */
 export async function createSubscriptionFromPaidOrder(order, {
-  promotion,
+  promotion = null,
+  coursePlan = null,
   creditHash,
+  amountFinal: amountFinalOverride = undefined,
   now = new Date(),
 } = {}) {
   if (!order || order.cardMode !== 'RECURRING') return null;
@@ -74,8 +96,12 @@ export async function createSubscriptionFromPaidOrder(order, {
     console.warn(`⚠️ 訂單 ${order.id} 為定期定額但缺少 CreditHash，無法建立續扣訂閱`);
     return null;
   }
-  if (!promotion?.id) {
-    console.warn(`⚠️ 訂單 ${order.id} 無法解析方案，略過訂閱建立`);
+  if (!promotion?.id && !coursePlan?.id) {
+    console.warn(`⚠️ 訂單 ${order.id} 無法解析儲值／課程方案，略過訂閱建立`);
+    return null;
+  }
+  if (promotion?.id && coursePlan?.id) {
+    console.warn(`⚠️ 訂單 ${order.id} 同時帶入儲值與課程方案，略過訂閱建立`);
     return null;
   }
 
@@ -85,12 +111,39 @@ export async function createSubscriptionFromPaidOrder(order, {
   if (existing) return existing;
 
   const periodType = String(order.periodType || 'M').toUpperCase();
-  const periodTimes = resolveMaxPeriodTimes(order, promotion);
+  let periodTimes = resolveMaxPeriodTimes(order, promotion, coursePlan);
+  // 儲值方案：總期數權威＝方案有效期 periodCount
+  if (promotion?.id) {
+    const fromPromo = parseInt(promotion.periodCount, 10);
+    if (Number.isInteger(fromPromo) && fromPromo > 0) {
+      periodTimes = fromPromo;
+    }
+  }
+
   const recurringOverride = Number(order.recurringAmount);
-  const amount =
+  let amount =
     Number.isFinite(recurringOverride) && recurringOverride > 0
       ? recurringOverride
       : Number(order.cardAmount > 0 ? order.cardAmount : order.amount);
+  // 儲值方案：每期金額權威＝方案費用
+  if (promotion?.id) {
+    const price = Number(promotion.price);
+    if (Number.isFinite(price) && price > 0) amount = price;
+  }
+
+  let amountFinal = null;
+  if (amountFinalOverride !== undefined) {
+    const v = Number(amountFinalOverride);
+    amountFinal = Number.isFinite(v) && v > 0 ? v : null;
+  } else {
+    const fromOrder = Number(order.recurringAmountFinal);
+    if (Number.isFinite(fromOrder) && fromOrder > 0) amountFinal = fromOrder;
+    else if (coursePlan?.recurringAmountFinal != null) {
+      const v = Number(coursePlan.recurringAmountFinal);
+      if (Number.isFinite(v) && v > 0) amountFinal = v;
+    }
+  }
+
   const nextChargeAt = computeNextChargeAt(periodType, now);
 
   const status =
@@ -102,10 +155,12 @@ export async function createSubscriptionFromPaidOrder(order, {
       data: {
         id: generateSubscriptionId(),
         memberId: order.memberId,
-        promotionId: promotion.id,
+        promotionId: promotion?.id || null,
+        coursePlanId: coursePlan?.id || null,
         originOrderId: order.id,
         creditHash: hash,
         amount,
+        amountFinal,
         periodType: ['W', 'M', 'Y'].includes(periodType) ? periodType : 'M',
         periodTimes,
         chargedCount: 1,
@@ -124,8 +179,11 @@ export async function createSubscriptionFromPaidOrder(order, {
   }
   if (!sub) return null;
 
+  const targetLabel = promotion?.id
+    ? `方案#${promotion.id}`
+    : `課程方案#${coursePlan.id}`;
   console.log(
-    `🔁 已建立定期定額訂閱 ${sub.id}（會員#${sub.memberId} · 方案#${sub.promotionId} · 下次 ${nextChargeAt.toISOString()}）`,
+    `🔁 已建立定期定額訂閱 ${sub.id}（會員#${sub.memberId} · ${targetLabel} · 共${periodTimes || '不限'}期 · 下次 ${nextChargeAt.toISOString()}）`,
   );
   return sub;
 }
@@ -152,6 +210,7 @@ export async function processOneSubscription(subscriptionId, { now = new Date() 
     where: { id: subscriptionId },
     include: {
       promotion: true,
+      coursePlan: true,
       member: { select: { id: true, name: true } },
     },
   });
@@ -167,6 +226,18 @@ export async function processOneSubscription(subscriptionId, { now = new Date() 
   }
 
   const periodIndex = sub.chargedCount + 1;
+  const chargeAmount = resolvePeriodChargeAmount(sub, periodIndex);
+  if (!(chargeAmount > 0)) {
+    await prisma.cardSubscription.update({
+      where: { id: sub.id },
+      data: {
+        status: 'FAILED',
+        lastError: '續扣金額無效',
+        nextChargeAt: sub.nextChargeAt,
+      },
+    });
+    return { ok: false, message: '續扣金額無效' };
+  }
 
   const existingCharge = await prisma.cardSubscriptionCharge.findUnique({
     where: {
@@ -187,7 +258,13 @@ export async function processOneSubscription(subscriptionId, { now = new Date() 
 
   const orderId = generateSubscriptionOrderId();
   const chargeId = generateChargeId();
-  const itemDesc = `${buildTopupItemDesc(sub.promotion, '定期定額續扣', 1)} | 訂閱#${sub.id} | 期${periodIndex}`;
+  const planName =
+    sub.promotion?.name ||
+    sub.coursePlan?.name ||
+    (sub.coursePlanId ? `課程方案#${sub.coursePlanId}` : '定期定額');
+  const itemDesc = sub.promotion
+    ? `${buildTopupItemDesc(sub.promotion, '定期定額續扣', 1)} | 訂閱#${sub.id} | 期${periodIndex}`
+    : `課程定期定額續扣 | ${planName} | 課程方案#${sub.coursePlanId} | 訂閱#${sub.id} | 期${periodIndex}`;
 
   try {
     await prisma.$transaction(async (tx) => {
@@ -195,13 +272,15 @@ export async function processOneSubscription(subscriptionId, { now = new Date() 
         data: {
           id: orderId,
           memberId: sub.memberId,
-          amount: sub.amount,
+          amount: chargeAmount,
           itemDesc,
           payMethod: 'CARD',
-          cardAmount: sub.amount,
+          cardAmount: chargeAmount,
           cardMode: 'RECURRING',
           periodType: sub.periodType,
           periodTimes: sub.periodTimes,
+          recurringAmount: sub.amount,
+          recurringAmountFinal: sub.amountFinal,
           creditHash: sub.creditHash,
           status: 'PENDING',
         },
@@ -211,7 +290,7 @@ export async function processOneSubscription(subscriptionId, { now = new Date() 
           id: chargeId,
           subscriptionId: sub.id,
           orderId,
-          amount: sub.amount,
+          amount: chargeAmount,
           periodIndex,
           status: 'PENDING',
           attemptedAt: now,
@@ -231,7 +310,7 @@ export async function processOneSubscription(subscriptionId, { now = new Date() 
 
   const chargeResult = await chargeWithCreditHash({
     merTradeNo: orderId,
-    amount: sub.amount,
+    amount: chargeAmount,
     itemDesc,
     creditHash: sub.creditHash,
   });
@@ -269,10 +348,6 @@ export async function processOneSubscription(subscriptionId, { now = new Date() 
     return { ok: false, orderId, chargeId, message: chargeResult.message, giveUp };
   }
 
-  const durationOverride = isUnlimitedPromotion(sub.promotion)
-    ? resolveRecurringPeriodDays(sub.promotion)
-    : undefined;
-
   await prisma.$transaction(async (tx) => {
     await tx.order.update({
       where: { id: orderId },
@@ -291,10 +366,16 @@ export async function processOneSubscription(subscriptionId, { now = new Date() 
       },
     });
 
-    await fulfillPromotionPurchase(tx, sub.memberId, sub.promotion, {
-      qty: 1,
-      durationDaysOverride: durationOverride ?? undefined,
-    });
+    // 儲值方案續扣才履約（延長效期／入帳）；課程首期已給滿堂數，續扣僅收款
+    if (sub.promotion) {
+      const durationOverride = isUnlimitedPromotion(sub.promotion)
+        ? resolveRecurringPeriodDays(sub.promotion)
+        : undefined;
+      await fulfillPromotionPurchase(tx, sub.memberId, sub.promotion, {
+        qty: 1,
+        durationDaysOverride: durationOverride ?? undefined,
+      });
+    }
 
     const chargedCount = sub.chargedCount + 1;
     const completed = sub.periodTimes > 0 && chargedCount >= sub.periodTimes;
@@ -311,12 +392,12 @@ export async function processOneSubscription(subscriptionId, { now = new Date() 
     });
   });
 
-  // 續扣發票（失敗不擋主流程）；品名含「代為處理折讓」
+  // 續扣發票（失敗不擋主流程）
   try {
     const invoiceResult = await issueInvoice({
       id: orderId,
-      amount: sub.amount,
-      itemDesc: buildRecurringInvoiceItemDesc(sub.promotion?.name, { periodIndex }),
+      amount: chargeAmount,
+      itemDesc: buildRecurringInvoiceItemDesc(planName, { periodIndex }),
       buyerName: sub.member?.name || '會員',
     });
     if (invoiceResult.Status === 'SUCCESS') {
@@ -330,8 +411,8 @@ export async function processOneSubscription(subscriptionId, { now = new Date() 
     console.error(`❌ 訂閱續扣 ${orderId} 發票失敗:`, err.message);
   }
 
-  console.log(`✅ 訂閱 ${sub.id} 第 ${periodIndex} 期扣款成功 → 訂單 ${orderId}`);
-  return { ok: true, orderId, chargeId, periodIndex };
+  console.log(`✅ 訂閱 ${sub.id} 第 ${periodIndex} 期扣款成功 → 訂單 ${orderId} $${chargeAmount}`);
+  return { ok: true, orderId, chargeId, periodIndex, amount: chargeAmount };
 }
 
 /**

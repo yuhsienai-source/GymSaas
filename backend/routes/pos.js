@@ -3,7 +3,7 @@ import express from 'express';
 import prisma from '../lib/prisma.js';
 import { verifyStaff, requirePermission } from '../middleware/jwtAuth.js';
 import { assertBranchAccess, branchListWhere } from '../lib/staffAccess.js';
-import { buildUPPPayload, parseCardPayOptions, PAYUNI_UPP_URL } from '../lib/payuni.js';
+import { buildCardCheckoutRequest, parseCardPayOptions } from '../lib/payuni.js';
 import { normalizeInvoiceOptions } from '../lib/ezpay.js';
 import { coercePaymentsFromBody, POS_PAY_METHODS } from '../lib/compositePay.js';
 import {
@@ -100,6 +100,13 @@ router.get('/course-plans', async (req, res) => {
         description: p.description,
         requiresMemberContract: p.requiresMemberContract,
         enableCardRecurring: p.enableCardRecurring,
+        recurringPeriods: p.recurringPeriods,
+        recurringAmount: p.recurringAmount,
+        recurringAmount4: p.recurringAmount4,
+        recurringAmountFinal: p.recurringAmountFinal,
+        enableSecondPerson: p.enableSecondPerson,
+        giftLabel: p.giftLabel,
+        giftQty: p.giftQty,
         isActive: p.isActive,
       }));
 
@@ -326,7 +333,7 @@ router.post('/pos/checkout', async (req, res) => {
     });
 
     if (pay.needsCard) {
-      const payuniPayload = buildUPPPayload({
+      const { actionUrl, payload: payuniPayload } = buildCardCheckoutRequest({
         id: result.id,
         amount: pay.cardAmount,
         itemDesc: result.itemDesc,
@@ -349,7 +356,7 @@ router.post('/pos/checkout', async (req, res) => {
           carrierNum: invoiceOpts.carrierNum,
           buyerUbn: invoiceOpts.buyerUbn,
           loveCode: invoiceOpts.loveCode,
-          actionUrl: PAYUNI_UPP_URL,
+          actionUrl,
           payload: payuniPayload,
         },
       });

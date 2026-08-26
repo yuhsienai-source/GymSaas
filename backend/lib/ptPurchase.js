@@ -135,6 +135,8 @@ export async function fulfillPtCheckoutLines(tx, {
         usedSessions: 0,
         pricePaid: line.lineTotal,
         isActive: true,
+        source: 'PURCHASE',
+        ...(line.coursePlanId ? { coursePlanId: line.coursePlanId } : {}),
         ...(line.branchId ? { branchId: line.branchId } : {}),
       },
     });

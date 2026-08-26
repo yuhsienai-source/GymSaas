@@ -77,10 +77,14 @@ interface CompositePayFieldsProps {
   onCardOptionsChange?: (opts: CardPayOptions) => void;
   /** 是否允許定期定額（通常依方案 enableCardRecurring） */
   allowCardRecurring?: boolean;
+  /** 定期定額可選總期數（例如課程方案 bitmask 解出的 [2]／[4]／[2,4]） */
+  allowedPeriodTimes?: number[];
   /** 定期定額預設總期數（例如方案 periodCount） */
   defaultPeriodTimes?: number;
-  /** 定期定額預設期付金額（通常＝方案價） */
+  /** 定期定額預設期付金額（通常＝方案價或課程續期金額） */
   defaultRecurringAmount?: number;
+  /** 鎖定期付金額（方案表定，禁止臨櫃改） */
+  lockRecurringAmount?: boolean;
 }
 
 /**
@@ -105,8 +109,10 @@ export default function CompositePayFields({
   cardOptions = DEFAULT_CARD_PAY_OPTIONS,
   onCardOptionsChange,
   allowCardRecurring = false,
+  allowedPeriodTimes,
   defaultPeriodTimes,
   defaultRecurringAmount,
+  lockRecurringAmount = false,
 }: CompositePayFieldsProps) {
   const { toast } = useToast();
   const [voucherScanOpen, setVoucherScanOpen] = useState(false);
@@ -195,10 +201,20 @@ export default function CompositePayFields({
       return;
     }
     if (mode === 'RECURRING') {
+      const allowed =
+        allowedPeriodTimes && allowedPeriodTimes.length > 0
+          ? allowedPeriodTimes.filter((n) => Number.isInteger(n) && n > 0)
+          : null;
       const times =
-        defaultPeriodTimes != null && defaultPeriodTimes > 0
-          ? defaultPeriodTimes
-          : cardOptions.periodTimes ?? 12;
+        allowed && allowed.length === 1
+          ? allowed[0]
+          : defaultPeriodTimes != null &&
+              defaultPeriodTimes > 0 &&
+              (!allowed || allowed.includes(defaultPeriodTimes))
+            ? defaultPeriodTimes
+            : allowed && allowed.length > 0
+              ? allowed[0]
+              : cardOptions.periodTimes ?? 12;
       const defaultAmt =
         defaultRecurringAmount != null && defaultRecurringAmount > 0
           ? roundMoney(defaultRecurringAmount)
@@ -320,14 +336,20 @@ export default function CompositePayFields({
               <div className="form-stack">
                 <Field
                   label="期付金額"
-                  hint="續期幕後扣款以此為準；本次首期應付仍為上方購物車合計"
+                  hint={
+                    lockRecurringAmount
+                      ? '依方案表定；本次首期應付見上方購物車合計'
+                      : '續期幕後扣款以此為準；本次首期應付仍為上方購物車合計'
+                  }
                 >
                   <Input
                     type="number"
                     min={1}
                     step={1}
+                    readOnly={lockRecurringAmount}
                     value={cardOptions.recurringAmount ?? defaultRecurringAmount ?? ''}
                     onChange={(e) => {
+                      if (lockRecurringAmount) return;
                       const n = parseFloat(e.target.value);
                       onCardOptionsChange?.({
                         ...cardOptions,
@@ -355,25 +377,54 @@ export default function CompositePayFields({
                 </Field>
                 <Field
                   label="總期數"
-                  hint="0＝不限期數（依約定持續扣款）；首期於本次刷卡完成"
+                  hint={
+                    allowedPeriodTimes && allowedPeriodTimes.length > 0
+                      ? `此方案可選：${allowedPeriodTimes.join('／')} 期；首期於本次刷卡完成`
+                      : '0＝不限期數（依約定持續扣款）；首期於本次刷卡完成'
+                  }
                 >
-                  <Input
-                    type="number"
-                    min={0}
-                    max={99}
-                    value={cardOptions.periodTimes ?? 12}
-                    onChange={(e) => {
-                      const n = parseInt(e.target.value, 10);
-                      onCardOptionsChange?.({
-                        ...cardOptions,
-                        cardMode: 'RECURRING',
-                        periodTimes: Number.isInteger(n) && n >= 0 ? n : 0,
-                      });
-                    }}
-                  />
+                  {allowedPeriodTimes && allowedPeriodTimes.length > 0 ? (
+                    <Select
+                      value={String(
+                        cardOptions.periodTimes != null &&
+                          allowedPeriodTimes.includes(cardOptions.periodTimes)
+                          ? cardOptions.periodTimes
+                          : allowedPeriodTimes[0],
+                      )}
+                      onChange={(e) => {
+                        const n = parseInt(e.target.value, 10);
+                        onCardOptionsChange?.({
+                          ...cardOptions,
+                          cardMode: 'RECURRING',
+                          periodTimes: Number.isInteger(n) && n > 0 ? n : allowedPeriodTimes[0],
+                        });
+                      }}
+                    >
+                      {allowedPeriodTimes.map((n) => (
+                        <option key={n} value={n}>
+                          {n} 期
+                        </option>
+                      ))}
+                    </Select>
+                  ) : (
+                    <Input
+                      type="number"
+                      min={0}
+                      max={99}
+                      value={cardOptions.periodTimes ?? 12}
+                      onChange={(e) => {
+                        const n = parseInt(e.target.value, 10);
+                        onCardOptionsChange?.({
+                          ...cardOptions,
+                          cardMode: 'RECURRING',
+                          periodTimes: Number.isInteger(n) && n >= 0 ? n : 0,
+                        });
+                      }}
+                    />
+                  )}
                 </Field>
                 <Alert tone="info">
-                  定期定額會於 PayUNi 約定信用卡 Token（CreditHash），供後續續期扣款。
+                  定期定額走 PayUNi「續期收款」支付頁綁卡並約定後續扣款。
                 </Alert>
               </div>
             )}

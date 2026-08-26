@@ -86,6 +86,10 @@ function serializePtContract(row) {
     branchId: row.branchId ?? row.branch?.id ?? null,
     branchCode: row.branch?.code || null,
     branchName: staffBranchLabel(row.branch) || row.branch?.name || null,
+    coursePlanId: row.coursePlanId ?? row.coursePlan?.id ?? null,
+    coursePlanName: row.coursePlan?.name || null,
+    /** PURCHASE＝付費購案｜COMPENSATION＝總部補償贈送 */
+    source: row.source || 'PURCHASE',
     totalSessions: row.totalSessions,
     usedSessions: row.usedSessions,
     remainingSessions: remaining,
@@ -445,6 +449,7 @@ router.get('/dashboard', async (req, res) => {
           where: { trainerId: trainer.id, isActive: true },
           include: {
             branch: { select: { id: true, name: true, code: true } },
+            coursePlan: { select: { id: true, name: true, kind: true } },
             member: {
               select: {
                 id: true,
@@ -1291,10 +1296,8 @@ router.post('/schedule-private', async (req, res) => {
         throw err;
       }
 
-      let station = null;
       if (parsedStationId != null) {
-        station = venue.stations.find((s) => s.id === parsedStationId) || null;
-        if (!station) {
+        if (!venue.stations.some((s) => s.id === parsedStationId)) {
           const err = new Error('站點不屬於此場地');
           err.statusCode = 400;
           throw err;
@@ -1545,10 +1548,8 @@ router.post('/schedule-consult', async (req, res) => {
         throw err;
       }
 
-      let station = null;
       if (parsedStationId != null) {
-        station = venue.stations.find((s) => s.id === parsedStationId) || null;
-        if (!station) {
+        if (!venue.stations.some((s) => s.id === parsedStationId)) {
           const err = new Error('站點不屬於此場地');
           err.statusCode = 400;
           throw err;
@@ -1844,6 +1845,190 @@ router.delete('/time-offs/:id', async (req, res) => {
     }
     console.error(error);
     res.status(500).json({ status: 'error', message: '刪除排休失敗' });
+  }
+});
+
+// ==========================================
+// PATCH /api/trainer/classes/:id/reschedule
+// Body: { startAt, endAt, venueId?, stationId?, viewAsTrainerId? }
+// 拖拉改時：僅改時間／可選場地，保留預約與堂數（不重扣堂）
+// ==========================================
+router.patch('/classes/:id/reschedule', async (req, res) => {
+  const classId = parseInt(req.params.id, 10);
+  const { startAt, endAt, venueId, stationId } = req.body || {};
+
+  if (!Number.isInteger(classId)) {
+    return res.status(400).json({ status: 'error', message: 'classId 無效' });
+  }
+  if (!startAt || !endAt) {
+    return res.status(400).json({ status: 'error', message: '需提供 startAt、endAt' });
+  }
+
+  const startTime = new Date(startAt);
+  const endTime = new Date(endAt);
+  if (Number.isNaN(startTime.getTime()) || Number.isNaN(endTime.getTime())) {
+    return res.status(400).json({ status: 'error', message: '時間格式無效' });
+  }
+  if (startTime >= endTime) {
+    return res.status(400).json({ status: 'error', message: '結束時間必須大於開始時間' });
+  }
+  if (startTime.getTime() < Date.now() - 60_000) {
+    return res.status(400).json({ status: 'error', message: '不可改到已過去的時段' });
+  }
+
+  try {
+    const { trainer: selfTrainer } = await resolveTrainerWorkspace(req, {
+      viewAsTrainerId: req.body?.viewAsTrainerId,
+    });
+
+    const result = await prisma.$transaction(async (tx) => {
+      const existing = await tx.class.findUnique({
+        where: { id: classId },
+        include: {
+          venue: { include: { branch: { select: { id: true, name: true, code: true } } } },
+          station: { select: { id: true, name: true } },
+          trainer: { select: { id: true, name: true, displayName: true } },
+          reservations: {
+            include: {
+              member: { select: { id: true, name: true, phone: true } },
+              consultGuest: { select: { id: true, name: true, phone: true } },
+            },
+          },
+        },
+      });
+      if (!existing) {
+        const err = new Error('找不到課程');
+        err.statusCode = 404;
+        throw err;
+      }
+      if (!isAdminUser(req.user)) {
+        if (!selfTrainer || existing.trainerId !== selfTrainer.id) {
+          const err = new Error('⛔ 僅能調整自己的課表');
+          err.statusCode = 403;
+          throw err;
+        }
+      } else if (selfTrainer && existing.trainerId !== selfTrainer.id) {
+        const err = new Error('所選教練與課程教練不符');
+        err.statusCode = 400;
+        throw err;
+      }
+
+      const nextVenueId =
+        venueId === undefined || venueId === null || venueId === ''
+          ? existing.venueId
+          : parseInt(venueId, 10);
+      if (!Number.isInteger(nextVenueId)) {
+        const err = new Error('venueId 無效');
+        err.statusCode = 400;
+        throw err;
+      }
+
+      let nextStationId = existing.stationId;
+      if (stationId !== undefined) {
+        nextStationId =
+          stationId === null || stationId === ''
+            ? null
+            : parseInt(stationId, 10);
+        if (nextStationId !== null && !Number.isInteger(nextStationId)) {
+          const err = new Error('stationId 無效');
+          err.statusCode = 400;
+          throw err;
+        }
+      }
+
+      const venue = await tx.venue.findUnique({
+        where: { id: nextVenueId },
+        include: {
+          branch: { select: { id: true, name: true, code: true } },
+          stations: { orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }] },
+        },
+      });
+      if (!venue) {
+        const err = new Error('找不到場地');
+        err.statusCode = 404;
+        throw err;
+      }
+
+      if (nextStationId != null) {
+        const station = venue.stations.find((s) => s.id === nextStationId);
+        if (!station) {
+          const err = new Error('站點不屬於此場地');
+          err.statusCode = 400;
+          throw err;
+        }
+      } else if (venue.stations.length > 0 && nextStationId == null) {
+        const err = new Error('此場地已設定站點，請選擇訓練站點');
+        err.statusCode = 400;
+        throw err;
+      }
+
+      const trainerConflict = await tx.class.findFirst({
+        where: {
+          trainerId: existing.trainerId,
+          id: { not: classId },
+          ...overlapWhere(startTime, endTime),
+        },
+        select: { id: true, title: true },
+      });
+      if (trainerConflict) {
+        const err = new Error(`教練防衝堂：此時段已有 [${trainerConflict.title}]`);
+        err.statusCode = 409;
+        throw err;
+      }
+
+      await assertTrainerNotOnTimeOff(tx, existing.trainerId, startTime, endTime);
+
+      const venueConflict = await tx.class.findFirst({
+        where: {
+          id: { not: classId },
+          ...venueStationConflictWhere(nextVenueId, nextStationId),
+          ...overlapWhere(startTime, endTime),
+        },
+        select: { id: true, title: true },
+      });
+      if (venueConflict) {
+        const err = new Error(`場地防衝堂：此時段已被 [${venueConflict.title}] 佔用`);
+        err.statusCode = 409;
+        throw err;
+      }
+
+      const updated = await tx.class.update({
+        where: { id: classId },
+        data: {
+          startAt: startTime,
+          endAt: endTime,
+          venueId: nextVenueId,
+          stationId: nextStationId,
+        },
+        include: {
+          venue: {
+            include: { branch: { select: { id: true, name: true, code: true } } },
+          },
+          station: { select: { id: true, name: true } },
+          trainer: { select: { id: true, name: true, displayName: true } },
+          reservations: {
+            include: {
+              member: { select: { id: true, name: true, phone: true } },
+              consultGuest: { select: { id: true, name: true, phone: true } },
+            },
+          },
+        },
+      });
+
+      return updated;
+    });
+
+    res.json({
+      status: 'success',
+      message: '課表時間已更新',
+      data: serializeClass(result),
+    });
+  } catch (error) {
+    console.error(error);
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({ status: 'error', message: error.message });
+    }
+    res.status(500).json({ status: 'error', message: '改期失敗' });
   }
 });
 

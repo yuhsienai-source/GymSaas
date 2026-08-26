@@ -38,12 +38,11 @@ import {
   writeContractAudit,
 } from '../lib/contractAudit.js';
 import {
-  buildUPPPayload,
+  buildCardCheckoutRequest,
   decryptInfo,
   verifyWebhookHash,
   parseCardPayOptions,
   extractCardTradeMeta,
-  PAYUNI_UPP_URL,
 } from '../lib/payuni.js';
 import {
   createSubscriptionFromPaidOrder,
@@ -58,7 +57,7 @@ import {
   previewCancelUnlimitedOrder,
   EXPIRE_POLICIES,
   findLatestPaidOrderForSubscription,
-  computeUnusedAllowanceAmount,
+  computeMonthlyCardRefundDetail,
 } from '../lib/subscriptionSettle.js';
 import {
   startMemberLeave,
@@ -79,8 +78,6 @@ import {
   PAY_METHOD_COLUMNS,
 } from '../lib/shiftHandover.js';
 import {
-  buildAllowanceSlip,
-  persistAllowanceSlip,
   savePrintableAllowanceSlip,
   toPrintableAllowance,
   normalizeBuyerEmail,
@@ -108,7 +105,7 @@ import {
 } from '../lib/memberIdentify.js';
 import { setMemberBranches, listMemberBranches } from '../lib/memberBranch.js';
 import { deviceBindUpdateData, deviceBindUpdateIfChanged } from '../lib/memberDevice.js';
-import { payReturnRedirect, posPayReturnRedirect, topupPayReturnRedirect, checkoutPayReturnRedirect } from '../lib/frontendUrl.js';
+import { posPayReturnRedirect, topupPayReturnRedirect, checkoutPayReturnRedirect } from '../lib/frontendUrl.js';
 import { fulfillCardSaleOrder, restockSaleStock } from '../lib/inventory.js';
 import { broadcastOccupancy } from '../lib/occupancy.js';
 import {
@@ -282,42 +279,104 @@ router.post('/payuni/webhook', async (req, res) => {
 
 // ==========================================
 // 🪃 【前端 ReturnURL 中繼站】(必須在 verifyStaff 上方)
-// 網址：POST /api/ops/payuni/return
-// 金流以瀏覽器 POST 打回後端 → 再 302 到獨立前端（本服務不託管 UI）
+// 網址：POST|GET /api/ops/payuni/return
+// 金流以瀏覽器打回 → 回 HTML 自動跳轉獨立前端（比純 303 更穩）
+// 注意：入帳靠 NotifyURL（webhook）；ReturnURL 只負責把人帶回系統頁
 // ==========================================
-router.post('/payuni/return', (req, res) => {
+function extractMerTradeNoFromPayuniReturn(body = {}, query = {}) {
+  const encryptInfo = body.EncryptInfo || query.EncryptInfo;
+  const hashInfo = body.HashInfo || query.HashInfo;
+  if (!encryptInfo) {
+    return {
+      merTradeNo: null,
+      status: body.Status || query.Status || null,
+      note: 'no_encrypt',
+    };
+  }
+
+  let tradeData = null;
+  let note = 'ok';
   try {
-    // 嘗試從 EncryptInfo 取出 MerTradeNo，導向對應前端頁
+    if (hashInfo && verifyWebhookHash(encryptInfo, hashInfo)) {
+      tradeData = decryptInfo(encryptInfo);
+    } else {
+      tradeData = decryptInfo(encryptInfo);
+      note = hashInfo ? 'hash_mismatch' : 'no_hash';
+    }
+  } catch (err) {
+    return {
+      merTradeNo: null,
+      status: body.Status || query.Status || null,
+      note: `decrypt_fail:${err.message || 'error'}`,
+    };
+  }
+
+  const merTradeNo = String(
+    tradeData.MerTradeNo ||
+      tradeData.merTradeNo ||
+      tradeData.MerchantTradeNo ||
+      tradeData.MerOrderNo ||
+      '',
+  ).trim();
+
+  return {
+    merTradeNo: merTradeNo || null,
+    status: tradeData.Status || body.Status || query.Status || null,
+    note,
+  };
+}
+
+function sendPayuniBrowserBounce(res, targetUrl) {
+  const safe = String(targetUrl).replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+  const jsUrl = JSON.stringify(String(targetUrl));
+  res
+    .status(200)
+    .type('html')
+    .send(`<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="refresh" content="0;url=${safe}" />
+  <title>返回系統</title>
+</head>
+<body>
+  <p>付款流程結束，正在返回系統…</p>
+  <p><a href="${safe}">若未自動跳轉，請點此返回</a></p>
+  <script>window.location.replace(${jsUrl});</script>
+</body>
+</html>`);
+}
+
+function handlePayuniBrowserReturn(req, res) {
+  try {
+    const body = req.body || {};
+    const query = req.query || {};
+    const parsed = extractMerTradeNoFromPayuniReturn(body, query);
+    const merTradeNo = parsed.merTradeNo || '';
+
     let saleId;
     let orderId;
     let checkoutId;
-    try {
-      if (req.body?.EncryptInfo && verifyWebhookHash(req.body.EncryptInfo, req.body.HashInfo)) {
-        const tradeData = decryptInfo(req.body.EncryptInfo);
-        const merTradeNo = String(tradeData.MerTradeNo || '');
-        if (merTradeNo.startsWith('CHK')) {
-          checkoutId = merTradeNo;
-        } else if (merTradeNo.startsWith('SAL')) {
-          saleId = merTradeNo;
-        } else if (merTradeNo.startsWith('TYK') || merTradeNo.startsWith('CRS')) {
-          orderId = merTradeNo;
-        }
-      }
-    } catch {
-      /* 解密失敗仍導向前端 */
-    }
+    if (merTradeNo.startsWith('CHK')) checkoutId = merTradeNo;
+    else if (merTradeNo.startsWith('SAL')) saleId = merTradeNo;
+    else if (merTradeNo.startsWith('TYK') || merTradeNo.startsWith('CRS')) orderId = merTradeNo;
 
-    console.log('🪃 消費者完成結帳，導向獨立前端。', checkoutId || saleId || orderId || '');
-    if (checkoutId) {
-      return res.redirect(checkoutPayReturnRedirect({ checkoutId }));
-    }
-    if (saleId) {
-      return res.redirect(posPayReturnRedirect({ saleId }));
-    }
-    if (orderId) {
-      return res.redirect(topupPayReturnRedirect({ orderId }));
-    }
-    res.redirect(payReturnRedirect());
+    console.log(
+      '🪃 PayUNi ReturnURL → 前端',
+      checkoutId || saleId || orderId || '(無單號)',
+      `method=${req.method}`,
+      `status=${parsed.status || '-'}`,
+      `note=${parsed.note}`,
+      `keys=${Object.keys(body).join(',') || Object.keys(query).join(',') || '-'}`,
+    );
+
+    let target;
+    if (checkoutId) target = checkoutPayReturnRedirect({ checkoutId });
+    else if (saleId) target = posPayReturnRedirect({ saleId });
+    else if (orderId) target = topupPayReturnRedirect({ orderId });
+    else target = posPayReturnRedirect({});
+
+    return sendPayuniBrowserBounce(res, target);
   } catch (error) {
     console.error('PayUNi return 導向失敗:', error);
     res.status(500).json({
@@ -325,7 +384,10 @@ router.post('/payuni/return', (req, res) => {
       message: error.message || '無法導向前端付款結果頁',
     });
   }
-});
+}
+
+router.post('/payuni/return', handlePayuniBrowserReturn);
+router.get('/payuni/return', handlePayuniBrowserReturn);
 
 // 所有 ops.js 內的路由，強制通過員工海關驗證
 // 交易異動（退費／取消／訂閱請假）限 DUTY 以上；其餘限櫃檯模組
@@ -412,6 +474,46 @@ async function resolveTopupMetaFromOrder(order, tx) {
 
 function roundMoney(n) {
   return parseFloat(Number(n).toFixed(2));
+}
+
+/** 計時儲值退費手續費（新台幣） */
+const TIMED_TOPUP_REFUND_FEE = 100;
+
+/**
+ * 計時儲值退費：
+ * 退費金額 = 實付金額 − 實際使用額度 − 手續費$100
+ * - 實付＝方案本金（訂單配發現金）
+ * - 實際使用＝已用本金 + 已消耗運動金
+ * - 手續費固定 100
+ */
+function computeTimedTopupRefund({
+  cashWallet,
+  bonusWallet,
+  originalPrice,
+  originalBonus,
+}) {
+  const paidAmount = roundMoney(originalPrice);
+  const recoveredBonus = roundMoney(Math.min(Number(bonusWallet) || 0, originalBonus));
+  const shortfall = roundMoney(originalBonus - recoveredBonus);
+  const remainingPrincipal = roundMoney(
+    Math.min(Number(cashWallet) || 0, originalPrice),
+  );
+  const usedPrincipal = roundMoney(originalPrice - remainingPrincipal);
+  const usedAmount = roundMoney(usedPrincipal + shortfall);
+  const beforeFee = roundMoney(paidAmount - usedAmount);
+  const refundFee = TIMED_TOPUP_REFUND_FEE;
+  const refundCash = roundMoney(beforeFee - refundFee);
+  return {
+    paidAmount,
+    recoveredBonus,
+    shortfall,
+    remainingPrincipal,
+    usedPrincipal,
+    usedAmount,
+    beforeFee,
+    refundFee,
+    refundCash,
+  };
 }
 
 /** 臨櫃回傳用的會員摘要（共用 lib） */
@@ -803,13 +905,13 @@ router.get('/card-subscriptions/:id/cancel-preview', async (req, res) => {
       sub.promotion?.durationDays ||
       30;
     const latest = await findLatestPaidOrderForSubscription(sub);
-    const allowanceAmt = latest.order
-      ? computeUnusedAllowanceAmount({
+    const refundDetail = latest.order
+      ? computeMonthlyCardRefundDetail({
           orderAmount: latest.order.amount,
           unusedDays,
           periodDays,
         })
-      : 0;
+      : null;
 
     res.json({
       status: 'success',
@@ -835,6 +937,8 @@ router.get('/card-subscriptions/:id/cancel-preview', async (req, res) => {
         expirePolicies: EXPIRE_POLICIES,
         unusedDays,
         periodDays,
+        usedDays: refundDetail?.usedDays ?? null,
+        refundDetail,
         latestOrder: latest.order
           ? {
               id: latest.order.id,
@@ -844,7 +948,7 @@ router.get('/card-subscriptions/:id/cancel-preview', async (req, res) => {
               periodIndex: latest.periodIndex,
             }
           : null,
-        estimatedAllowance: allowanceAmt,
+        estimatedAllowance: refundDetail?.amount ?? 0,
       },
     });
   } catch (error) {
@@ -1224,6 +1328,97 @@ router.post('/checkout', async (req, res) => {
   }
 });
 
+/** GET /api/ops/checkout/:id — 輪詢刷卡／續期收款入帳狀態（Notify 為準） */
+router.get('/checkout/:id', async (req, res) => {
+  try {
+    const id = String(req.params.id || '').trim();
+    if (!id) {
+      return res.status(400).json({ status: 'error', message: '缺少 checkoutId' });
+    }
+
+    if (id.startsWith('CHK')) {
+      const session = await prisma.checkoutSession.findUnique({
+        where: { id },
+        select: {
+          id: true,
+          status: true,
+          amount: true,
+          cardAmount: true,
+          cardMode: true,
+          merchantNo: true,
+          invoiceNumber: true,
+          orderId: true,
+          saleOrderId: true,
+          ptFulfilled: true,
+          creditHash: true,
+          updatedAt: true,
+        },
+      });
+      if (!session) {
+        return res.status(404).json({ status: 'error', message: '找不到結帳單' });
+      }
+      return res.json({
+        status: 'success',
+        data: {
+          kind: 'checkout',
+          checkoutId: session.id,
+          orderId: session.orderId,
+          saleId: session.saleOrderId,
+          payStatus: session.status,
+          amount: session.amount,
+          cardAmount: session.cardAmount,
+          cardMode: session.cardMode,
+          merchantNo: session.merchantNo,
+          invoiceNumber: session.invoiceNumber,
+          ptFulfilled: session.ptFulfilled,
+          hasCreditHash: Boolean(session.creditHash),
+          updatedAt: session.updatedAt,
+        },
+      });
+    }
+
+    const order = await prisma.order.findUnique({
+      where: { id },
+      select: {
+        id: true,
+        status: true,
+        amount: true,
+        cardAmount: true,
+        cardMode: true,
+        merchantNo: true,
+        invoiceNumber: true,
+        checkoutSessionId: true,
+        creditHash: true,
+        updatedAt: true,
+      },
+    });
+    if (!order) {
+      return res.status(404).json({ status: 'error', message: '找不到訂單' });
+    }
+    return res.json({
+      status: 'success',
+      data: {
+        kind: 'order',
+        checkoutId: order.checkoutSessionId,
+        orderId: order.id,
+        saleId: null,
+        payStatus: order.status,
+        amount: order.amount,
+        cardAmount: order.cardAmount,
+        cardMode: order.cardMode,
+        merchantNo: order.merchantNo,
+        invoiceNumber: order.invoiceNumber,
+        ptFulfilled: null,
+        hasCreditHash: Boolean(order.creditHash),
+        updatedAt: order.updatedAt,
+      },
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ status: 'error', message: '查詢結帳狀態失敗' });
+  }
+});
+
 // ==========================================
 // 0. 【商品化防呆儲值】臨櫃加值（唯一合法儲值入口）
 // 網址：POST /api/ops/topup
@@ -1403,7 +1598,7 @@ router.post(['/topup', '/deposit'], async (req, res) => {
         });
       });
 
-      const payuniPayload = buildUPPPayload({
+      const { actionUrl, payload: payuniPayload } = buildCardCheckoutRequest({
         id: order.id,
         amount: pay.cardAmount,
         itemDesc: order.itemDesc,
@@ -1411,6 +1606,8 @@ router.post(['/topup', '/deposit'], async (req, res) => {
         cardInst: cardOpts.cardInst,
         periodType: cardOpts.periodType,
         periodTimes: cardOpts.periodTimes,
+        periodAmt: recurringAmount,
+        recurringAmount,
       });
 
       return res.json({
@@ -1431,7 +1628,7 @@ router.post(['/topup', '/deposit'], async (req, res) => {
           carrierNum: invoiceOpts.carrierNum,
             buyerUbn: invoiceOpts.buyerUbn,
             loveCode: invoiceOpts.loveCode,
-          actionUrl: PAYUNI_UPP_URL,
+          actionUrl,
           payload: payuniPayload,
         },
       });
@@ -1685,6 +1882,14 @@ router.patch('/members/:id', async (req, res) => {
     return res.status(400).json({
       status: 'error',
       message: '⛔ 禁止直接修改錢包，請走儲值 / 退費 API',
+    });
+  }
+
+  // 解除警示僅限總部合規 API（須寫入 reason 日誌）
+  if (req.body?.isAlert === false || req.body?.isAlert === 'false' || req.body?.isAlert === 0) {
+    return res.status(400).json({
+      status: 'error',
+      message: '⛔ 解除警示請改走總部合規補償 API：POST /api/hq/members/:id/clear-alert（須填 reason）',
     });
   }
 
@@ -2099,20 +2304,40 @@ router.post('/refund', async (req, res) => {
         throw err;
       }
 
-      const recoveredBonus = roundMoney(Math.min(member.bonusWallet, originalBonus));
-      const shortfall = roundMoney(originalBonus - recoveredBonus);
-      const remainingPrincipal = roundMoney(Math.min(member.cashWallet, originalPrice));
-      const refundCash = roundMoney(remainingPrincipal - shortfall);
+      const calc = computeTimedTopupRefund({
+        cashWallet: member.cashWallet,
+        bonusWallet: member.bonusWallet,
+        originalPrice,
+        originalBonus,
+      });
 
-      if (refundCash < 0) {
+      if (calc.beforeFee < 0) {
         const err = new Error(
           `⛔ 退費阻擋：運動金已消耗且本金殘值不足以折讓。` +
-            `本金殘值 $${remainingPrincipal} − 已消耗運動金 $${shortfall} = $${refundCash}。` +
+            `實付 $${calc.paidAmount} − 實際使用 $${calc.usedAmount} = $${calc.beforeFee}。` +
             `請人工處理，禁止套利退費。`,
         );
         err.statusCode = 403;
         throw err;
       }
+      if (calc.refundCash < 0) {
+        const err = new Error(
+          `⛔ 退費阻擋：扣除實際使用後餘額不足手續費 $${calc.refundFee}。` +
+            `實付 $${calc.paidAmount} − 實際使用 $${calc.usedAmount} − 手續費 $${calc.refundFee} = $${calc.refundCash}。`,
+        );
+        err.statusCode = 403;
+        throw err;
+      }
+
+      const {
+        recoveredBonus,
+        shortfall,
+        remainingPrincipal,
+        usedAmount,
+        refundFee,
+        refundCash,
+        paidAmount,
+      } = calc;
 
       const invoiceCtx = await resolveOrderInvoiceReverse(order, { refundCash, tx });
       // 退費折讓：有「真實」發票且應退現金 > 0 才開立折讓；禁止 SPLIT:／複合標記與 $0 全額折讓
@@ -2146,9 +2371,12 @@ router.post('/refund', async (req, res) => {
         meta,
         originalPrice,
         originalBonus,
+        paidAmount,
         recoveredBonus,
         shortfall,
         remainingPrincipal,
+        usedAmount,
+        refundFee,
         refundCash,
         invoiceCtx,
       };
@@ -2186,6 +2414,9 @@ router.post('/refund', async (req, res) => {
           recoveredBonus: preview.recoveredBonus,
           shortfall: preview.shortfall,
           remainingPrincipal: preview.remainingPrincipal,
+          usedAmount: preview.usedAmount,
+          refundFee: preview.refundFee,
+          paidAmount: preview.paidAmount,
         };
       }
       if (order.status !== 'PAID') {
@@ -2201,26 +2432,37 @@ router.post('/refund', async (req, res) => {
         throw err;
       }
 
-      const recoveredBonus = roundMoney(
-        Math.min(member.bonusWallet, preview.originalBonus),
-      );
-      const shortfall = roundMoney(preview.originalBonus - recoveredBonus);
-      const remainingPrincipal = roundMoney(
-        Math.min(member.cashWallet, preview.originalPrice),
-      );
-      const refundCash = roundMoney(remainingPrincipal - shortfall);
-      if (refundCash < 0) {
+      const calc = computeTimedTopupRefund({
+        cashWallet: member.cashWallet,
+        bonusWallet: member.bonusWallet,
+        originalPrice: preview.originalPrice,
+        originalBonus: preview.originalBonus,
+      });
+      if (calc.beforeFee < 0 || calc.refundCash < 0) {
         const err = new Error(
-          '⛔ 退費阻擋：錢包狀態已變更，本金殘值不足以折讓。若折讓已開立請人工核對。',
+          '⛔ 退費阻擋：錢包狀態已變更，餘額不足以依公式退費。若折讓已開立請人工核對。',
         );
         err.statusCode = 409;
         throw err;
       }
-      if (refundCash !== preview.refundCash || remainingPrincipal !== preview.remainingPrincipal) {
+      if (
+        calc.refundCash !== preview.refundCash ||
+        calc.remainingPrincipal !== preview.remainingPrincipal
+      ) {
         console.warn(
-          `退費 ${orderId} 寫入時金額與預覽不一致：preview=$${preview.refundCash} now=$${refundCash}`,
+          `退費 ${orderId} 寫入時金額與預覽不一致：preview=$${preview.refundCash} now=$${calc.refundCash}`,
         );
       }
+
+      const {
+        recoveredBonus,
+        shortfall,
+        remainingPrincipal,
+        usedAmount,
+        refundFee,
+        refundCash,
+        paidAmount,
+      } = calc;
 
       const updatedMember = await tx.member.update({
         where: { id: member.id },
@@ -2231,9 +2473,9 @@ router.post('/refund', async (req, res) => {
       });
 
       const clawbackNote =
-        `退費折讓：本金殘值$${remainingPrincipal}` +
-        ` − 已消耗運動金$${shortfall} = 應退$${refundCash}` +
-        `（回收運動金$${recoveredBonus}）`;
+        `退費折讓：實付$${paidAmount} − 實際使用$${usedAmount} − 手續費$${refundFee}` +
+        ` = 應退$${refundCash}` +
+        `（回收運動金$${recoveredBonus}／本金殘值$${remainingPrincipal}）`;
 
       const statusUpdated = await tx.order.updateMany({
         where: { id: order.id, status: 'PAID' },
@@ -2270,6 +2512,9 @@ router.post('/refund', async (req, res) => {
         recoveredBonus,
         shortfall,
         remainingPrincipal,
+        usedAmount,
+        refundFee,
+        paidAmount,
       };
     });
 
@@ -2316,6 +2561,9 @@ router.post('/refund', async (req, res) => {
         clawback: {
           originalPrice: preview.originalPrice,
           originalBonus: preview.originalBonus,
+          paidAmount: result.paidAmount ?? preview.paidAmount,
+          usedAmount: result.usedAmount ?? preview.usedAmount,
+          refundFee: result.refundFee ?? preview.refundFee,
           recoveredBonus: result.recoveredBonus,
           spentBonus: result.shortfall,
           remainingPrincipal: result.remainingPrincipal,
@@ -3627,7 +3875,7 @@ router.post('/orders', async (req, res) => {
       },
     });
 
-    const payuniPayload = buildUPPPayload({
+    const { actionUrl, payload: payuniPayload } = buildCardCheckoutRequest({
       id: newOrder.id,
       amount: newOrder.amount,
       itemDesc: newOrder.itemDesc,
@@ -3635,13 +3883,15 @@ router.post('/orders', async (req, res) => {
       cardInst: cardOpts.cardInst,
       periodType: cardOpts.periodType,
       periodTimes: cardOpts.periodTimes,
+      periodAmt: newOrder.amount,
+      recurringAmount: newOrder.amount,
     });
 
     res.json({
       status: 'success',
       message: '訂單建立成功，準備導向金流',
       data: {
-        actionUrl: PAYUNI_UPP_URL,
+        actionUrl,
         payload: payuniPayload,
         orderId: newOrder.id,
         promotionId: promotion.id,
@@ -3756,61 +4006,114 @@ router.post('/members/:id/face', async (req, res) => {
 
 // ==========================================
 // 3. 查詢會員列表 (櫃檯營運必備)
-// 網址：GET /api/ops/members
+// 網址：GET /api/ops/members?q=&take=&skip=&id=&lite=
 // ==========================================
 router.get('/members', async (req, res) => {
   try {
-    const members = await prisma.member.findMany({
-      select: {
-        id: true, memberNo: true, name: true, phone: true, plan: true, expireDate: true,
-        cashWallet: true, bonusWallet: true,
-        papagoFaceId: true, isAlert: true, allowBiometrics: true, faceEnabled: true,
-        deviceId: true, lineId: true,
-        emergencyContact: true, emergencyContactPhone: true,
-        branches: {
-          include: { branch: { select: { id: true, name: true, code: true } } },
+    const q = String(req.query.q || '').trim();
+    const lite = req.query.lite === '1' || req.query.lite === 'true';
+    const takeRaw = Number(req.query.take);
+    const skipRaw = Number(req.query.skip);
+    const take = Math.min(100, Math.max(1, Number.isFinite(takeRaw) && takeRaw > 0 ? Math.floor(takeRaw) : 50));
+    const skip = Math.max(0, Number.isFinite(skipRaw) && skipRaw >= 0 ? Math.floor(skipRaw) : 0);
+    const idRaw = req.query.id != null && req.query.id !== '' ? Number(req.query.id) : null;
+    const byId = Number.isInteger(idRaw) && idRaw > 0 ? idRaw : null;
+
+    const where = {};
+    if (byId) {
+      where.id = byId;
+    } else if (q) {
+      const or = [
+        { name: { contains: q, mode: 'insensitive' } },
+        { phone: { contains: q } },
+        { memberNo: { contains: q, mode: 'insensitive' } },
+        { lineId: { contains: q, mode: 'insensitive' } },
+      ];
+      if (/^\d+$/.test(q)) {
+        or.push({ id: Number(q) });
+      }
+      where.OR = or;
+    }
+
+    const pageSkip = byId ? 0 : skip;
+    const [total, members] = await Promise.all([
+      prisma.member.count({ where }),
+      prisma.member.findMany({
+        where,
+        select: {
+          id: true, memberNo: true, name: true, phone: true, plan: true, expireDate: true,
+          cashWallet: true, bonusWallet: true,
+          papagoFaceId: true, isAlert: true, allowBiometrics: true, faceEnabled: true,
+          deviceId: true, lineId: true,
+          emergencyContact: true, emergencyContactPhone: true,
+          branches: {
+            include: { branch: { select: { id: true, name: true, code: true } } },
+          },
         },
-      },
-      orderBy: { createdAt: 'desc' }
-    });
-    const memberIds = members.map((m) => m.id);
-    const [{ boardByMember }, bioSignedIds, recentTopupOrders] = await Promise.all([
-      buildMembersContractBoard(memberIds),
-      getBiometricsSignedMemberIdSet(memberIds),
-      prisma.order.findMany({
-        where: {
-          memberId: { in: memberIds },
-          status: 'PAID',
-          itemDesc: { contains: '商品#' },
-        },
-        select: { memberId: true, itemDesc: true, createdAt: true },
         orderBy: { createdAt: 'desc' },
+        take,
+        skip: pageSkip,
       }),
     ]);
-    const planNameByMember = new Map();
-    for (const row of recentTopupOrders) {
-      if (planNameByMember.has(row.memberId)) continue;
-      const parts = String(row.itemDesc || '')
-        .split('|')
-        .map((s) => s.trim())
-        .filter(Boolean);
-      const planName = parts.length >= 2 ? parts[1] : null;
-      if (planName) planNameByMember.set(row.memberId, planName);
+
+    const memberIds = members.map((m) => m.id);
+    let boardByMember = new Map();
+    let planNameByMember = new Map();
+    /** @type {Set<number>} */
+    let bioSignedIds = new Set();
+
+    if (lite) {
+      // Cmd+K：略過合約板與購案方案名掃描；allowBiometrics 用 DB 欄位
+      bioSignedIds = new Set(members.filter((m) => m.allowBiometrics).map((m) => m.id));
+    } else if (memberIds.length > 0) {
+      const [{ boardByMember: board }, bioIds, recentTopupOrders] = await Promise.all([
+        buildMembersContractBoard(memberIds),
+        getBiometricsSignedMemberIdSet(memberIds),
+        prisma.order.findMany({
+          where: {
+            memberId: { in: memberIds },
+            status: 'PAID',
+            itemDesc: { contains: '商品#' },
+          },
+          select: { memberId: true, itemDesc: true, createdAt: true },
+          orderBy: { createdAt: 'desc' },
+        }),
+      ]);
+      boardByMember = board;
+      bioSignedIds = bioIds;
+      for (const row of recentTopupOrders) {
+        if (planNameByMember.has(row.memberId)) continue;
+        const parts = String(row.itemDesc || '')
+          .split('|')
+          .map((s) => s.trim())
+          .filter(Boolean);
+        const planName = parts.length >= 2 ? parts[1] : null;
+        if (planName) planNameByMember.set(row.memberId, planName);
+      }
     }
+
     res.json({
       status: 'success',
-      data: members.map((m) => {
-        const allowBiometrics = bioSignedIds.has(m.id);
-        return {
-          ...toCounterMemberView({
-            ...m,
-            allowBiometrics,
-            planName: planNameByMember.get(m.id) || m.plan,
-          }),
-          papagoFaceId: m.papagoFaceId ? '(已綁定)' : null,
-          contracts: boardByMember.get(m.id) || [],
-        };
-      }),
+      data: {
+        items: members.map((m) => {
+          const allowBiometrics = bioSignedIds.has(m.id);
+          const view = {
+            ...toCounterMemberView({
+              ...m,
+              allowBiometrics,
+              planName: planNameByMember.get(m.id) || m.plan,
+            }),
+            papagoFaceId: m.papagoFaceId ? '(已綁定)' : null,
+          };
+          if (!lite) {
+            view.contracts = boardByMember.get(m.id) || [];
+          }
+          return view;
+        }),
+        total,
+        take,
+        skip: pageSkip,
+      },
     });
   } catch (error) {
     console.error(error);

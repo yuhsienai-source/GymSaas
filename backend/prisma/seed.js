@@ -176,7 +176,7 @@ async function main() {
 
   // 5. 示範櫃檯員工（和平店 · 僅櫃檯權限）
   const counterHash = await bcrypt.hash('staff1234', 10);
-  const counterStaff = await prisma.staff.upsert({
+  await prisma.staff.upsert({
     where: { account: 'counter' },
     update: {
       password: counterHash,
