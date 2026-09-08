@@ -120,6 +120,8 @@ export function resolveCoursePlanFields(body, { partial = false, current = null 
       recurringAmount: null,
       recurringAmount4: null,
       recurringAmountFinal: null,
+      payuniPeriodHash: null,
+      payuniPeriodHashOnline: null,
       enableSecondPerson: false,
       giftLabel: null,
       giftQty: null,
@@ -329,6 +331,24 @@ export function resolveCoursePlanFields(body, { partial = false, current = null 
     recurringAmount,
     recurringAmount4,
     recurringAmountFinal,
+    payuniPeriodHash: (() => {
+      if (!enableCardRecurring) return null;
+      const raw =
+        body.payuniPeriodHash !== undefined
+          ? body.payuniPeriodHash
+          : current?.payuniPeriodHash;
+      const s = raw == null ? '' : String(raw).trim();
+      return s || null;
+    })(),
+    payuniPeriodHashOnline: (() => {
+      if (!enableCardRecurring) return null;
+      const raw =
+        body.payuniPeriodHashOnline !== undefined
+          ? body.payuniPeriodHashOnline
+          : current?.payuniPeriodHashOnline;
+      const s = raw == null ? '' : String(raw).trim();
+      return s || null;
+    })(),
     requiresMemberContract,
     enableSecondPerson,
     giftLabel,

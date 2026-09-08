@@ -25,6 +25,23 @@ function formatDateTime(value?: string | null) {
   });
 }
 
+type GateAlertEvent = {
+  type?: string;
+  code?: string;
+  title?: string;
+  message?: string;
+  memberId?: number | null;
+  memberName?: string | null;
+  branchId?: number | null;
+  severity?: string;
+  at?: string;
+};
+
+function gateAlertWsUrl() {
+  const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
+  return `${proto}://${window.location.host}/ws/gate-alert`;
+}
+
 type Props = {
   branchId: number | '';
 };
@@ -34,6 +51,8 @@ export default function OpsActiveCheckInsTab({ branchId }: Props) {
   const [rows, setRows] = useState<OpsActiveCheckIn[]>([]);
   const [loading, setLoading] = useState(false);
   const [busyLogId, setBusyLogId] = useState<number | null>(null);
+  const [alerts, setAlerts] = useState<GateAlertEvent[]>([]);
+  const [wsStatus, setWsStatus] = useState('連線中…');
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -51,6 +70,64 @@ export default function OpsActiveCheckInsTab({ branchId }: Props) {
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    let closed = false;
+    let timer: number | undefined;
+    let socket: WebSocket | null = null;
+
+    function pushAlert(ev: GateAlertEvent) {
+      if (branchId !== '' && ev.branchId != null && Number(ev.branchId) !== Number(branchId)) {
+        return;
+      }
+      setAlerts((prev) => [ev, ...prev].slice(0, 12));
+      toast(
+        ev.title ? `${ev.title}：${ev.message || ''}` : ev.message || '閘機異常',
+        'error',
+      );
+      void load();
+    }
+
+    function connect() {
+      socket = new WebSocket(gateAlertWsUrl());
+      socket.onopen = () => {
+        if (!closed) setWsStatus('異常推播已連線');
+      };
+      socket.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data) as GateAlertEvent & { recent?: GateAlertEvent[] };
+          if (msg.type === 'gate-alert-hello' && Array.isArray(msg.recent)) {
+            const filtered = msg.recent.filter(
+              (r) =>
+                branchId === '' ||
+                r.branchId == null ||
+                Number(r.branchId) === Number(branchId),
+            );
+            setAlerts(filtered.slice(0, 12));
+            return;
+          }
+          if (msg.type === 'gate-alert' || msg.code === 'NO_ACTIVE_CHECKIN') {
+            pushAlert(msg);
+          }
+        } catch {
+          /* ignore */
+        }
+      };
+      socket.onclose = () => {
+        if (closed) return;
+        setWsStatus('推播中斷，3 秒後重連…');
+        timer = window.setTimeout(connect, 3000);
+      };
+      socket.onerror = () => socket?.close();
+    }
+
+    connect();
+    return () => {
+      closed = true;
+      if (timer) window.clearTimeout(timer);
+      socket?.close();
+    };
+  }, [branchId, load, toast]);
 
   async function handleCancel(row: OpsActiveCheckIn) {
     const accessNo =
@@ -106,15 +183,41 @@ export default function OpsActiveCheckInsTab({ branchId }: Props) {
     >
       <div className="table-toolbar" style={{ justifyContent: 'space-between' }}>
         <p className="text-sm text-muted" style={{ margin: 0 }}>
-          {branchId === '' ? '全部分店' : `分店篩選中`} · 共 {rows.length} 人
+          {branchId === '' ? '全部分店' : `分店篩選中`} · 共 {rows.length} 人 · {wsStatus}
         </p>
         <Button size="sm" variant="secondary" loading={loading} onClick={() => void load()}>
           重新整理
         </Button>
       </div>
 
+      {alerts.length > 0 && (
+        <div className="gate-alert-stack" style={{ marginBottom: '0.75rem' }}>
+          {alerts.slice(0, 3).map((a, i) => (
+            <Alert key={`${a.at}-${i}`} tone="error">
+              <strong>{a.title || '閘機異常'}</strong>
+              {a.memberName ? ` · ${a.memberName}` : ''}
+              {a.memberId != null ? `（#${a.memberId}）` : ''}
+              ：{a.message}
+              {a.at ? (
+                <span className="text-sm text-muted"> · {formatDateTime(a.at)}</span>
+              ) : null}
+            </Alert>
+          ))}
+          {alerts.length > 3 && (
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => setAlerts([])}
+              style={{ marginTop: '0.35rem' }}
+            >
+              清除異常標記（{alerts.length}）
+            </Button>
+          )}
+        </div>
+      )}
+
       <Alert tone="info">
-        「取消入場」＝誤刷／作廢（不扣費）。「補登出場」＝會員已離場但未掃碼，依進場方案結算後離場。
+        「取消入場」＝誤刷／作廢（不扣費）。「補登出場」＝會員已離場但未掃碼，依進場方案結算後離場。出場無在場紀錄會推播「異常滯留」。
       </Alert>
 
       {loading && rows.length === 0 ? (

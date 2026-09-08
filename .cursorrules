@@ -1,23 +1,217 @@
-# 體育客 (GymSaaS) Monorepo 憲法
+# 體育客 (GymSaaS) 全端開發守則 (Master Cursorrules)
 
-## 👨‍💻 角色
-你是「碼字天才」。拒絕恭維；看到前後端混寫、靜態檔掛在 API 上、或商業邏輯塞進前端，必須直接擋下。
+## 👨‍💻 角色設定與工程準則
 
-## 🛑 前後端絕對分離（最高優先）
-本倉庫**只允許**兩個可執行專案，禁止在根目錄復活舊單體：
+你是「碼字天才」。全系統商業真相、金流審計與資安風控唯一歸屬於後端；前端僅作為高互動體驗與 API 消費端。
 
-| 目錄 | 職責 | 禁止 |
-|------|------|------|
-| `backend/` | 純 API + WebSocket + Prisma | 任何 HTML/CSS/React/Vue/EJS、`express.static`、回傳 UI |
-| `frontend/` | 獨立 SPA（Vite + React） | Express routes、Prisma、直接改 DB、自創金額欄位送儲值 |
+* 嚴格拒絕將後端商業運算、金流簽章、密鑰或資料庫操作搬移至前端。
+* 採用 2026 年最新技術標準：Node.js v26 (ES Modules)、Prisma 7、PostgreSQL (Neon)、React 19、TypeScript、Vite。
+* 回應直接切入核心，不寫多餘客套話；發現資安漏洞或架構越界必須直接糾正。
 
-1. **根目錄不是伺服器**：根目錄不得存在 `app.js`、`routes/`、`public/*.html`、`prisma/`。根目錄只放 monorepo 說明與腳本轉發。
-2. **機密只在 `backend/.env`**：禁止把前端當後端跑；`FRONTEND_URL` 與 `API_PUBLIC_URL` / `BASE_URL` **必須是不同網域／埠**。
-3. **改哪邊就開哪邊的守則**：後端工作遵守 `backend/.cursorrules`；前端工作遵守 `frontend/.cursorrules`。禁止一次 PR 把 UI 寫進 backend。
-4. **瀏覽器回流 ≠ 託管 UI**：後端僅允許對 `FRONTEND_URL` 做 OAuth／金流 `302`；業務結果一律 JSON。
+### 目錄守則層級
 
-## 📂 啟動
+* **本檔（根目錄）＝ Master**：全端必須／禁止的最高準則。
+* 改 `backend/` 另遵守 `backend/.cursorrules`（API 專屬補充）。
+* 改 `frontend/` 另遵守 `frontend/.cursorrules`（SPA 專屬補充）。
+* 目錄守則不得放寬本檔禁令；僅可補實作細節與現況契約。
+
+### 啟動
+
 ```bash
 npm run dev:api   # backend → :8000
 npm run dev:web   # frontend → Vite（proxy /api、/ws → 後端）
 ```
+
+機密只在 `backend/.env`。`FRONTEND_URL` 與 `API_PUBLIC_URL`／`BASE_URL` **必須不同網域／埠**。根目錄禁止復活 `app.js`、`routes/`、`public/*.html`、`prisma/`。
+
+---
+
+## 🛑 前後端分離絕對物理禁令
+
+1. **目錄物理隔離**：
+   * `frontend/`：純 React SPA。絕對禁止寫入 Express、Prisma、SQL、Webhook、金流私鑰或伺服器邏輯。
+   * `backend/`：純 RESTful API。絕對禁止提供 HTML、靜態託管（無 `express.static`、無 `res.sendFile` 處理敏感個資）或樣板引擎。
+
+2. **通訊與 Proxy 規範**：
+   * 開發環境經由 Vite Proxy 轉發：`/api`、`/ws` → `localhost:8000`。
+   * 所有後端回應一律遵循標準 JSON 結構：`{ "status": "success" | "error", "code"?: string, "message": string, "data": any }`。
+
+3. **身分零信任前端**：
+   * 會員端操作**嚴禁前端直傳 `memberId`**，後端一律從驗證通過之 JWT `sub` 解析。
+   * 門禁端點**嚴禁傳遞 `memberId`**，僅接收 30 秒動態 `qrToken` 或單路相機人臉影像。
+   * **契約未簽署阻絕**：會員未完成必簽定型化契約（`purpose=NEW_MEMBER`，狀態須為已簽署／等同 `contractStatus === 'SIGNED'`）者，後端嚴禁派發 `qrToken`，前端標紅鎖定。
+   * 儲值、購課、POS 購物**嚴禁自填金額與堂數**，一律由後端查驗 `promotionId`、`coursePlanId`、`productId`。
+
+4. **Token 分倉管理**：
+   * 會員 JWT（內嵌 `deviceId`、`dav`）與員工 JWT（內嵌 `staffId`、`role`、`branchId`）密鑰與 Storage Key 物理分離，嚴禁混用或越權呼叫。
+
+5. **強制回流路由**：
+   * `/auth/callback`：LINE OAuth 2.0 / 臨時 Auth Code 回流（URL 嚴禁帶明文 JWT）。
+   * `/pay/return`：PayUNi / 線上金流完成後之瀏覽器回流頁面。
+
+6. **瀏覽器回流 ≠ 託管 UI**：後端僅允許對 `FRONTEND_URL` 做 OAuth／金流 `302`；業務結果一律 JSON。
+
+---
+
+## 🔐 認證、資安防弊與一機一帳（Anti-Fraud）
+
+1. **雙軌認證機制**：
+   * 台灣客通道：LINE 快速登入（Authorization Code Flow）。
+   * 外國客與通用通道：**Email OTP（核心通用標準）**。完全零 SMS 依賴，以 6 位數 Email 驗證碼登入。
+   * 自助查詢帳號完成度；無 Email 之舊會員回傳 `canEmailEnroll = true` 進行補登。手機號碼（支援國際 E.164 格式）、證件號與歸屬分店為必填。
+
+2. **合規前置狀態機（嚴禁略過）**：
+   * 人臉偏好（`CHOOSE_FACE`）→ 必簽入會契約（`NEW_MEMBER`；啟用人臉則加簽生物辨識）→ **證件正／反面（`UPLOAD_ID_PHOTOS`）** → 綁定本機裝置／LINE → 發正式 JWT。
+
+3. **一機一帳與 `dav` (Device Auth Version) 聯防**：
+   * 會員端所有請求強制攜帶 Header `X-Device-Id`。
+   * 同機登入不增加 `dav`；換機綁定強制遞增 `Member.deviceAuthVersion += 1`，舊手機持有之 JWT 立即失效（中介層比對失敗拋出 `403 DEVICE_MISMATCH`）。
+   * **DAV 快取**：`memberId → dav/deviceId` 允許短 TTL（預設 3～5 分）記憶體快取以降 Neon 連線壓；換機／臨櫃重置／改綁必須 **Evict**。
+   * 換機熔斷：收到 `DEVICE_MISMATCH_RESET_REQUIRED` 進入「身分核對 ＋ Email OTP」換機流程。24 小時內限自主換機 1 次，超額觸發 **429 `DEVICE_RESET_RATE_LIMITED`**，強制引導臨櫃。
+   * 臨櫃重置：僅限櫃檯主管（`DUTY+`）呼叫 `POST /api/ops/members/:id/reset-device` 解除鎖定。
+
+4. **敏感日誌脫敏**：
+   * 嚴禁於 APM、Console 或 DB Log 印出 OTP 明碼、完整卡號、CVV、密碼或身分證號。
+
+---
+
+## 🚪 門禁閘機、生物辨識與進出場算費（/gate）
+
+1. **單路相機雙工辨識**：
+   * 閘機端透過 `navigator.mediaDevices.getUserMedia` 開啟**單一路視訊串流**，同時進行 Face8 人臉特徵擷取與軟體動態 QR 解碼，嚴禁重複請求相機串流。
+
+2. **Face8 (GOAT API) 特徵比對**：
+   * 嚴格檢查 `member.allowBiometrics`；未簽署同意書者嚴禁調用人臉特徵比對 API。
+   * 採用 `multipart/form-data` 與原生 Blob 傳輸影像，表單參數攜帶對應之 `access_token` 與 `env_token`。
+
+3. **閘機配對持久化**：
+   * 閘機依「裝置代碼 (`deviceCode`) ＋ 密鑰 (`deviceKey`)」綁定門市，持久化於 `localStorage`（`gymsaas_gate_pair`），連線暫時中斷不清除配對。
+   * **時鐘校準**：閘機定時呼叫 `GET /api/gate/sync-time`；動態 QR 驗證容許 **±5 秒**（`QR_SKEW_MS`）漂移。
+   * **短逾時／重試**：閘機進出場 API 客戶端逾時約 2.5 秒；失敗須明示「網路通訊重試中」，不得清配對或白屏。
+
+4. **契約前置與防潛回進場快照 (Anti-Passback)**：
+   * **契約前置檢驗**：生成 `qrToken` 與門禁進場驗證端點強制校驗必簽契約已簽署（`NEW_MEMBER`／等同 `contractStatus === 'SIGNED'`）。未完成定型化契約簽署者，禁止進場並直接拋出 **403 `CONTRACT_REQUIRED`**。
+   * **進場狀態寫入**：進場成功必須建立 `CheckInLog` 快照當前 `billingMode`（「包月免扣」或「計時扣款」）。未完成出場結算前，禁止同帳號再次刷進閘機（防止遞卡、截圖轉傳進場）。
+   * **並發防雙進**：交易內對 `Member` 列 `SELECT … FOR UPDATE`；DB 層 partial unique `uniq_active_member_checkin`（`memberId` WHERE `status='ACTIVE' AND checkOutAt IS NULL`）；唯一鍵衝突映射 **403 `ANTI_PASSBACK`**。套用：`npm run db:constraints`。
+   * 逾期會員進場自動觸發降級為「計時會員」；計時會員餘額低於 50 元阻擋入場。
+
+5. **出場結算、尾隨異常攔截與雙錢包扣款（跨夜灰姑娘條款）**：
+   * **尾隨／無進場快照出場攔截**：出場刷卡時若查無該會員狀態為 `ACTIVE` 的 `CheckInLog`（尾隨進場或重複刷出），**閘機嚴禁開門並拋出 409 `NO_ACTIVE_CHECKIN`**，同時透過 WebSocket (`/ws/gate-alert`) 即時推播櫃檯螢幕標記「異常滯留」，強制現場工作人員介入查驗。
+   * **雙錢包出場結算**：出場計算（1.3 元/分）**100% 依據 `CheckInLog.billingMode` 快照**，禁止依賴會員當前方案。交易內先 `FOR UPDATE` 鎖 `Member` 與 ACTIVE `CheckInLog`。
+   * **扣款順序**：一律優先扣除 `bonusWallet`（運動金／SC），不足部分才自 `cashWallet`（現金）扣抵；必須用 SQL 條件式遞減（`WHERE balance >= deduct`），禁止 Node 算好餘額後覆寫；DB `CHECK (cashWallet/bonusWallet >= 0)`。若總額不足：在場紀錄仍結算、回傳 `gateOpen=false`／`feeDetails.shortfall`，閘機不開門。
+
+6. **警示帳號（`isAlert`）處置**：
+   * 警示帳號門禁動態 QR 強制失效；解除警示僅限總部 `DUTY+` 經由合規補償 API 填寫必填 `reason`，一般櫃檯無權解鎖。
+
+---
+
+## 💳 現場 POS、金流分腿與電子發票架構
+
+1. **多軌混合支付標準**：
+   * **線上儲值／購案**：直串 LINE Pay V3（Request 產生 `paymentUrl`，回呼 Confirm 驗證請款後入帳雙錢包）。
+   * **現場實體刷卡**：採用 **YiPay（乙禾／凱基銀行固定式 EDC）**。API `payMethod`／`payments` 使用 **`YIPAY`**（勿與線上 PayUNi `CARD` 混淆）。端末交易成功後取得 `authCode`、`cardLast4`、`rrn`，先寫 **`YipayTerminalCapture` 暫存**（`POST /ops/yipay/captures`），再由前端呼叫 `opsConfirmYipay` 完成認列；日結對帳 `GET /ops/yipay/reconcile`。
+   * **臨櫃 LinePay**：掃碼槍讀取會員手機付款條碼，傳送 `linePayOneTimeKey` 直打後端請款，不轉跳外部網址。
+   * **定期定額月卡**：臨櫃以乙禾刷首期確認，隨即建立 PayUNi 定期定額（臨櫃 $1 授權驗證後取消不請款），次期起由排程自動扣繳（`PeriodAmt` 原價）。
+
+2. **ezPay 自動分腿發票（Soft-Split）**：
+   * POS 合併結帳交易，後端必須依科目自動拆分子單（零售商品 `SAL...`、會籍購案 `TYK...`／訂閱 `CRS...`、私教合約），分別向 ezPay 開立獨立電子發票。
+   * **非同步補開（防漏稅）**：任一腿 `issueInvoice` 失敗時寫入 `InvoiceIssueJob`（`refId`＋`leg`，`status=FAILED`），**禁止因開票失敗沖回已收款**（現金／乙禾／LinePay／PayUNi）；API 回 **`PARTIAL_INVOICE`**。佇列自動重試；後台 `GET/POST /ops/invoice-jobs…/retry` 可手動補開。
+   * 部分退費折讓：**嚴禁直接作廢整筆合併發票**。必須針對特定子單據開立 ezPay 折讓單，嚴格維持發票對帳完整性。
+
+---
+
+## 📑 證件合規管線、客顯雙螢幕與消保審查
+
+1. **身分證件儲存規範**：
+   * 採用 **Cloudflare R2 / AWS S3 私有 Bucket ＋ SSE-S3 (AES-256) 落盤加密**（開發可 `ID_PHOTO_STORAGE=local`）。
+   * 後端嚴禁 `express.static` 公開證件大圖；調閱統一簽發 3～5 分鐘短效 URL（R2 **Presigned GET**；local 為 HMAC `GET /api/ops/id-photo-access/:token`）。DUTY+ 須填原因並寫入 `IdPhotoAccessLog`；禁止公開目錄。
+   * 清除須申請、櫃檯核准；保存會籍結束後法定年限。
+
+2. **延伸客顯觸控螢幕架構**：
+   * POS 系統採用瀏覽器原生 **`BroadcastChannel('pos_display_bus')`** 進行主機與客顯視窗通訊；封裝層須以 **`localStorage` + `storage` 事件**為備援心跳（跨 Profile／全螢幕 Context 隔離時 BC 可能靜默斷線）。實作見 `frontend/src/lib/posDisplayBus.ts`。
+   * 顧客於副螢幕完整閱讀定型化契約與個資告知書，使用 `SignaturePad` 完成數位親簽，簽章傳回主機後自動歸檔，確保消保法合規證據力。
+
+3. **臨櫃代辦證件上傳標準操作流程（On-Site Assisted SOP）**：
+
+櫃檯人員代辦上傳證件照時，必須遵循「授權簽署先行、受控設備攝錄、記憶體壓印浮水印、不可逆稽核留痕」四道防線，嚴禁任何脫軌操作。
+
+* **防線一：授權簽署前置（Consent Gate）**
+  * 嚴禁口頭委託。主機端點擊代辦時，透過 `BroadcastChannel('pos_display_bus')` 派發 `CONSENT` 訊息至客顯副螢幕。
+  * 客人於副螢幕完整閱讀「身分證件蒐集暨委託代辦聲明書」，並透過 `SignaturePad` 親自簽名。
+  * 簽章傳回主機產生 `consentSignatureId`。後端 `POST /api/ops/members/:id/id-photo` 強制校驗此 ID，未附授權簽名者直接拒絕請求（拋出 **403 `CONSENT_REQUIRED`**）。
+
+* **防線二：受控設備攝錄（Strict Device Control）**
+  * **設備限定**：僅限使用門市資產列管之 Windows POS 外接 USB 高拍儀／UVC 視訊鏡頭（以 `navigator.mediaDevices.getUserMedia` 擷取串流）。
+  * **絕對禁止私載**：嚴禁員工使用私人手機、相機翻拍後透過通訊軟體（LINE、AirDrop、Email、USB 隨身碟）轉傳至 POS 主機。
+
+* **防線三：記憶體零落盤與不可逆防偽浮水印（Zero-Disk Watermarking Pipeline）**
+  * 畫面內建水平置中對齊導引框，導引依序拍攝「正面 (FRONT)」與「反面 (BACK)」，雙面皆完成方可提交。
+  * 拍攝後影像僅保留於前端記憶體 Canvas，**嚴禁將檔案另存至 Windows 本機硬碟（如桌面、Downloads 或 Temp 目錄）**。
+  * 送出前必須於記憶體 Canvas 強制繪製傾斜半透明動態防偽浮水印：
+    > 「僅供體育客會籍查驗｜他用無效｜分店代碼：{branchCode}｜經辦人員：{staffId}｜日期：{YYYY-MM-DD}」
+  * 透過 `canvas.toBlob()` 直接轉為二進位 `multipart/form-data` 直傳後端，傳送完畢立即撤銷記憶體物件指標（呼叫 `URL.revokeObjectURL` 並銷毀 Canvas）。
+
+* **防線四：後端加密落盤與追蹤日誌（Audit Trail & Access Control）**
+  * 後端接收圖檔流後，必須驗證 **Magic Bytes**（拒可執行檔偽裝），並以 Sharp 補壓防偽浮水印／剝 EXIF；直接以 SSE-S3 (AES-256) 寫入私有 R2/S3 Bucket。
+  * 資料庫紀錄必須強制綁定不可竄改的代辦日誌：經辦員工 `uploadedByStaffId`（由 Staff JWT 強制提取，嚴禁前端指定）、分店 `uploadBranchId`、來源 `uploadSource = 'STAFF_USB_SCANNER'`、終端 `clientIp` 與授權簽章 `consentSignatureId`。
+  * **調閱分級管制**：代辦建檔完成後，一般櫃檯人員於系統僅能檢視「證件已建檔（打勾標記）」，無權直接預覽大圖；如遇主管機關查驗需調閱原圖，必須由 **`DUTY+`（值班主管以上）** 提出調閱申請並記錄專屬調閱 Log。
+
+* **臨櫃代辦五步驟作業流程速查**：
+  1. **步驟 1（核對身分）**：櫃檯人員核對客戶實體證件正本與本人外貌一致。
+  2. **步驟 2（客顯親簽）**：切換客顯為委託聲明，引導客戶親簽數位委託書。
+  3. **步驟 3（就位拍攝）**：證件正反面依序置於 USB 高拍儀掃描框，完成影像對焦擷取。
+  4. **步驟 4（記憶體壓印上傳）**：Canvas 自動合成防偽動態浮水印，記憶體直傳後端加密存儲。
+  5. **步驟 5（當面歸還）**：當場將實體證件正本交還客戶，現場不保留任何紙本影本與本機暫存檔。
+
+---
+
+## 🏋️ 私教排課、教練拆帳與營運報表
+
+1. **私教預約雙重防衝堂**：
+   * 排課端點強制執行「教練排班衝堂」與「場地空間（`VenueStation`）衝堂」雙重交易鎖定。
+   * 支援線上請假規範（未依規定提前請假執行扣課）、釋出名額與候補補課機制。
+
+2. **教練業績抽成引擎**：
+   * 私教與團課分開拆帳：支援「底薪 ＋ 階段執行堂數抽成」、「固定鐘點制」與「人頭分潤抽成」。
+   * 考核係數連動：支援將考核成績折算權重自動納入薪資報表結算。
+
+3. **行銷喚醒與數據看板**：
+   * 沉睡客戶標記：高餘額久未進場、合約即將到期、體驗完未購課名單自動篩選與 LINE 推播。
+   * 容留看板：透過 WebSocket `/ws/occupancy` 推播，嚴格遵循 `Branch.showOccupancy` 與 `GET /api/board/occupancy-settings`；關閉時前端隱藏，不硬顯示 0 人。
+
+---
+
+## 📦 POS 庫存管理與交班防弊 (Inventory & Shift Handover)
+
+1. **交班盲盤機制 (Blind Shift Handover)**：
+   * 櫃檯開班前強制輸入「起始備用金 (Cash Float)」；未確認前鎖定 POS 結帳。
+   * 交班時系統嚴禁預顯帳面應有現金，員工必須輸入實際清點各面額數量 (`cashDenominations`)。
+   * 系統自動比對並產出「溢短差日誌 (Discrepancy Log)」。差額超過門檻強制輸入備註，並鎖定由接班人員覆核。
+
+2. **進銷存原子化連動 (Inventory Atomicity)**：
+   * POS 商品銷售 (`SAL...`) 必須與庫存扣減 (`inventory.decrement`) 處於同一 Prisma Transaction，嚴禁負庫存交易。
+   * 商品報損、過期與盤點調整，一般櫃檯僅具備查驗權限，異動必須由主管 (`DUTY+`) 簽核並記錄 `InventoryLog`。
+
+---
+
+## ⚖️ 消保法定型化契約退費與贈品收回演算法
+
+1. **7 日無條件解約**：簽約 7 日內且未使用任何服務，經由 `/api/ops/contracts/:id/refund` 必須 100% 全額無息退還。
+
+2. **法定退費計算公式**：
+   * 應退金額 = 實付總額 - (已使用服務依單堂原價計算之金額) - 法定違約手續費。
+   * 法定手續費上限嚴格鎖定為：`Math.min(未履約金額 * 0.2, 5000)`（依最新消保法規標準）。
+
+3. **運動金 (Bonus Wallet) 折抵防線**：
+   * 購案附贈之運動金於退費時全數註銷。
+   * 若贈送之運動金已被消耗，系統必須自「應退現金」中等額扣除其已消耗金額；若扣除後小於 0 則應退款為 0，絕對不倒貼。
+
+---
+
+## 💻 前端 UI / UX 規範 (React 19)
+
+* **視覺規範**：1st FITNESS 品牌主色 `#083D4F`（深青）搭配純白，全介面採用實色無漸層。樣式以現有 design tokens／`index.css` 為準（**不強制**引入 Tailwind）。
+* **並發鎖定**：金流送出、購案、儲值按鈕必須配置 React `ref` 同步鎖（如 `checkoutInFlightRef`），杜絕連點造成的雙重請款。
+* **Mobile-First 標準**：會員端底部導覽列恆定顯示；所有觸控標的 ≥44px；表單 Input 字級 ≥16px（防止 iOS 自動縮放）；螢幕寬度 <768px 時彈窗自動切換為底部抽屜。
+* **極速後台**：員工端側邊欄支援 Hover 展開；配置 **Ctrl/⌘K** 全域會員快速搜尋（呼叫 `GET /api/ops/members?lite=1&q=`，禁止預載全表資料）。
+* **錯誤中斷**：`AUTH_EXPIRED`／`AUTH_REQUIRED`／`DEVICE_MISMATCH`（或 401）清 JWT 並硬導登入（會員 `/`、員工 `/staff/login`）；模組 403 不得當登出。`CONTRACT_REQUIRED`／`NO_ACTIVE_CHECKIN`／`CONSENT_REQUIRED` 須明示，不得吞錯。

@@ -8,6 +8,7 @@ import {
   fulfillPromotionPurchase,
   isUnlimitedPromotion,
   parseTopupQtyFromItemDesc,
+  resolvePromotionRecurringAmount,
   resolveRecurringPeriodDays,
 } from './promotion.js';
 import { assertMemberSignedPromotionContracts } from './memberContract.js';
@@ -15,7 +16,10 @@ import { assertBranchAccess } from './staffAccess.js';
 import {
   buildCardCheckoutRequest,
   parseCardPayOptions,
+  resolvePayuniPeriodHash,
+  resolveBindCreditHash,
 } from './payuni.js';
+import { payLinePayPosWithOneTimeKey } from './linepay.js';
 import { normalizeInvoiceOptions } from './ezpay.js';
 import {
   buildPosLines,
@@ -23,11 +27,46 @@ import {
   fulfillCardSaleOrder,
   generateSaleId,
 } from './inventory.js';
-import { createSubscriptionFromPaidOrder } from './cardSubscription.js';
+import {
+  createSubscriptionFromPaidOrder,
+  ensureSubscriptionForPaidRecurringOrder,
+  isPlaceholderNextChargeAt,
+  resolveExpectedNextChargeAt,
+  applyCardSubscriptionCreditUpdate,
+  syncNextChargeAtFromPayuni,
+} from './cardSubscription.js';
 import { buildPtCheckoutLines, fulfillPtCheckoutLines } from './ptPurchase.js';
 import { resolveTopupOrderId, generateSubscriptionOrderId } from './orderIds.js';
 import { issueSplitCheckoutInvoices } from './checkoutInvoice.js';
 import { resolveCourseRecurringSchedule } from './coursePlan.js';
+import {
+  splitInvoicesHaveFailure,
+  summarizeInvoiceFailures,
+} from './checkoutAbort.js';
+
+async function failCheckoutIfInvoiceBroken({
+  checkoutId,
+  invoices,
+  linePayTransactionId = null,
+  linePayAmount = 0,
+}) {
+  // 已收款不因開票失敗沖回（防漏稅懸空改入 InvoiceIssueJob）
+  // linePay* 參數保留相容呼叫端，刻意不退款
+  void linePayTransactionId;
+  void linePayAmount;
+  if (!splitInvoicesHaveFailure(invoices)) {
+    return null;
+  }
+  const detail = summarizeInvoiceFailures(invoices);
+  console.warn(
+    `[PARTIAL_INVOICE] ${checkoutId} 部分開票失敗已入佇列（不沖回收款）: ${detail}`,
+  );
+  return {
+    code: 'PARTIAL_INVOICE',
+    message: `結帳已完成，但部分電子發票開立失敗，已排入自動補開：${detail}`,
+    payHints: [],
+  };
+}
 
 export function generateCheckoutId() {
   const dateStr = new Date().toISOString().replace(/[-:T.Z]/g, '').slice(0, 8);
@@ -270,6 +309,7 @@ export async function runOpsCheckout(req, body) {
     periodType,
     periodTimes,
     recurringAmount: _recurringAmountRaw,
+    linePayOneTimeKey,
     branchId: _b,
     memberId: _m,
     items: _i,
@@ -283,7 +323,7 @@ export async function runOpsCheckout(req, body) {
 
   if (illegalAmount !== undefined || Object.keys(rest).length > 0) {
     throw httpError(
-      '⛔ 非法參數：結帳只允許 branchId、memberId、items、promotionId、qty、courseItems、trainerId、payments、payMethod、voucherCode、carrierNum、buyerUbn、loveCode、cardMode、cardInst、periodType、periodTimes、recurringAmount；金額由後端查價',
+      '⛔ 非法參數：結帳只允許 branchId、memberId、items、promotionId、qty、courseItems、trainerId、payments、payMethod、voucherCode、carrierNum、buyerUbn、loveCode、cardMode、cardInst、periodType、periodTimes、recurringAmount、linePayOneTimeKey；金額由後端查價',
     );
   }
 
@@ -307,6 +347,7 @@ export async function runOpsCheckout(req, body) {
   let cardOpts = { cardMode: 'LUMP', cardInst: null, periodType: null, periodTimes: null };
   let recurringAmount = null;
   let recurringAmountFinal = null;
+  let payuniPeriodHash = null;
   let courseSchedule = null;
   let chargeAmount = priced.amount;
 
@@ -320,43 +361,58 @@ export async function runOpsCheckout(req, body) {
       .split('+')
       .map((s) => s.trim())
       .includes('CARD');
+  const wantsRecurring =
+    String(cardMode || '').toUpperCase() === 'RECURRING' || needsCardHint;
 
-  if (needsCardHint) {
+  if (wantsRecurring) {
     cardOpts = parseCardPayOptions(
-      { cardMode, cardInst, periodType, periodTimes },
+      { cardMode: cardMode || 'RECURRING', cardInst, periodType, periodTimes },
       { allowRecurring },
     );
-    if (cardOpts.cardMode === 'RECURRING') {
-      if (promoRecurring) {
-        const periodCount = parseInt(cart.promotion.periodCount, 10);
-        if (!Number.isInteger(periodCount) || periodCount <= 0) {
-          throw httpError('此儲值方案未設定有效期期數，無法使用定期定額');
-        }
-        // 每期金額＝方案費用；總期數＝有效期期數（忽略前端覆寫）
-        recurringAmount = computeTopupAmount(cart.promotion, cart.promoQty);
-        cardOpts.periodTimes = periodCount;
-      } else if (recurringCourse) {
-        courseSchedule = resolveCourseRecurringSchedule(
-          recurringCourse.plan,
-          cardOpts.periodTimes,
-        );
-        cardOpts.periodTimes = courseSchedule.periodTimes;
-        const firstPt =
-          Math.round(courseSchedule.firstAmount * recurringCourse.qty * 100) / 100;
-        const otherPt =
-          Math.round(
-            (priced.ptAmount - recurringCourse.plan.price * recurringCourse.qty) * 100,
-          ) / 100;
-        chargeAmount =
-          Math.round(
-            (priced.posAmount + priced.promoAmount + Math.max(0, otherPt) + firstPt) * 100,
-          ) / 100;
-        recurringAmount = courseSchedule.recurringAmount;
-        recurringAmountFinal = courseSchedule.amountFinal;
-        // 續扣金額依方案排程（忽略前端覆寫，與儲值定期定額一致）
-      } else {
-        throw httpError('定期定額僅限購物車含已啟用儲值或課程方案時使用');
+    // 臨櫃一次／分期請走乙禾；PayUNi CARD 金額線僅定期定額（月卡則首期改乙禾）
+    if (cardOpts.cardMode !== 'RECURRING') {
+      throw httpError(
+        '臨櫃一次付清／分期請使用「乙禾現場刷卡」（YIPAY）；PayUNi（CARD）僅用於定期定額',
+      );
+    }
+    if (promoRecurring) {
+      const periodCount = parseInt(cart.promotion.periodCount, 10);
+      if (!Number.isInteger(periodCount) || periodCount <= 0) {
+        throw httpError('此儲值方案未設定有效期期數，無法使用定期定額');
       }
+      recurringAmount = resolvePromotionRecurringAmount(cart.promotion);
+      if (!recurringAmount) {
+        throw httpError('此儲值方案未設定定期定額扣款金額');
+      }
+      cardOpts.periodTimes = periodCount;
+      payuniPeriodHash = resolvePayuniPeriodHash({
+        channel: 'counter',
+        promotion: cart.promotion,
+      });
+    } else if (recurringCourse) {
+      courseSchedule = resolveCourseRecurringSchedule(
+        recurringCourse.plan,
+        cardOpts.periodTimes,
+      );
+      cardOpts.periodTimes = courseSchedule.periodTimes;
+      const firstPt =
+        Math.round(courseSchedule.firstAmount * recurringCourse.qty * 100) / 100;
+      const otherPt =
+        Math.round(
+          (priced.ptAmount - recurringCourse.plan.price * recurringCourse.qty) * 100,
+        ) / 100;
+      chargeAmount =
+        Math.round(
+          (priced.posAmount + priced.promoAmount + Math.max(0, otherPt) + firstPt) * 100,
+        ) / 100;
+      recurringAmount = courseSchedule.recurringAmount;
+      recurringAmountFinal = courseSchedule.amountFinal;
+      payuniPeriodHash = resolvePayuniPeriodHash({
+        channel: 'counter',
+        coursePlan: recurringCourse.plan,
+      });
+    } else {
+      throw httpError('定期定額僅限購物車含已啟用儲值或課程方案時使用');
     }
   }
 
@@ -368,16 +424,35 @@ export async function runOpsCheckout(req, body) {
     { payments, payMethod, voucherCode },
     chargeAmount,
     CHECKOUT_PAY_METHODS,
+    {
+      // 月卡／課程定期定額：允許 CARD:0 作為 PayUNi 約定標記（首期金額走乙禾）
+      allowYipayPayuniRecurring:
+        cardOpts.cardMode === 'RECURRING' && Boolean(promoRecurring || recurringCourse),
+    },
   );
+
+  // 月卡（或課程）定期定額臨櫃：首期必須乙禾；PayUNi 於確認後再開約定頁
+  if (cardOpts.cardMode === 'RECURRING' && (promoRecurring || recurringCourse)) {
+    if (!pay.needsYipay) {
+      throw httpError(
+        '月卡／課程定期定額臨櫃：首期請使用「乙禾現場刷卡」（YIPAY），確認後再開 PayUNi 約定續期',
+      );
+    }
+    if (pay.needsCard) {
+      throw httpError(
+        '首期金額請全部放在乙禾現場刷卡；PayUNi（CARD）請用金額 0 僅作約定標記，或只選乙禾並帶 cardMode=RECURRING',
+      );
+    }
+  }
 
   if (pay.walletAmount > 0 && !cart.parsedMemberId) {
     throw httpError('零錢包付款必須指定會員 memberId');
   }
 
-  const status = pay.needsCard ? 'PENDING' : 'PAID';
+  const status = pay.needsOnlinePay ? 'PENDING' : 'PAID';
   const checkoutId = generateCheckoutId();
-  const isCourseRecurring =
-    pay.needsCard && cardOpts.cardMode === 'RECURRING' && Boolean(courseSchedule);
+  const isRecurringCheckout = cardOpts.cardMode === 'RECURRING';
+  const isCourseRecurring = isRecurringCheckout && Boolean(courseSchedule);
 
   const created = await prisma.$transaction(async (tx) => {
     let member = null;
@@ -413,7 +488,7 @@ export async function runOpsCheckout(req, body) {
           payBreakdown: pay.breakdown,
           voucherCode: pay.voucherCode,
           cardAmount: 0,
-          cardMode: pay.needsCard ? cardOpts.cardMode : 'LUMP',
+          cardMode: isRecurringCheckout ? 'RECURRING' : pay.needsCard ? cardOpts.cardMode : 'LUMP',
           cardInst: pay.needsCard ? cardOpts.cardInst : null,
           periodType: null,
           periodTimes: null,
@@ -437,7 +512,7 @@ export async function runOpsCheckout(req, body) {
         },
       });
 
-      if (!pay.needsCard) {
+      if (!pay.needsOnlinePay) {
         const sale = await tx.saleOrder.findUnique({
           where: { id: saleOrderId },
           include: { items: true },
@@ -461,10 +536,10 @@ export async function runOpsCheckout(req, body) {
           payBreakdown: pay.breakdown,
           voucherCode: pay.voucherCode,
           cardAmount: 0,
-          cardMode: pay.needsCard ? cardOpts.cardMode : 'LUMP',
+          cardMode: isRecurringCheckout ? 'RECURRING' : pay.needsCard ? cardOpts.cardMode : 'LUMP',
           cardInst: pay.needsCard ? cardOpts.cardInst : null,
-          periodType: pay.needsCard ? cardOpts.periodType : null,
-          periodTimes: pay.needsCard ? cardOpts.periodTimes : null,
+          periodType: isRecurringCheckout ? cardOpts.periodType : null,
+          periodTimes: isRecurringCheckout ? cardOpts.periodTimes : null,
           recurringAmount,
           recurringAmountFinal,
           carrierNum: invoiceOpts.carrierNum,
@@ -475,7 +550,7 @@ export async function runOpsCheckout(req, body) {
         },
       });
 
-      if (!pay.needsCard) {
+      if (!pay.needsOnlinePay) {
         await fulfillPromotionPurchase(tx, cart.parsedMemberId, cart.promotion, {
           qty: cart.promoQty,
         });
@@ -512,7 +587,7 @@ export async function runOpsCheckout(req, body) {
     }
 
     let ptFulfilled = false;
-    if (pricedTx.ptLines.length > 0 && !pay.needsCard) {
+    if (pricedTx.ptLines.length > 0 && !pay.needsOnlinePay) {
       await fulfillPtCheckoutLines(tx, {
         memberId: cart.parsedMemberId,
         trainerId: cart.parsedTrainerId,
@@ -538,13 +613,18 @@ export async function runOpsCheckout(req, body) {
         payMethod: pay.payMethodLabel,
         payBreakdown: pay.breakdown,
         voucherCode: pay.voucherCode,
-        cardAmount: pay.cardAmount,
-        cardMode: pay.needsCard ? cardOpts.cardMode : 'LUMP',
+        cardAmount: pay.cardAmount || pay.yipayAmount || 0,
+        cardMode: isRecurringCheckout ? 'RECURRING' : pay.needsCard ? cardOpts.cardMode : 'LUMP',
         cardInst: pay.needsCard ? cardOpts.cardInst : null,
-        periodType: pay.needsCard ? cardOpts.periodType : null,
-        periodTimes: pay.needsCard ? cardOpts.periodTimes : null,
+        periodType: isRecurringCheckout ? cardOpts.periodType : pay.needsCard ? cardOpts.periodType : null,
+        periodTimes: isRecurringCheckout
+          ? cardOpts.periodTimes
+          : pay.needsCard
+            ? cardOpts.periodTimes
+            : null,
         recurringAmount,
         recurringAmountFinal,
+        payuniPeriodHash: isRecurringCheckout ? payuniPeriodHash : null,
         carrierNum: invoiceOpts.carrierNum,
         buyerUbn: invoiceOpts.buyerUbn,
         loveCode: invoiceOpts.loveCode,
@@ -578,6 +658,8 @@ export async function runOpsCheckout(req, body) {
       periodTimes: cardOpts.periodTimes,
       periodAmt: recurringAmount,
       recurringAmount,
+      payuniPeriodHash,
+      channel: 'counter',
     });
 
     return {
@@ -607,8 +689,134 @@ export async function runOpsCheckout(req, body) {
     };
   }
 
+  if (pay.needsYipay) {
+    const needsPeriodBind =
+      isRecurringCheckout && Boolean(promoRecurring || recurringCourse);
+    return {
+      kind: 'yipay',
+      message: needsPeriodBind
+        ? `請於乙禾完成首期 $${pay.yipayAmount}，確認後開 PayUNi 續期頁（$1 驗證授權後取消、不請款；第 2 期起 PeriodAmt $${recurringAmount || ''}）`
+        : `請於乙禾／凱基固定式刷卡機完成收款 $${pay.yipayAmount}，完成後按「確認刷卡成功」`,
+      data: {
+        checkoutId: created.session.id,
+        saleId: created.saleOrderId,
+        orderId: created.orderId,
+        amount: created.session.amount,
+        yipayAmount: pay.yipayAmount,
+        payMethod: pay.payMethodLabel,
+        payBreakdown: pay.breakdown,
+        voucherCode: pay.voucherCode,
+        carrierNum: invoiceOpts.carrierNum,
+        buyerUbn: invoiceOpts.buyerUbn,
+        loveCode: invoiceOpts.loveCode,
+        channel: 'YIPAY',
+        terminalHint: '乙禾凱基固定式刷卡機',
+        cardMode: isRecurringCheckout ? 'RECURRING' : 'LUMP',
+        needsPeriodBind,
+        recurringAmount,
+        periodTimes: cardOpts.periodTimes,
+      },
+    };
+  }
+
+  if (pay.needsLinePay) {
+    if (cardOpts.cardMode === 'RECURRING') {
+      throw httpError('定期定額請使用刷卡（PayUNi），LinePay 僅支援一次付清');
+    }
+    const oneTimeKey = String(linePayOneTimeKey || '').trim();
+    if (!oneTimeKey) {
+      throw httpError(
+        '臨櫃 LinePay 為 POS 掃碼模式：請掃描會員 LinePay 付款碼（My Code）後再結帳',
+      );
+    }
+
+    let branchName = null;
+    if (created.session.branchId) {
+      const br = await prisma.branch.findUnique({
+        where: { id: created.session.branchId },
+        select: { name: true, code: true },
+      });
+      branchName = br?.name || br?.code || null;
+    }
+
+    const lp = await payLinePayPosWithOneTimeKey({
+      orderId: created.session.id,
+      amount: pay.linePayAmount,
+      productName: created.session.itemDesc,
+      oneTimeKey,
+      branchId: created.session.branchId,
+      branchName,
+    }).catch(async (err) => {
+      await prisma.$transaction(async (tx) => {
+        await tx.checkoutSession.updateMany({
+          where: { id: created.session.id, status: 'PENDING' },
+          data: { status: 'CANCELLED' },
+        });
+        if (created.saleOrderId) {
+          await tx.saleOrder.updateMany({
+            where: { id: created.saleOrderId, status: 'PENDING' },
+            data: { status: 'CANCELLED' },
+          });
+        }
+        if (created.orderId) {
+          await tx.order.updateMany({
+            where: { id: created.orderId, status: 'PENDING' },
+            data: { status: 'CANCELLED' },
+          });
+        }
+        if (pay.walletAmount > 0 && cart.parsedMemberId) {
+          await tx.member.update({
+            where: { id: cart.parsedMemberId },
+            data: { cashWallet: { increment: pay.walletAmount } },
+          });
+        }
+      });
+      throw err;
+    });
+
+    const fulfilled = await fulfillCheckoutSession(
+      created.session.id,
+      `LP:${lp.transactionId}`,
+      null,
+    );
+
+    // fulfill 內開票失敗已入佇列；標 PARTIAL_INVOICE（不沖回／不退 LinePay）
+    const partial = await failCheckoutIfInvoiceBroken({
+      checkoutId: created.session.id,
+      invoices: fulfilled?.invoices || [],
+      linePayTransactionId: lp.transactionId,
+      linePayAmount: pay.linePayAmount,
+    });
+
+    return {
+      kind: 'paid',
+      message: partial?.message || `LinePay POS 收款成功（${pay.payMethodLabel}）`,
+      code: partial?.code || undefined,
+      data: {
+        checkoutId: created.session.id,
+        saleId: created.saleOrderId,
+        orderId: created.orderId,
+        amount: created.session.amount,
+        payMethod: pay.payMethodLabel,
+        payBreakdown: pay.breakdown,
+        linePayAmount: pay.linePayAmount,
+        linePayMode: 'POS',
+        transactionId: lp.transactionId,
+        invoiceNumber: fulfilled?.invoiceNumber || null,
+        invoices: fulfilled?.invoices || [],
+        invoiceJobs: fulfilled?.invoiceJobs || [],
+        invoiceOutcome: partial?.code || fulfilled?.code || 'OK',
+        carrierNum: invoiceOpts.carrierNum,
+        buyerUbn: invoiceOpts.buyerUbn,
+        loveCode: invoiceOpts.loveCode,
+      },
+    };
+  }
+
   let invoiceNumber = null;
   let invoices = [];
+  let invoiceJobs = [];
+  let issuedMeta = null;
   try {
     const issued = await issueSplitCheckoutInvoices({
       checkoutId: created.session.id,
@@ -619,13 +827,31 @@ export async function runOpsCheckout(req, body) {
     });
     invoices = issued.invoices || [];
     invoiceNumber = issued.invoiceNumber;
+    invoiceJobs = issued.invoiceJobs || [];
+    issuedMeta = issued;
   } catch (invoiceErr) {
     console.error(`❌ 合併結帳 ${created.session.id} 軟拆開票例外:`, invoiceErr.message);
+    invoices = [
+      {
+        leg: 'ALL',
+        id: created.session.id,
+        invoiceNumber: null,
+        amount: created.session.amount,
+        ok: false,
+        message: invoiceErr.message,
+      },
+    ];
   }
+
+  const partial = await failCheckoutIfInvoiceBroken({
+    checkoutId: created.session.id,
+    invoices,
+  });
 
   return {
     kind: 'paid',
-    message: `結帳成功（${pay.payMethodLabel}）`,
+    message: partial?.message || `結帳成功（${pay.payMethodLabel}）`,
+    code: partial?.code || undefined,
     data: {
       checkoutId: created.session.id,
       saleId: created.saleOrderId,
@@ -636,6 +862,8 @@ export async function runOpsCheckout(req, body) {
       voucherCode: pay.voucherCode,
       invoiceNumber,
       invoices,
+      invoiceJobs,
+      invoiceOutcome: partial?.code || issuedMeta?.code || 'OK',
       carrierNum: invoiceOpts.carrierNum,
       buyerUbn: invoiceOpts.buyerUbn,
       loveCode: invoiceOpts.loveCode,
@@ -665,7 +893,77 @@ export async function fulfillCheckoutSession(checkoutId, merchantNo, cardMeta = 
       include: { member: { select: { id: true, name: true } } },
     });
     if (existing?.status === 'PAID') {
-      return { session: existing, invoiceNumber: existing.invoiceNumber, invoices: [] };
+      // 重入 Notify：乙禾首期後的 PayUNi 約定頁 → 回寫 CreditHash／PeriodTradeNo；並確保訂閱列存在
+      const bindHash = resolveBindCreditHash(cardMeta || {}, {});
+      if (bindHash) {
+        try {
+          if (existing.orderId) {
+            await prisma.order.updateMany({
+              where: { id: existing.orderId },
+              data: { creditHash: bindHash },
+            });
+            const subs = await prisma.cardSubscription.findMany({
+              where: { originOrderId: existing.orderId },
+              select: {
+                id: true,
+                nextChargeAt: true,
+                lastChargeAt: true,
+                periodType: true,
+                creditHash: true,
+              },
+            });
+            for (const s of subs) {
+              await applyCardSubscriptionCreditUpdate(s.id, {
+                creditHash: bindHash,
+                periodTradeNo: cardMeta?.periodTradeNo || null,
+                dateList: cardMeta?.dateList || null,
+              });
+            }
+            // 舊資料若仍是 2099 佔位且無 DateList，改寫為可顯示的預期日後再對齊 PayUNi
+            for (const s of subs) {
+              const fresh = await prisma.cardSubscription.findUnique({ where: { id: s.id } });
+              if (fresh && isPlaceholderNextChargeAt(fresh.nextChargeAt)) {
+                await prisma.cardSubscription.update({
+                  where: { id: s.id },
+                  data: { nextChargeAt: resolveExpectedNextChargeAt(fresh) },
+                });
+              }
+              if (fresh) await syncNextChargeAtFromPayuni(fresh);
+            }
+          }
+          await prisma.checkoutSession.updateMany({
+            where: { id: checkoutId },
+            data: { creditHash: bindHash },
+          });
+          console.log(`✅ 合併結帳 ${checkoutId} 約定回寫 ${bindHash.startsWith('PERIOD:') ? 'PeriodTradeNo' : 'CreditHash'}`);
+        } catch (hashErr) {
+          console.error(`❌ 合併結帳 ${checkoutId} 回寫約定失敗:`, hashErr.message);
+        }
+      }
+      if (
+        String(existing.cardMode || '').toUpperCase() === 'RECURRING' &&
+        existing.orderId
+      ) {
+        try {
+          const paidOrder = await prisma.order.findUnique({ where: { id: existing.orderId } });
+          await ensureSubscriptionForPaidRecurringOrder(paidOrder, {
+            creditHash: bindHash || cardMeta?.creditHash || paidOrder?.creditHash,
+            periodTradeNo: cardMeta?.periodTradeNo || null,
+            dateList: cardMeta?.dateList || null,
+          });
+        } catch (subErr) {
+          console.error(`❌ 合併結帳 ${checkoutId} 補建定期定額失敗:`, subErr.message);
+        }
+      }
+      const refreshed = await prisma.checkoutSession.findUnique({
+        where: { id: checkoutId },
+        include: { member: { select: { id: true, name: true } } },
+      });
+      return {
+        session: refreshed || existing,
+        invoiceNumber: (refreshed || existing).invoiceNumber,
+        invoices: [],
+      };
     }
     return null;
   }
@@ -752,13 +1050,20 @@ export async function fulfillCheckoutSession(checkoutId, merchantNo, cardMeta = 
     }
   });
 
-  // 若交易外才解析到課程（order 早已 PAID 的重入），再補一次
+  // 若交易外才解析到方案／課程（order 早已 PAID 的重入），再補一次
   if (isRecurring && !promotionForSub && !coursePlanForSub && paidOrderId) {
     const order = await prisma.order.findUnique({ where: { id: paidOrderId } });
-    const courseMatch = (order?.itemDesc || '').match(/課程方案#(\d+)/);
-    const coursePlanId = courseMatch ? parseInt(courseMatch[1], 10) : null;
-    if (coursePlanId) {
-      coursePlanForSub = await prisma.coursePlan.findUnique({ where: { id: coursePlanId } });
+    const promoMatch = (order?.itemDesc || '').match(/商品#(\d+)/);
+    const promotionId = promoMatch ? parseInt(promoMatch[1], 10) : null;
+    if (promotionId) {
+      promotionForSub = await prisma.promotion.findUnique({ where: { id: promotionId } });
+    }
+    if (!promotionForSub) {
+      const courseMatch = (order?.itemDesc || '').match(/課程方案#(\d+)/);
+      const coursePlanId = courseMatch ? parseInt(courseMatch[1], 10) : null;
+      if (coursePlanId) {
+        coursePlanForSub = await prisma.coursePlan.findUnique({ where: { id: coursePlanId } });
+      }
     }
   }
 
@@ -770,6 +1075,8 @@ export async function fulfillCheckoutSession(checkoutId, merchantNo, cardMeta = 
 
   let invoiceNumber = null;
   let invoices = [];
+  let invoiceJobs = [];
+  let invoiceCode = null;
   try {
     const issued = await issueSplitCheckoutInvoices({
       checkoutId: session.id,
@@ -780,6 +1087,8 @@ export async function fulfillCheckoutSession(checkoutId, merchantNo, cardMeta = 
     });
     invoices = issued.invoices || [];
     invoiceNumber = issued.invoiceNumber;
+    invoiceJobs = issued.invoiceJobs || [];
+    invoiceCode = issued.code;
     if (invoiceNumber) {
       console.log(
         `🧾 合併結帳 ${session.id} 軟拆開票 ${invoices.filter((i) => i.ok).length}/${invoices.length} 張`,
@@ -787,7 +1096,33 @@ export async function fulfillCheckoutSession(checkoutId, merchantNo, cardMeta = 
     }
   } catch (err) {
     console.error(`❌ 合併結帳 ${session.id} 軟拆開票例外:`, err.message);
+    invoices = [
+      {
+        leg: 'ALL',
+        id: session.id,
+        invoiceNumber: null,
+        amount: session.amount,
+        ok: false,
+        message: err.message,
+      },
+    ];
   }
+
+  const partial = await failCheckoutIfInvoiceBroken({
+    checkoutId: session.id,
+    invoices,
+    linePayTransactionId: (() => {
+      const merchant = String(session.merchantNo || '');
+      return merchant.startsWith('LP:') ? merchant.slice(3) : null;
+    })(),
+    linePayAmount: (() => {
+      const breakdown =
+        session.payBreakdown && typeof session.payBreakdown === 'object'
+          ? session.payBreakdown
+          : {};
+      return Number(breakdown.LINEPAY) || 0;
+    })(),
+  });
 
   if (isRecurring && paidOrderId && (promotionForSub || coursePlanForSub)) {
     try {
@@ -796,6 +1131,8 @@ export async function fulfillCheckoutSession(checkoutId, merchantNo, cardMeta = 
         promotion: promotionForSub || null,
         coursePlan: coursePlanForSub || null,
         creditHash: cardMeta?.creditHash || paidOrder?.creditHash,
+        periodTradeNo: cardMeta?.periodTradeNo || null,
+        dateList: cardMeta?.dateList || null,
         amountFinal:
           paidOrder?.recurringAmountFinal ??
           session.recurringAmountFinal ??
@@ -805,7 +1142,25 @@ export async function fulfillCheckoutSession(checkoutId, merchantNo, cardMeta = 
     } catch (subErr) {
       console.error(`❌ 合併結帳 ${session.id} 建立定期定額失敗:`, subErr.message);
     }
+  } else if (isRecurring && paidOrderId) {
+    try {
+      const paidOrder = await prisma.order.findUnique({ where: { id: paidOrderId } });
+      await ensureSubscriptionForPaidRecurringOrder(paidOrder, {
+        creditHash: cardMeta?.creditHash || paidOrder?.creditHash,
+        periodTradeNo: cardMeta?.periodTradeNo || null,
+        dateList: cardMeta?.dateList || null,
+      });
+    } catch (subErr) {
+      console.error(`❌ 合併結帳 ${session.id} 補建定期定額失敗:`, subErr.message);
+    }
   }
 
-  return { session, invoiceNumber, invoices };
+  return {
+    session,
+    invoiceNumber,
+    invoices,
+    invoiceJobs,
+    code: partial?.code || invoiceCode || null,
+    partial: Boolean(partial),
+  };
 }

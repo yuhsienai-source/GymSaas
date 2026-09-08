@@ -54,6 +54,8 @@ export function Button({
   variant = 'primary',
   size = 'md',
   loading,
+  className = '',
+  type = 'button',
   ...props
 }: ButtonHTMLAttributes<HTMLButtonElement> & {
   variant?: 'primary' | 'secondary' | 'danger' | 'line' | 'ghost';
@@ -62,8 +64,8 @@ export function Button({
 }) {
   return (
     <button
-      type="button"
-      className={`btn btn--${variant} btn--${size} ${loading ? 'is-loading' : ''}`.trim()}
+      type={type}
+      className={`btn btn--${variant} btn--${size}${loading ? ' is-loading' : ''}${className ? ` ${className}` : ''}`}
       disabled={loading || props.disabled}
       {...props}
     >
@@ -116,7 +118,7 @@ export function Input({ className = '', readOnly, disabled, ...props }: InputHTM
   const locked = Boolean(readOnly || disabled);
   return (
     <input
-      className={`input${locked ? ' input--locked' : ''} ${className}`.trim()}
+      className={`input${locked ? ' input--locked' : ''}${className ? ` ${className}` : ''}`}
       readOnly={readOnly}
       disabled={disabled}
       {...props}

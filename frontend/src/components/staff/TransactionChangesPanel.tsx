@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Button, Card, Field, Input, PageSection, Select } from '../ui';
+import { Button, Card, Field, Input, Modal, PageSection, Select } from '../ui';
 import { staffBranchLabel } from '../../lib/branchLabel';
 import BranchScopeBar from './BranchScopeBar';
 import { useStaffAuth } from '../../contexts/StaffAuthContext';
@@ -10,14 +10,17 @@ import {
   endOpsMemberLeave,
   fetchAllowanceSlip,
   fetchAllowanceSlips,
+  fetchOpsCardSubscriptionRebindStatus,
   fetchOpsCardSubscriptions,
   fetchOpsMemberLeaves,
   fetchReportBranches,
   getErrorMessage,
+  openPayuniCheckoutInNewTab,
   opsCancelGate,
   opsCancelSale,
   pauseOpsCardSubscription,
   previewCancelCardSubscription,
+  rebindOpsCardSubscription,
   resumeOpsCardSubscription,
   startOpsMemberLeave,
 } from '../../lib/api';
@@ -78,10 +81,14 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
   const [cancelSubReason, setCancelSubReason] = useState('');
   const [doAllowance, setDoAllowance] = useState(true);
   const [previewText, setPreviewText] = useState('');
-  const [leaveMemberId, setLeaveMemberId] = useState('');
+  const [leaveMemberNo, setLeaveMemberNo] = useState('');
   const [leaveDays, setLeaveDays] = useState('7');
   const [leaveReason, setLeaveReason] = useState('');
   const [leaveSubId, setLeaveSubId] = useState('');
+  const [pendingRebind, setPendingRebind] = useState<{
+    subscriptionId: string;
+    label: string;
+  } | null>(null);
 
   useEffect(() => {
     if (branchesProp?.length) return;
@@ -103,9 +110,9 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
 
   const loadSubscriptions = useCallback(async () => {
     try {
-      const params: { memberId?: number; status?: string } = {};
-      const mid = Number(subMemberFilter);
-      if (Number.isInteger(mid) && mid > 0) params.memberId = mid;
+      const params: { memberNo?: string; status?: string } = {};
+      const no = subMemberFilter.trim().toUpperCase();
+      if (/^[A-Z0-9]{6}$/.test(no)) params.memberNo = no;
       const res = await fetchOpsCardSubscriptions(params);
       if (res.status === 'success' && Array.isArray(res.data)) {
         setSubs(res.data);
@@ -117,9 +124,9 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
 
   const loadLeaves = useCallback(async () => {
     try {
-      const params: { memberId?: number; status?: string } = { status: 'ACTIVE' };
-      const mid = Number(leaveMemberId || subMemberFilter);
-      if (Number.isInteger(mid) && mid > 0) params.memberId = mid;
+      const params: { memberNo?: string; status?: string } = { status: 'ACTIVE' };
+      const no = (leaveMemberNo || subMemberFilter).trim().toUpperCase();
+      if (/^[A-Z0-9]{6}$/.test(no)) params.memberNo = no;
       const res = await fetchOpsMemberLeaves(params);
       if (res.status === 'success' && Array.isArray(res.data)) {
         setLeaves(res.data as MemberLeave[]);
@@ -127,7 +134,7 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
     } catch (err) {
       toast(getErrorMessage(err, '讀取請假失敗'), 'error');
     }
-  }, [leaveMemberId, subMemberFilter, toast]);
+  }, [leaveMemberNo, subMemberFilter, toast]);
 
   useEffect(() => {
     if (subTab !== 'subscription') return;
@@ -143,6 +150,51 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
       cancelled = true;
     };
   }, [subTab, loadSubscriptions, loadLeaves]);
+
+  useEffect(() => {
+    if (!pendingRebind?.subscriptionId) return;
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const res = await fetchOpsCardSubscriptionRebindStatus(pendingRebind.subscriptionId);
+        if (cancelled) return;
+        if (res.status === 'success' && res.data && !res.data.rebindPending && res.data.creditUpdated) {
+          toast('換卡約定完成', 'success');
+          setPendingRebind(null);
+          await loadSubscriptions();
+        }
+      } catch {
+        /* 輪詢中略過暫時錯誤 */
+      }
+    };
+    void tick();
+    const t = window.setInterval(() => void tick(), 2500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(t);
+    };
+  }, [pendingRebind?.subscriptionId, loadSubscriptions, toast]);
+
+  async function handleRebindCard(s: CardSubscription) {
+    setBusy(true);
+    try {
+      const r = await rebindOpsCardSubscription(s.id);
+      if (r.status !== 'success' || !r.data?.actionUrl || !r.data?.payload) {
+        toast(r.message || '無法開啟換卡頁', 'error');
+        return;
+      }
+      openPayuniCheckoutInNewTab(r.data.actionUrl, r.data.payload);
+      setPendingRebind({
+        subscriptionId: s.id,
+        label: s.promotion?.name || s.coursePlan?.name || s.id,
+      });
+      toast(r.message || '已開啟 PayUNi 換卡頁', 'success');
+    } catch (e) {
+      toast(getErrorMessage(e, '換卡失敗'), 'error');
+    } finally {
+      setBusy(false);
+    }
+  }
 
   const handleLoadRecentAllowances = useCallback(async () => {
     setBusy(true);
@@ -336,7 +388,7 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
             ? String((result.data as { id?: string }).id || '')
             : '';
       if (resolved) setSelectedSubId(resolved);
-      toast(result.message || '訂閱已取消', 'success');
+      toast(result.message || '訂閱已取消', /PayUNi|⚠/.test(String(result.message || '')) ? 'error' : 'success');
       const slip = (result.data as { allowanceSlip?: AllowanceSlip | null } | undefined)
         ?.allowanceSlip;
       if (slip?.allowanceNo) {
@@ -361,10 +413,10 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
   }, [selectedSubId, expirePolicy, doAllowance, cancelSubReason, toast, loadSubscriptions]);
 
   const handleStartLeave = useCallback(async () => {
-    const memberId = Number(leaveMemberId);
+    const memberNo = leaveMemberNo.trim().toUpperCase();
     const days = Number(leaveDays);
-    if (!Number.isInteger(memberId) || memberId <= 0) {
-      toast('請輸入會員 ID', 'error');
+    if (!memberNo) {
+      toast('請輸入會員編號', 'error');
       return;
     }
     if (!Number.isInteger(days) || days <= 0) {
@@ -373,14 +425,14 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
     }
     if (
       !window.confirm(
-        `確定為會員 #${memberId} 請假 ${days} 天？\n效期將預先順延、進場暫停月費通行，定期定額暫停並順延扣款日。`,
+        `確定為會員 ${memberNo} 請假 ${days} 天？\n效期將預先順延、進場暫停月費通行，定期定額暫停並順延扣款日。`,
       )
     )
       return;
     setBusy(true);
     try {
       const result = await startOpsMemberLeave({
-        memberId,
+        memberNo,
         days,
         reason: leaveReason || undefined,
         subscriptionId: leaveSubId.trim() || undefined,
@@ -394,7 +446,7 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
     } finally {
       setBusy(false);
     }
-  }, [leaveMemberId, leaveDays, leaveReason, leaveSubId, toast, loadLeaves, loadSubscriptions]);
+  }, [leaveMemberNo, leaveDays, leaveReason, leaveSubId, toast, loadLeaves, loadSubscriptions]);
 
   const branchName =
     branchId === ''
@@ -628,12 +680,11 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
             <Card title="訂閱一覽" subtitle="定期定額 CRS…">
               <div className="form-stack">
                 <div className="list-toolbar">
-                  <Field label="會員 ID（選填）">
+                  <Field label="會員編號（選填）">
                     <Input
                       value={subMemberFilter}
                       onChange={(e) => setSubMemberFilter(e.target.value)}
-                      placeholder="例如 12"
-                      inputMode="numeric"
+                      placeholder="6 碼英數，例如 A1B2C3"
                     />
                   </Field>
                   <Button variant="secondary" onClick={() => void loadSubscriptions()} disabled={busy}>
@@ -646,6 +697,7 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
                       <tr>
                         <th>選</th>
                         <th>訂閱</th>
+                        <th>會員編號</th>
                         <th>會員</th>
                         <th>方案</th>
                         <th>狀態</th>
@@ -657,7 +709,7 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
                     <tbody>
                       {subs.length === 0 ? (
                         <tr>
-                          <td colSpan={8} className="text-muted text-center">
+                          <td colSpan={9} className="text-muted text-center">
                             尚無訂閱
                           </td>
                         </tr>
@@ -672,15 +724,24 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
                                 onChange={() => {
                                   setSelectedSubId(s.id);
                                   setLeaveSubId(s.id);
-                                  setLeaveMemberId(String(s.memberId));
+                                  setLeaveMemberNo(s.member?.memberNo || '');
                                 }}
                               />
                             </td>
                             <td className="text-sm">{s.id}</td>
+                            <td className="text-sm">{s.member?.memberNo || '—'}</td>
                             <td className="text-sm">
                               {s.member?.name || `#${s.memberId}`}
                             </td>
-                            <td className="text-sm">{s.promotion?.name || s.promotionId}</td>
+                            <td className="text-sm">
+                              {s.promotion?.name ||
+                                s.coursePlan?.name ||
+                                (s.promotionId
+                                  ? `#${s.promotionId}`
+                                  : s.coursePlanId
+                                    ? `課程#${s.coursePlanId}`
+                                    : '—')}
+                            </td>
                             <td>{s.status}</td>
                             <td className="text-sm">{fmtDate(s.nextChargeAt)}</td>
                             <td className="text-sm">{fmtDate(s.member?.expireDate)}</td>
@@ -716,7 +777,13 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
                                         setBusy(true);
                                         try {
                                           const r = await resumeOpsCardSubscription(s.id);
-                                          toast(r.message || '已恢復', 'success');
+                                          toast(
+                                            r.message || '已恢復',
+                                            /PayUNi|⚠/.test(String(r.message || '')) &&
+                                              !/已啟用/.test(String(r.message || ''))
+                                              ? 'error'
+                                              : 'success',
+                                          );
                                           await loadSubscriptions();
                                         } catch (e) {
                                           toast(getErrorMessage(e, '恢復失敗'), 'error');
@@ -728,6 +795,15 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
                                     disabled={busy}
                                   >
                                     恢復續扣
+                                  </Button>
+                                )}
+                                {['ACTIVE', 'PAUSED', 'FAILED'].includes(String(s.status)) && (
+                                  <Button
+                                    variant="secondary"
+                                    onClick={() => void handleRebindCard(s)}
+                                    disabled={busy}
+                                  >
+                                    換卡
                                   </Button>
                                 )}
                               </div>
@@ -809,12 +885,11 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
               subtitle="效期預先順延；請假期間禁止月費進場；定期定額暫停並順延 nextChargeAt"
             >
               <div className="form-stack">
-                <Field label="會員 ID">
+                <Field label="會員編號">
                   <Input
-                    value={leaveMemberId}
-                    onChange={(e) => setLeaveMemberId(e.target.value)}
-                    placeholder="會員主鍵 ID"
-                    inputMode="numeric"
+                    value={leaveMemberNo}
+                    onChange={(e) => setLeaveMemberNo(e.target.value)}
+                    placeholder="6 碼英數，例如 A1B2C3"
                   />
                 </Field>
                 <Field label="請假天數">
@@ -840,7 +915,7 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
                 </Field>
                 <Button
                   onClick={() => void handleStartLeave()}
-                  disabled={busy || !leaveMemberId.trim()}
+                  disabled={busy || !leaveMemberNo.trim()}
                 >
                   開始請假
                 </Button>
@@ -853,6 +928,7 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
                   <thead>
                     <tr>
                       <th>ID</th>
+                      <th>會員編號</th>
                       <th>會員</th>
                       <th>天數</th>
                       <th>起迄</th>
@@ -863,7 +939,7 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
                   <tbody>
                     {leaves.length === 0 ? (
                       <tr>
-                        <td colSpan={6} className="text-muted text-center">
+                        <td colSpan={7} className="text-muted text-center">
                           尚無進行中請假
                         </td>
                       </tr>
@@ -871,6 +947,7 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
                       leaves.map((lv) => (
                         <tr key={lv.id}>
                           <td>{lv.id}</td>
+                          <td className="text-sm">{lv.member?.memberNo || '—'}</td>
                           <td className="text-sm">
                             {lv.member?.name || `#${lv.memberId}`}
                           </td>
@@ -1007,6 +1084,52 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
           </div>
         </PageSection>
       )}
+
+      <Modal
+        open={pendingRebind !== null}
+        onClose={() => setPendingRebind(null)}
+        title="等待換卡約定"
+      >
+        <p className="text-sm">
+          已另開 PayUNi 頁面；請會員輸入新卡（$1 驗證授權，隨後取消不請款）。完成後此視窗會自動關閉。
+        </p>
+        <p className="text-sm text-muted mt-sm">
+          訂閱：<strong>{pendingRebind?.label || pendingRebind?.subscriptionId}</strong>
+        </p>
+        <div className="btn-row mt-md">
+          <Button variant="secondary" onClick={() => setPendingRebind(null)}>
+            稍後再查
+          </Button>
+          <Button
+            onClick={() =>
+              void (async () => {
+                if (!pendingRebind) return;
+                try {
+                  const res = await fetchOpsCardSubscriptionRebindStatus(
+                    pendingRebind.subscriptionId,
+                  );
+                  if (
+                    res.status === 'success' &&
+                    res.data &&
+                    !res.data.rebindPending &&
+                    res.data.creditUpdated
+                  ) {
+                    toast('換卡約定完成', 'success');
+                    setPendingRebind(null);
+                    await loadSubscriptions();
+                  } else {
+                    toast('尚未收到約定回報，請稍候再試', 'info');
+                  }
+                } catch (e) {
+                  toast(getErrorMessage(e, '查詢失敗'), 'error');
+                }
+              })()
+            }
+          >
+            我已完成換卡
+          </Button>
+        </div>
+      </Modal>
     </div>
   );
 }

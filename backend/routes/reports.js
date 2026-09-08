@@ -104,6 +104,28 @@ function txnStatusLabel(rawStatus) {
   return s || '—';
 }
 
+/**
+ * 已收款但無發票號碼 → 標「成功（未開票）」，避免誤以為交易失敗；
+ * 交易狀態碼仍為 PAID（篩選／加總不變）
+ */
+function txnStatusLabelWithInvoice(rawStatus, invoiceNumber) {
+  const base = txnStatusLabel(rawStatus);
+  const s = String(rawStatus || '').toUpperCase();
+  const inv = String(invoiceNumber || '').trim();
+  if ((s === 'PAID' || s === 'ACTIVE') && !inv) return '成功（未開票）';
+  return base;
+}
+
+function invoiceStatusMeta(rawStatus, invoiceNumber) {
+  const s = String(rawStatus || '').toUpperCase();
+  const inv = String(invoiceNumber || '').trim();
+  if (inv) return { invoiceStatus: 'ISSUED', invoiceStatusLabel: '已開立' };
+  if (s === 'PAID' || s === 'ACTIVE') {
+    return { invoiceStatus: 'MISSING', invoiceStatusLabel: '未開票' };
+  }
+  return { invoiceStatus: 'N/A', invoiceStatusLabel: '—' };
+}
+
 /** 依 CHK 子單推導交易狀態（歷史資料可能 session 仍為 PAID） */
 function deriveCheckoutTxnStatus(sessionStatus, legStatuses) {
   const legs = (legStatuses || [])
@@ -428,7 +450,7 @@ router.get('/orders', requireOpsOrDuty, async (req, res) => {
     const dateWhere = createdAt ? { createdAt } : {};
     // 沖回後子單已 CANCELLED／REFUNDED 但 CHK 可能仍 PAID：先寬抓再依子單推導
     const statusWhere = statusFilter
-      ? { status: { in: ['PAID', 'CANCELLED', 'PENDING', 'REFUNDED'] } }
+      ? { status: { in: ['PAID', 'CANCELLED', 'PENDING', 'REFUNDED', 'FAILED'] } }
       : {};
     const branchWhere = scopedBranchId ? { branchId: scopedBranchId } : {};
 
@@ -551,6 +573,7 @@ router.get('/orders', requireOpsOrDuty, async (req, res) => {
         ...(ptOrdersBySession.get(s.id) || []).map((o) => o.status),
       ];
       const effectiveStatus = deriveCheckoutTxnStatus(s.status, legStatuses);
+      const invoiceDisplay = formatCheckoutInvoiceDisplay(s.invoiceNumber);
 
       return {
         orderId: s.id,
@@ -568,8 +591,9 @@ router.get('/orders', requireOpsOrDuty, async (req, res) => {
         periodTimes: s.periodTimes,
         recurringAmount: s.recurringAmount,
         status: effectiveStatus,
-        txnStatus: txnStatusLabel(effectiveStatus),
-        invoiceNumber: formatCheckoutInvoiceDisplay(s.invoiceNumber),
+        txnStatus: txnStatusLabelWithInvoice(effectiveStatus, invoiceDisplay),
+        invoiceNumber: invoiceDisplay,
+        ...invoiceStatusMeta(effectiveStatus, invoiceDisplay),
         carrierNum: s.carrierNum,
         buyerUbn: s.buyerUbn,
         loveCode: s.loveCode,
@@ -632,8 +656,9 @@ router.get('/orders', requireOpsOrDuty, async (req, res) => {
         periodTimes: o.periodTimes,
         recurringAmount: o.recurringAmount,
         status: o.status,
-        txnStatus: txnStatusLabel(o.status),
+        txnStatus: txnStatusLabelWithInvoice(o.status, o.invoiceNumber),
         invoiceNumber: o.invoiceNumber,
+        ...invoiceStatusMeta(o.status, o.invoiceNumber),
         carrierNum: o.carrierNum,
         buyerUbn: o.buyerUbn,
         loveCode: o.loveCode,
@@ -674,8 +699,9 @@ router.get('/orders', requireOpsOrDuty, async (req, res) => {
         periodTimes: s.periodTimes,
         recurringAmount: null,
         status: s.status,
-        txnStatus: txnStatusLabel(s.status),
+        txnStatus: txnStatusLabelWithInvoice(s.status, formatCheckoutInvoiceDisplay(s.invoiceNumber)),
         invoiceNumber: formatCheckoutInvoiceDisplay(s.invoiceNumber),
+        ...invoiceStatusMeta(s.status, formatCheckoutInvoiceDisplay(s.invoiceNumber)),
         carrierNum: s.carrierNum,
         buyerUbn: s.buyerUbn,
         loveCode: s.loveCode,
@@ -766,24 +792,55 @@ router.get('/topup', requireDutyOrAbove, async (req, res) => {
       take: 1000,
     });
 
-    const data = rows.map((o) => ({
-      orderId: o.id,
-      createdAt: o.createdAt,
-      memberId: o.memberId,
-      memberNo: o.member?.memberNo || null,
-      memberName: o.member?.name,
-      planName: parsePlanNameFromItemDesc(o.itemDesc),
-      usageType: String(o.itemDesc || '').includes('UNLIMITED') ? 'UNLIMITED' : 'TIMED',
-      cardMode: o.cardMode || null,
-      payMethod: o.payMethod || null,
-      amount: o.amount,
-      status: o.status,
-      txnStatus: txnStatusLabel(o.status),
-      invoiceNumber: o.invoiceNumber,
-      carrierNum: o.carrierNum,
-      buyerUbn: o.buyerUbn,
-      loveCode: o.loveCode,
-    }));
+    const orderIds = rows.map((o) => o.id);
+    const subs = orderIds.length
+      ? await prisma.cardSubscription.findMany({
+          where: { originOrderId: { in: orderIds } },
+          select: { originOrderId: true, status: true, id: true },
+          orderBy: { updatedAt: 'desc' },
+        })
+      : [];
+    const subByOrder = new Map();
+    for (const s of subs) {
+      if (!s.originOrderId || subByOrder.has(s.originOrderId)) continue;
+      subByOrder.set(s.originOrderId, s);
+    }
+
+    const data = rows.map((o) => {
+      const sub = subByOrder.get(o.id) || null;
+      const subStatus = sub ? String(sub.status || '').toUpperCase() : null;
+      const recurringStopped =
+        String(o.cardMode || '').toUpperCase() === 'RECURRING' &&
+        (subStatus === 'CANCELLED' ||
+          subStatus === 'COMPLETED' ||
+          String(o.itemDesc || '').includes('定期定額已停續扣'));
+      let txnStatus = txnStatusLabelWithInvoice(o.status, o.invoiceNumber);
+      if (String(o.status || '').toUpperCase() === 'PAID' && recurringStopped) {
+        txnStatus = '成功（訂閱已停）';
+      }
+      return {
+        orderId: o.id,
+        createdAt: o.createdAt,
+        memberId: o.memberId,
+        memberNo: o.member?.memberNo || null,
+        memberName: o.member?.name,
+        planName: parsePlanNameFromItemDesc(o.itemDesc),
+        usageType: String(o.itemDesc || '').includes('UNLIMITED') ? 'UNLIMITED' : 'TIMED',
+        cardMode: o.cardMode || null,
+        payMethod: o.payMethod || null,
+        amount: o.amount,
+        status: o.status,
+        txnStatus,
+        subscriptionId: sub?.id || null,
+        subscriptionStatus: subStatus,
+        recurringStopped,
+        invoiceNumber: o.invoiceNumber,
+        ...invoiceStatusMeta(o.status, o.invoiceNumber),
+        carrierNum: o.carrierNum,
+        buyerUbn: o.buyerUbn,
+        loveCode: o.loveCode,
+      };
+    });
 
     const totalAmount = data.reduce((s, r) => s + (Number(r.amount) || 0), 0);
 
@@ -1840,6 +1897,302 @@ router.get('/analytics', requireAdmin, async (req, res) => {
     }
     console.error(error);
     res.status(500).json({ status: 'error', message: '讀取銷售分析失敗' });
+  }
+});
+
+/** GET /api/hq/reports/analytics/yoy?year= — 歷年同月門票銷售比較 */
+router.get('/analytics/yoy', requireAdmin, async (req, res) => {
+  try {
+    const year = Number(req.query.year) || new Date().getFullYear();
+    const months = [];
+    for (let m = 1; m <= 12; m += 1) {
+      const from = new Date(year, m - 1, 1);
+      const to = new Date(year, m, 0, 23, 59, 59, 999);
+      const agg = await prisma.order.aggregate({
+        where: {
+          status: 'PAID',
+          createdAt: { gte: from, lte: to },
+        },
+        _sum: { amount: true },
+        _count: { id: true },
+      });
+      months.push({
+        month: m,
+        amount: agg._sum.amount || 0,
+        count: agg._count.id || 0,
+      });
+    }
+    const prevYear = year - 1;
+    const prevMonths = [];
+    for (let m = 1; m <= 12; m += 1) {
+      const from = new Date(prevYear, m - 1, 1);
+      const to = new Date(prevYear, m, 0, 23, 59, 59, 999);
+      const agg = await prisma.order.aggregate({
+        where: { status: 'PAID', createdAt: { gte: from, lte: to } },
+        _sum: { amount: true },
+        _count: { id: true },
+      });
+      prevMonths.push({ month: m, amount: agg._sum.amount || 0, count: agg._count.id || 0 });
+    }
+    return res.json({
+      status: 'success',
+      data: { year, months, prevYear, prevMonths },
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ status: 'error', message: '歷年比較失敗' });
+  }
+});
+
+/** GET /api/hq/reports/analytics/members — 會員分析 */
+router.get('/analytics/members', requireAdmin, async (req, res) => {
+  try {
+    const range = parseAnalyticsDateRange(req.query);
+    const from = range.from;
+    const to = range.to;
+
+    const [newMembers, checkIns, activeNow, genderBreakdown] = await Promise.all([
+      prisma.member.count({ where: { createdAt: { gte: from, lte: to } } }),
+      prisma.checkInLog.findMany({
+        where: { checkInAt: { gte: from, lte: to }, status: 'ACTIVE' },
+        select: { memberId: true, checkInAt: true, checkOutAt: true },
+      }),
+      prisma.checkInLog.count({
+        where: { status: 'ACTIVE', checkOutAt: null },
+      }),
+      prisma.member.groupBy({
+        by: ['gender'],
+        _count: { id: true },
+      }),
+    ]);
+
+    const uniqueVisitors = new Set(checkIns.map((c) => c.memberId)).size;
+    let totalMinutes = 0;
+    let completed = 0;
+    for (const c of checkIns) {
+      if (c.checkOutAt) {
+        totalMinutes += (c.checkOutAt - c.checkInAt) / 60000;
+        completed += 1;
+      }
+    }
+    const avgStayMinutes = completed > 0 ? Math.round(totalMinutes / completed) : 0;
+
+    const dailyMap = new Map();
+    for (const c of checkIns) {
+      const key = c.checkInAt.toISOString().slice(0, 10);
+      dailyMap.set(key, (dailyMap.get(key) || 0) + 1);
+    }
+    const dailyVisits = [...dailyMap.entries()]
+      .map(([date, count]) => ({ date, count }))
+      .sort((a, b) => a.date.localeCompare(b.date));
+
+    return res.json({
+      status: 'success',
+      data: {
+        from,
+        to,
+        newMembers,
+        uniqueVisitors,
+        visitCount: checkIns.length,
+        avgStayMinutes,
+        currentlyInGym: activeNow,
+        dailyVisits,
+        genderBreakdown: genderBreakdown.map((g) => ({
+          gender: g.gender || 'UNKNOWN',
+          count: g._count.id,
+        })),
+      },
+    });
+  } catch (error) {
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({ status: 'error', message: error.message });
+    }
+    console.error(error);
+    return res.status(500).json({ status: 'error', message: '會員分析失敗' });
+  }
+});
+
+/** GET /api/hq/reports/card-subscriptions/batch — 信用卡扣款批次明細 */
+router.get('/card-subscriptions/batch', requireDutyOrAbove, async (req, res) => {
+  try {
+    const range = parseDateRange(req.query);
+    const where = {};
+    if (range) where.attemptedAt = range;
+    const charges = await prisma.cardSubscriptionCharge.findMany({
+      where,
+      include: {
+        subscription: {
+          select: {
+            id: true,
+            memberId: true,
+            periodType: true,
+            status: true,
+            member: { select: { name: true, phone: true } },
+          },
+        },
+      },
+      orderBy: { attemptedAt: 'desc' },
+      take: 500,
+    });
+    const summary = {
+      total: charges.length,
+      paid: charges.filter((c) => c.status === 'PAID').length,
+      failed: charges.filter((c) => c.status === 'FAILED').length,
+      pending: charges.filter((c) => c.status === 'PENDING').length,
+    };
+    return res.json({ status: 'success', data: { charges, summary } });
+  } catch (error) {
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({ status: 'error', message: error.message });
+    }
+    console.error(error);
+    return res.status(500).json({ status: 'error', message: '扣款批次查詢失敗' });
+  }
+});
+
+/** GET /api/hq/reports/group-class-crm — 團課 CRM：到課率／請假率／補課／續約代理指標 */
+router.get('/group-class-crm', requireOpsOrDuty, async (req, res) => {
+  try {
+    const range = parseDateRange(req.query);
+    const branchId = req.query.branchId ? Number(req.query.branchId) : null;
+    const classWhere = {
+      type: 'GROUP',
+      ...(range ? { startAt: range } : {}),
+      ...(branchId
+        ? { venue: { branchId } }
+        : {}),
+    };
+
+    const classes = await prisma.class.findMany({
+      where: classWhere,
+      select: {
+        id: true,
+        title: true,
+        startAt: true,
+        capacity: true,
+        trainerId: true,
+        venue: { select: { branchId: true, name: true, branch: { select: { name: true, code: true } } } },
+        trainer: { select: { id: true, displayName: true, name: true } },
+        reservations: {
+          select: {
+            id: true,
+            status: true,
+            memberId: true,
+            classLeave: { select: { id: true, status: true, withinPolicy: true } },
+            attendance: { select: { id: true, checkedInAt: true } },
+          },
+        },
+        makeupSlots: {
+          select: {
+            id: true,
+            capacity: true,
+            _count: { select: { registrations: true } },
+          },
+        },
+      },
+      orderBy: { startAt: 'desc' },
+      take: 500,
+    });
+
+    const rows = classes.map((c) => {
+      const booked = c.reservations.filter((r) =>
+        ['PENDING', 'CONFIRMED', 'ATTENDED', 'NO_SHOW'].includes(String(r.status || '').toUpperCase()) ||
+        r.status,
+      );
+      const reserved = c.reservations.length;
+      const attended = c.reservations.filter((r) => r.attendance).length;
+      const left = c.reservations.filter((r) => r.classLeave).length;
+      const makeupReg = c.makeupSlots.reduce((s, m) => s + (m._count?.registrations || 0), 0);
+      const attendanceRate = reserved > 0 ? Math.round((attended / reserved) * 1000) / 10 : 0;
+      const leaveRate = reserved > 0 ? Math.round((left / reserved) * 1000) / 10 : 0;
+      return {
+        classId: c.id,
+        title: c.title,
+        startAt: c.startAt,
+        capacity: c.capacity,
+        branchName: c.venue?.branch?.name || null,
+        venueName: c.venue?.name || null,
+        trainerName: c.trainer?.displayName || c.trainer?.name || null,
+        reserved,
+        attended,
+        left,
+        makeupRegistrations: makeupReg,
+        attendanceRate,
+        leaveRate,
+        fillRate:
+          c.capacity > 0 ? Math.round((reserved / c.capacity) * 1000) / 10 : 0,
+      };
+    });
+
+    // 續課代理：區間內有 GROUP 預約的會員，對照是否另有更新的 PT／購案（簡化）
+    const memberIds = [
+      ...new Set(
+        classes.flatMap((c) =>
+          c.reservations.map((r) => r.memberId).filter(Boolean),
+        ),
+      ),
+    ];
+    let renewProxy = { membersWithClass: memberIds.length, membersWithNewPurchase: 0, rate: 0 };
+    if (memberIds.length) {
+      const since = range?.gte || new Date(Date.now() - 90 * 86400000);
+      const purchasers = await prisma.order.findMany({
+        where: {
+          memberId: { in: memberIds },
+          status: 'PAID',
+          createdAt: { gte: since },
+          itemDesc: { contains: '課程' },
+        },
+        select: { memberId: true },
+        distinct: ['memberId'],
+      });
+      const ptBuyers = await prisma.pTContract.findMany({
+        where: {
+          memberId: { in: memberIds },
+          source: 'PURCHASE',
+          createdAt: { gte: since },
+        },
+        select: { memberId: true },
+        distinct: ['memberId'],
+      });
+      const renewed = new Set([
+        ...purchasers.map((p) => p.memberId),
+        ...ptBuyers.map((p) => p.memberId),
+      ]);
+      renewProxy = {
+        membersWithClass: memberIds.length,
+        membersWithNewPurchase: renewed.size,
+        rate:
+          memberIds.length > 0
+            ? Math.round((renewed.size / memberIds.length) * 1000) / 10
+            : 0,
+      };
+    }
+
+    const summary = {
+      classCount: rows.length,
+      reserved: rows.reduce((s, r) => s + r.reserved, 0),
+      attended: rows.reduce((s, r) => s + r.attended, 0),
+      left: rows.reduce((s, r) => s + r.left, 0),
+      avgAttendanceRate:
+        rows.length > 0
+          ? Math.round(
+              (rows.reduce((s, r) => s + r.attendanceRate, 0) / rows.length) * 10,
+            ) / 10
+          : 0,
+      avgLeaveRate:
+        rows.length > 0
+          ? Math.round((rows.reduce((s, r) => s + r.leaveRate, 0) / rows.length) * 10) / 10
+          : 0,
+      renewProxy,
+    };
+
+    return res.json({ status: 'success', data: { rows, summary } });
+  } catch (error) {
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({ status: 'error', message: error.message });
+    }
+    console.error(error);
+    return res.status(500).json({ status: 'error', message: '團課 CRM 查詢失敗' });
   }
 });
 

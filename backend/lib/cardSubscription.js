@@ -1,10 +1,23 @@
-// lib/cardSubscription.js — 信用卡定期定額：建訂閱、排程續扣、履約
+// lib/cardSubscription.js — 信用卡定期定額：建訂閱、排程續扣、履約、換卡
 import prisma from './prisma.js';
-import { chargeWithCreditHash } from './payuni.js';
+import {
+  buildCardCheckoutRequest,
+  chargeWithCreditHash,
+  resolveBindVerifyAmount,
+  resolvePayuniPeriodHash,
+  stopPayuniRecurringForSubscription,
+  resumePayuniRecurringForSubscription,
+  resolveNextChargeAtFromDateList,
+  resolveNextChargeAtFromPeriodSchedule,
+  extractPeriodTradeNo,
+  queryPayuniPeriod,
+  summarizePayuniPeriodSchedule,
+} from './payuni.js';
 import {
   buildTopupItemDesc,
   fulfillPromotionPurchase,
   isUnlimitedPromotion,
+  resolvePromotionRecurringAmount,
   resolveRecurringPeriodDays,
   buildRecurringInvoiceItemDesc,
 } from './promotion.js';
@@ -15,6 +28,16 @@ const MAX_FAILS = 3;
 const DEFAULT_TICK_MS = 60_000;
 /** 排程 claim 鎖定時間（毫秒），避免多實例／重疊 tick 雙扣 */
 const CLAIM_LOCK_MS = 5 * 60 * 1000;
+
+/** lastError 標記：櫃檯／會員已開換卡頁，等待 PayUNi Notify */
+export const REBIND_PENDING_MARKER = 'REBIND_PENDING';
+export const REBIND_DONE_MARKER = '換卡約定完成；CreditHash 已更新';
+
+function httpError(message, statusCode = 400) {
+  const err = new Error(message);
+  err.statusCode = statusCode;
+  return err;
+}
 
 function generateSubscriptionId() {
   const dateStr = new Date().toISOString().replace(/[-:T.Z]/g, '').slice(0, 8);
@@ -37,11 +60,120 @@ function generateChargeId() {
  * @param {Date} from
  */
 export function computeNextChargeAt(periodType, from = new Date()) {
-  const base = new Date(from);
   const pt = String(periodType || 'M').toUpperCase();
   const days = pt === 'W' ? 7 : pt === 'Y' ? 365 : 30;
-  base.setDate(base.getDate() + days);
-  return base;
+  // 與效期一致：起始日算第 1 天 → 下期自「第 days+1 天」00:00 起扣
+  const next = new Date(from);
+  next.setHours(0, 0, 0, 0);
+  next.setDate(next.getDate() + days);
+  return next;
+}
+
+/** PayUNi 代扣時曾用的本機略過佔位日（勿再寫入；僅辨識舊資料） */
+export const PLACEHOLDER_NEXT_CHARGE_AT = new Date('2099-01-01T00:00:00.000Z');
+
+export function isPlaceholderNextChargeAt(value) {
+  if (!value) return true;
+  const t = new Date(value).getTime();
+  if (!Number.isFinite(t)) return true;
+  return t >= Date.UTC(2090, 0, 1);
+}
+
+/**
+ * 請假／顯示用的「預期下次扣款」：若 DB 仍是 2099 佔位，改以 lastChargeAt／現在推算
+ * （PERIOD 訂閱應優先用 PayUNi DateList／period/query，見 syncNextChargeAtFromPayuni）
+ */
+export function resolveExpectedNextChargeAt(sub, now = new Date()) {
+  if (sub?.nextChargeAt && !isPlaceholderNextChargeAt(sub.nextChargeAt)) {
+    return new Date(sub.nextChargeAt);
+  }
+  const from = sub?.lastChargeAt ? new Date(sub.lastChargeAt) : new Date(now);
+  return computeNextChargeAt(sub?.periodType || 'M', from);
+}
+
+function sameLocalYmd(a, b) {
+  if (!a || !b) return false;
+  const da = new Date(a);
+  const db = new Date(b);
+  if (Number.isNaN(da.getTime()) || Number.isNaN(db.getTime())) return false;
+  return (
+    da.getFullYear() === db.getFullYear() &&
+    da.getMonth() === db.getMonth() &&
+    da.getDate() === db.getDate()
+  );
+}
+
+/**
+ * 以 PayUNi period/query 的下一筆「排程中」日覆寫 nextChargeAt（僅 PERIOD: 訂閱）
+ * @returns {Promise<object>} 更新後的訂閱列（未變則原列）
+ */
+export async function syncNextChargeAtFromPayuni(sub, { now = new Date() } = {}) {
+  if (!sub?.id || !isExternalPeriodSubscription(sub)) return sub;
+  const periodNo = extractPeriodTradeNo(sub);
+  if (!periodNo) return sub;
+
+  const query = await queryPayuniPeriod({ periodTradeNo: periodNo });
+  if (!query.ok) return sub;
+  const schedule = summarizePayuniPeriodSchedule(query.data);
+  const next = resolveNextChargeAtFromPeriodSchedule(schedule, now);
+  if (!next) return sub;
+  if (sameLocalYmd(sub.nextChargeAt, next)) return sub;
+
+  try {
+    return await prisma.cardSubscription.update({
+      where: { id: sub.id },
+      data: { nextChargeAt: next },
+    });
+  } catch {
+    return { ...sub, nextChargeAt: next };
+  }
+}
+
+/** 列表用：對 ACTIVE 的 PERIOD 訂閱批次對齊 PayUNi 下次扣款日 */
+export async function syncPeriodNextChargeAtsFromPayuni(rows = [], { now = new Date() } = {}) {
+  const list = Array.isArray(rows) ? rows : [];
+  const out = [];
+  for (const row of list) {
+    if (
+      row?.status === 'ACTIVE' &&
+      isExternalPeriodSubscription(row) &&
+      extractPeriodTradeNo(row)
+    ) {
+      out.push(await syncNextChargeAtFromPayuni(row, { now }));
+    } else {
+      out.push(row);
+    }
+  }
+  return out;
+}
+
+/** 將列表中仍為 2099 佔位的 nextChargeAt 寫回真實預期日（顯示／請假用） */
+export async function repairPlaceholderNextChargeAts(rows = []) {
+  const list = Array.isArray(rows) ? rows : [];
+  const out = [];
+  for (const row of list) {
+    if (!row?.id || !isPlaceholderNextChargeAt(row.nextChargeAt)) {
+      out.push(row);
+      continue;
+    }
+    const hash = String(row.creditHash || '').trim();
+    // 真實 CreditHash 用遠日防與金流雙扣：禁止「修復」成近期，否則本機排程會重扣
+    if (hash && !hash.startsWith(EXTERNAL_PERIOD_HASH_PREFIX)) {
+      out.push(row);
+      continue;
+    }
+    const nextChargeAt = resolveExpectedNextChargeAt(row);
+    try {
+      await prisma.cardSubscription.update({
+        where: { id: row.id },
+        data: { nextChargeAt },
+      });
+      out.push({ ...row, nextChargeAt });
+    } catch {
+      out.push({ ...row, nextChargeAt });
+    }
+  }
+  return out;
 }
 
 /**
@@ -79,22 +211,43 @@ export function resolvePeriodChargeAmount(sub, periodIndex) {
   return Math.round((Number(sub?.amount) || 0) * 100) / 100;
 }
 
+const EXTERNAL_PERIOD_HASH_PREFIX = 'PERIOD:';
+
+/** 是否為續期收款頁訂閱（無真實 CreditHash，本機不幕後扣） */
+export function isExternalPeriodSubscription(subOrHash) {
+  const h =
+    typeof subOrHash === 'string'
+      ? subOrHash
+      : String(subOrHash?.creditHash || '');
+  return h.startsWith(EXTERNAL_PERIOD_HASH_PREFIX) || !h.trim();
+}
+
 /**
- * 首期 UPP 成功後建立訂閱（idempotent：同 originOrderId 不重複）
- * promotion 與 coursePlan 擇一
+ * 首期付款成功後建立訂閱（idempotent：同 originOrderId 不重複）
+ * promotion 與 coursePlan 擇一。
+ * 無 CreditHash（續期收款頁）時仍建訂閱，creditHash 存 PERIOD:… 佔位，本機排程略過。
  */
 export async function createSubscriptionFromPaidOrder(order, {
   promotion = null,
   coursePlan = null,
   creditHash,
+  periodTradeNo: periodTradeNoRaw,
   amountFinal: amountFinalOverride = undefined,
+  dateList = null,
+  nextChargeAt: nextChargeAtHint = null,
   now = new Date(),
 } = {}) {
-  if (!order || order.cardMode !== 'RECURRING') return null;
-  const hash = String(creditHash || order.creditHash || '').trim();
-  if (!hash) {
-    console.warn(`⚠️ 訂單 ${order.id} 為定期定額但缺少 CreditHash，無法建立續扣訂閱`);
-    return null;
+  if (!order || String(order.cardMode || '').toUpperCase() !== 'RECURRING') return null;
+  const realHash = String(creditHash || order.creditHash || '').trim();
+  const periodNo = String(periodTradeNoRaw || '').trim() || null;
+  const hash =
+    realHash ||
+    `${EXTERNAL_PERIOD_HASH_PREFIX}${periodNo || order.id}`;
+
+  if (!realHash) {
+    console.warn(
+      `⚠️ 訂單 ${order.id} 定期定額無 CreditHash（續期收款頁常見）→ 仍建立訂閱，續扣交由 PayUNi`,
+    );
   }
   if (!promotion?.id && !coursePlan?.id) {
     console.warn(`⚠️ 訂單 ${order.id} 無法解析儲值／課程方案，略過訂閱建立`);
@@ -108,7 +261,18 @@ export async function createSubscriptionFromPaidOrder(order, {
   const existing = await prisma.cardSubscription.findFirst({
     where: { originOrderId: order.id },
   });
-  if (existing) return existing;
+  if (existing) {
+    // 約定 Notify 晚到：補齊 PeriodTradeNo／下次扣款日（以 DateList 為準）
+    if (periodNo || dateList || nextChargeAtHint || realHash) {
+      return applyCardSubscriptionCreditUpdate(existing.id, {
+        creditHash: realHash || existing.creditHash || hash,
+        periodTradeNo: periodNo || extractPeriodTradeNo(existing),
+        dateList,
+        nextChargeAt: nextChargeAtHint,
+      });
+    }
+    return existing;
+  }
 
   const periodType = String(order.periodType || 'M').toUpperCase();
   let periodTimes = resolveMaxPeriodTimes(order, promotion, coursePlan);
@@ -125,10 +289,10 @@ export async function createSubscriptionFromPaidOrder(order, {
     Number.isFinite(recurringOverride) && recurringOverride > 0
       ? recurringOverride
       : Number(order.cardAmount > 0 ? order.cardAmount : order.amount);
-  // 儲值方案：每期金額權威＝方案費用
+  // 儲值方案：續期金額＝recurringAmount（可與首期不同）
   if (promotion?.id) {
-    const price = Number(promotion.price);
-    if (Number.isFinite(price) && price > 0) amount = price;
+    const periodAmt = resolvePromotionRecurringAmount(promotion);
+    if (periodAmt != null && periodAmt > 0) amount = periodAmt;
   }
 
   let amountFinal = null;
@@ -144,7 +308,18 @@ export async function createSubscriptionFromPaidOrder(order, {
     }
   }
 
-  const nextChargeAt = computeNextChargeAt(periodType, now);
+  // 下次扣款：PERIOD 優先 DateList／指定日；否則本機 +30 天推算（僅本機幕後續扣適用）
+  const fromHint =
+    nextChargeAtHint instanceof Date && !Number.isNaN(nextChargeAtHint.getTime())
+      ? nextChargeAtHint
+      : nextChargeAtHint
+        ? new Date(nextChargeAtHint)
+        : null;
+  const fromList = resolveNextChargeAtFromDateList(dateList, now);
+  const nextChargeAt =
+    (fromHint && !Number.isNaN(fromHint.getTime()) ? fromHint : null) ||
+    fromList ||
+    computeNextChargeAt(periodType, now);
 
   const status =
     periodTimes > 0 && periodTimes <= 1 ? 'COMPLETED' : 'ACTIVE';
@@ -168,6 +343,7 @@ export async function createSubscriptionFromPaidOrder(order, {
         nextChargeAt,
         lastChargeAt: now,
         failCount: 0,
+        lastError: realHash ? null : '無 CreditHash：續扣由 PayUNi 續期收款排程',
       },
     });
   } catch (err) {
@@ -183,9 +359,304 @@ export async function createSubscriptionFromPaidOrder(order, {
     ? `方案#${promotion.id}`
     : `課程方案#${coursePlan.id}`;
   console.log(
-    `🔁 已建立定期定額訂閱 ${sub.id}（會員#${sub.memberId} · ${targetLabel} · 共${periodTimes || '不限'}期 · 下次 ${nextChargeAt.toISOString()}）`,
+    `🔁 已建立定期定額訂閱 ${sub.id}（會員#${sub.memberId} · ${targetLabel} · 共${periodTimes || '不限'}期 · ${realHash ? `下次 ${nextChargeAt.toISOString()}` : 'PayUNi 排程／無本機續扣'}）`,
   );
   return sub;
+}
+
+/**
+ * 已付款定期定額訂單若缺訂閱列則補建（Notify 舊版略過／CHK 與 CRS 分流不一致）
+ * @returns {Promise<object|null>}
+ */
+export async function ensureSubscriptionForPaidRecurringOrder(order, {
+  creditHash,
+  periodTradeNo,
+  dateList = null,
+  promotion = null,
+  coursePlan = null,
+} = {}) {
+  if (!order || String(order.status || '').toUpperCase() !== 'PAID') return null;
+  if (String(order.cardMode || '').toUpperCase() !== 'RECURRING') return null;
+
+  const existing = await prisma.cardSubscription.findFirst({
+    where: { originOrderId: order.id },
+  });
+  if (existing) {
+    const incoming = String(creditHash || order.creditHash || '').trim();
+    if (incoming && incoming !== existing.creditHash) {
+      return applyCardSubscriptionCreditUpdate(existing.id, {
+        creditHash: incoming,
+        periodTradeNo,
+        dateList,
+      });
+    }
+    if (dateList || periodTradeNo) {
+      return applyCardSubscriptionCreditUpdate(existing.id, {
+        creditHash: existing.creditHash,
+        periodTradeNo: periodTradeNo || extractPeriodTradeNo(existing),
+        dateList,
+      });
+    }
+    return existing;
+  }
+
+  let promo = promotion;
+  let course = coursePlan;
+  if (!promo?.id && !course?.id) {
+    const promoMatch = String(order.itemDesc || '').match(/商品#(\d+)/);
+    const promotionId = promoMatch ? parseInt(promoMatch[1], 10) : null;
+    if (promotionId) {
+      promo = await prisma.promotion.findUnique({ where: { id: promotionId } });
+    }
+    if (!promo?.id) {
+      const courseMatch = String(order.itemDesc || '').match(/課程方案#(\d+)/);
+      const coursePlanId = courseMatch ? parseInt(courseMatch[1], 10) : null;
+      if (coursePlanId) {
+        course = await prisma.coursePlan.findUnique({ where: { id: coursePlanId } });
+      }
+    }
+  }
+
+  return createSubscriptionFromPaidOrder(order, {
+    promotion: promo,
+    coursePlan: course,
+    creditHash: creditHash || order.creditHash,
+    periodTradeNo: periodTradeNo || null,
+    dateList,
+    amountFinal: order.recurringAmountFinal ?? undefined,
+  });
+}
+
+/**
+ * Notify／人工：回寫訂閱 CreditHash（換卡或首約補綁）
+ * @returns {Promise<object|null>}
+ */
+export async function applyCardSubscriptionCreditUpdate(
+  subscriptionId,
+  { creditHash, periodTradeNo, dateList = null, nextChargeAt: nextChargeAtHint = null, mode = 'notify' } = {},
+) {
+  const id = String(subscriptionId || '').trim();
+  if (!id) return null;
+  const realHash = String(creditHash || '').trim();
+  const periodNo = String(periodTradeNo || '').trim();
+  const hash =
+    realHash ||
+    (periodNo ? `${EXTERNAL_PERIOD_HASH_PREFIX}${periodNo}` : '');
+  if (!hash) return null;
+
+  const sub = await prisma.cardSubscription.findUnique({ where: { id } });
+  if (!sub) return null;
+
+  const becomesReal = Boolean(realHash) && !realHash.startsWith(EXTERNAL_PERIOD_HASH_PREFIX);
+  const far = PLACEHOLDER_NEXT_CHARGE_AT;
+  let nextChargeAt = sub.nextChargeAt;
+  let lastError = sub.lastError;
+
+  const fromHint =
+    nextChargeAtHint instanceof Date && !Number.isNaN(nextChargeAtHint.getTime())
+      ? nextChargeAtHint
+      : nextChargeAtHint
+        ? new Date(nextChargeAtHint)
+        : null;
+  const fromList = resolveNextChargeAtFromDateList(dateList, new Date());
+
+  if (mode === 'manual') {
+    if (becomesReal) {
+      nextChargeAt = isPlaceholderNextChargeAt(sub.nextChargeAt)
+        ? computeNextChargeAt(sub.periodType, new Date())
+        : sub.nextChargeAt;
+      lastError = '人工更新 CreditHash';
+    }
+  } else if (becomesReal) {
+    // 續期頁若回真實 Token：本機置遠日，避免與 PayUNi 排程雙扣（顯示／請假另以 resolveExpectedNextChargeAt）
+    nextChargeAt = far;
+    lastError = REBIND_DONE_MARKER;
+  } else if (periodNo || hash.startsWith(EXTERNAL_PERIOD_HASH_PREFIX)) {
+    // PERIOD：下次扣款以 PayUNi DateList 為準（勿用 +30 天估算）
+    if (fromHint && !Number.isNaN(fromHint.getTime())) {
+      nextChargeAt = fromHint;
+    } else if (fromList) {
+      nextChargeAt = fromList;
+    } else if (isPlaceholderNextChargeAt(sub.nextChargeAt)) {
+      nextChargeAt = resolveExpectedNextChargeAt(sub);
+    }
+    lastError = `${REBIND_DONE_MARKER}（PERIOD:${periodNo || extractPeriodTradeNo(hash)}）`;
+  } else {
+    lastError = REBIND_DONE_MARKER;
+  }
+
+  const updated = await prisma.cardSubscription.update({
+    where: { id },
+    data: {
+      creditHash: hash,
+      failCount: 0,
+      status: sub.status === 'FAILED' || mode === 'manual' ? 'ACTIVE' : sub.status,
+      nextChargeAt,
+      lastError,
+    },
+  });
+
+  if (sub.originOrderId && realHash && !realHash.startsWith(EXTERNAL_PERIOD_HASH_PREFIX)) {
+    await prisma.order.updateMany({
+      where: { id: sub.originOrderId },
+      data: { creditHash: realHash },
+    });
+  }
+
+  // PERIOD 若 Notify 無 DateList，補查 period/query
+  if (
+    isExternalPeriodSubscription(updated) &&
+    extractPeriodTradeNo(updated) &&
+    !fromList &&
+    !(fromHint && !Number.isNaN(fromHint.getTime()))
+  ) {
+    return syncNextChargeAtFromPayuni(updated);
+  }
+
+  console.log(`🔁 訂閱 ${id} CreditHash 已更新（${mode}）`);
+  return updated;
+}
+
+/**
+ * 計算換卡約定剩餘期數（至少 1）
+ */
+export function resolveRebindRemainTimes(sub, promotion = null) {
+  const total = parseInt(sub?.periodTimes, 10);
+  const charged = parseInt(sub?.chargedCount, 10);
+  const used = Number.isInteger(charged) && charged > 0 ? charged : 0;
+  if (Number.isInteger(total) && total > 0) {
+    return Math.max(1, total - used);
+  }
+  const promoCount = parseInt(promotion?.periodCount, 10);
+  if (Number.isInteger(promoCount) && promoCount > 0) {
+    return Math.max(1, promoCount - used);
+  }
+  // 不限期：PayUNi 仍要 PeriodTimes；給足夠期數供約定
+  return 36;
+}
+
+/**
+ * 開 PayUNi 續期頁換卡：臨櫃 $1 驗證授權後取消（不請款）；線上預設不收款
+ * @param {string} subscriptionId
+ * @param {{ channel?: 'counter'|'online' }} [opts]
+ */
+export async function buildSubscriptionRebindRequest(
+  subscriptionId,
+  { channel = 'counter' } = {},
+) {
+  const id = String(subscriptionId || '').trim();
+  if (!id) throw httpError('請提供訂閱編號');
+
+  const sub = await prisma.cardSubscription.findUnique({
+    where: { id },
+    include: {
+      promotion: true,
+      coursePlan: true,
+      member: { select: { id: true, name: true } },
+    },
+  });
+  if (!sub) throw httpError('找不到訂閱', 404);
+  if (!['ACTIVE', 'PAUSED', 'FAILED'].includes(String(sub.status))) {
+    throw httpError('僅進行中／暫停／扣款失敗的訂閱可換卡');
+  }
+
+  const periodAmt = resolvePeriodChargeAmount(sub, (parseInt(sub.chargedCount, 10) || 0) + 1);
+  if (!(periodAmt > 0)) {
+    throw httpError('訂閱扣款金額無效，無法換卡');
+  }
+  const remainTimes = resolveRebindRemainTimes(sub, sub.promotion);
+  const periodChannel = channel === 'online' ? 'online' : 'counter';
+  const payuniPeriodHash = resolvePayuniPeriodHash({
+    channel: periodChannel,
+    promotion: sub.promotion,
+    coursePlan: sub.coursePlan,
+  });
+
+  const bindMerTradeNo = `${id}R${String(Date.now()).slice(-6)}`.slice(0, 25);
+  const itemDesc = sub.promotion?.name || sub.coursePlan?.name || '定期定額換卡';
+
+  await prisma.cardSubscription.update({
+    where: { id },
+    data: { lastError: REBIND_PENDING_MARKER },
+  });
+
+  try {
+    const bindOrder = {
+      id: bindMerTradeNo,
+      bindSubscriptionId: id,
+      bindOnly: true,
+      rebind: true,
+      itemDesc,
+      cardMode: 'RECURRING',
+      periodType: sub.periodType || 'M',
+      periodTimes: remainTimes,
+      periodAmt,
+      recurringAmount: periodAmt,
+      payuniPeriodHash,
+      channel: periodChannel,
+      promotion: sub.promotion,
+      coursePlan: sub.coursePlan,
+    };
+    const verifyAmt = resolveBindVerifyAmount(bindOrder);
+    const { actionUrl, payload } = buildCardCheckoutRequest({
+      ...bindOrder,
+      amount: verifyAmt,
+    });
+    return {
+      subscriptionId: id,
+      memberId: sub.memberId,
+      memberName: sub.member?.name || null,
+      channel: periodChannel,
+      needsPeriodBind: true,
+      bindOnly: true,
+      rebind: true,
+      actionUrl,
+      payload,
+      periodAmt,
+      periodTimes: remainTimes,
+      tradeAmt: verifyAmt,
+      fAmt: verifyAmt,
+      verifyAmt,
+      rebindPending: true,
+      messageHint:
+        periodChannel === 'online'
+          ? verifyAmt > 0
+            ? `請於 PayUNi 頁面輸入新卡（$${verifyAmt} 驗證授權，隨後取消不請款）；完成後自動更新扣款信用卡`
+            : '請於 PayUNi 頁面輸入新卡完成約定（本次不收款）；完成後自動更新扣款信用卡'
+          : verifyAmt > 0
+            ? `請會員於 PayUNi 續期頁輸入新卡（$${verifyAmt} 驗證授權，隨後取消不請款；第 2 期起 PeriodAmt $${periodAmt}）`
+            : '請會員於 PayUNi 續期頁輸入新卡完成約定（本次不收款）',
+    };
+  } catch (err) {
+    await prisma.cardSubscription.update({
+      where: { id },
+      data: { lastError: err.message || '開換卡頁失敗' },
+    });
+    throw err;
+  }
+}
+
+export function isRebindPending(sub) {
+  return String(sub?.lastError || '') === REBIND_PENDING_MARKER;
+}
+
+/**
+ * 訂閱換卡輪詢狀態（不回傳原始 CreditHash）
+ */
+export function toRebindStatusView(sub) {
+  if (!sub) return null;
+  return {
+    subscriptionId: sub.id,
+    status: sub.status,
+    rebindPending: isRebindPending(sub),
+    hasCreditHash: Boolean(String(sub.creditHash || '').trim()),
+    creditUpdated:
+      String(sub.lastError || '').startsWith('換卡約定完成') ||
+      String(sub.lastError || '') === REBIND_DONE_MARKER,
+    lastError: isRebindPending(sub) ? REBIND_PENDING_MARKER : sub.lastError || null,
+    updatedAt: sub.updatedAt,
+    nextChargeAt: sub.nextChargeAt,
+  };
 }
 
 /**
@@ -216,6 +687,17 @@ export async function processOneSubscription(subscriptionId, { now = new Date() 
   });
   if (!sub || sub.status !== 'ACTIVE') {
     return { ok: false, skipped: true, reason: 'not_active' };
+  }
+  if (isExternalPeriodSubscription(sub)) {
+    // 續期收款頁訂閱：本機不幕後扣；推進顯示用下次扣款，勿再寫 2099
+    await prisma.cardSubscription.update({
+      where: { id: sub.id },
+      data: {
+        nextChargeAt: computeNextChargeAt(sub.periodType, now),
+        lastError: '無 CreditHash：續扣由 PayUNi 排程，本機略過',
+      },
+    });
+    return { ok: false, skipped: true, reason: 'external_period_no_credit_hash' };
   }
   if (sub.periodTimes > 0 && sub.chargedCount >= sub.periodTimes) {
     await prisma.cardSubscription.update({
@@ -423,6 +905,8 @@ export async function processDueSubscriptions({ limit = 20, now = new Date() } =
     where: {
       status: 'ACTIVE',
       nextChargeAt: { lte: now },
+      // 略過 PERIOD: 佔位（續期收款頁／PayUNi 排程）
+      NOT: { creditHash: { startsWith: EXTERNAL_PERIOD_HASH_PREFIX } },
     },
     orderBy: { nextChargeAt: 'asc' },
     take: limit,
@@ -442,7 +926,10 @@ export async function processDueSubscriptions({ limit = 20, now = new Date() } =
   return { processed: results.length, results };
 }
 
-export async function cancelCardSubscription(id, { reason } = {}) {
+export async function cancelCardSubscription(
+  id,
+  { reason, stopPayuni = true, forceLocalOnly = false } = {},
+) {
   const sub = await prisma.cardSubscription.findUnique({ where: { id } });
   if (!sub) {
     const err = new Error('找不到訂閱');
@@ -450,18 +937,54 @@ export async function cancelCardSubscription(id, { reason } = {}) {
     throw err;
   }
   if (sub.status === 'CANCELLED' || sub.status === 'COMPLETED') {
-    return sub;
+    return { subscription: sub, payuniStop: { ok: true, skipped: true, message: '訂閱已停' } };
   }
-  return prisma.cardSubscription.update({
+
+  let payuniStop = { ok: true, skipped: true };
+  if (stopPayuni) {
+    try {
+      payuniStop = await stopPayuniRecurringForSubscription(sub, { mode: 'terminate' });
+    } catch (e) {
+      payuniStop = { ok: false, message: e.message || '停 PayUNi 續期失敗' };
+    }
+    if (!payuniStop.ok && !payuniStop.skipped && !forceLocalOnly) {
+      console.error(
+        `[取消訂閱] ${id} PayUNi 續期未停：${payuniStop.message}` +
+          (payuniStop.periodTradeNo ? `（PeriodTradeNo=${payuniStop.periodTradeNo}）` : ''),
+      );
+      const err = new Error(
+        payuniStop.message ||
+          'PayUNi 續期排程尚未終止，本機訂閱未取消（避免顯示已停卻仍扣款）',
+      );
+      err.statusCode = 409;
+      err.payuniStop = payuniStop;
+      throw err;
+    }
+    if (!payuniStop.ok && !payuniStop.skipped) {
+      console.error(
+        `[取消訂閱] ${id} forceLocalOnly：本機將取消，但 PayUNi 未停：${payuniStop.message}`,
+      );
+    }
+  }
+
+  const noteParts = [reason ? String(reason).slice(0, 160) : '手動取消'];
+  if (payuniStop?.ok && !payuniStop.skipped) {
+    noteParts.push('PayUNi 續期已終止');
+  } else if (payuniStop && !payuniStop.ok && !payuniStop.skipped) {
+    noteParts.push(`PayUNi 續期未停：${String(payuniStop.message || '').slice(0, 80)}`);
+  }
+
+  const subscription = await prisma.cardSubscription.update({
     where: { id },
     data: {
       status: 'CANCELLED',
-      lastError: reason ? String(reason).slice(0, 200) : '手動取消',
+      lastError: noteParts.join('｜').slice(0, 200),
     },
   });
+  return { subscription, payuniStop };
 }
 
-export async function pauseCardSubscription(id) {
+export async function pauseCardSubscription(id, { stopPayuni = true, forceLocalOnly = false } = {}) {
   const sub = await prisma.cardSubscription.findUnique({ where: { id } });
   if (!sub) {
     const err = new Error('找不到訂閱');
@@ -473,13 +996,44 @@ export async function pauseCardSubscription(id) {
     err.statusCode = 400;
     throw err;
   }
-  return prisma.cardSubscription.update({
+
+  let payuniStop = { ok: true, skipped: true };
+  if (stopPayuni) {
+    try {
+      payuniStop = await stopPayuniRecurringForSubscription(sub, { mode: 'suspend' });
+    } catch (e) {
+      payuniStop = { ok: false, message: e.message || '暫停 PayUNi 續期失敗' };
+    }
+    if (!payuniStop.ok && !payuniStop.skipped && !forceLocalOnly) {
+      const err = new Error(
+        payuniStop.message ||
+          'PayUNi 續期排程尚未暫停，本機訂閱未暫停（避免顯示已停卻仍扣款）',
+      );
+      err.statusCode = 409;
+      err.payuniStop = payuniStop;
+      throw err;
+    }
+  }
+
+  const subscription = await prisma.cardSubscription.update({
     where: { id },
-    data: { status: 'PAUSED' },
+    data: {
+      status: 'PAUSED',
+      lastError:
+        payuniStop?.ok && !payuniStop.skipped
+          ? '已暫停（含 PayUNi 續期）'
+          : payuniStop && !payuniStop.ok && !payuniStop.skipped
+            ? `本機已暫停；PayUNi：${String(payuniStop.message || '').slice(0, 120)}`
+            : null,
+    },
   });
+  return { subscription, payuniStop };
 }
 
-export async function resumeCardSubscription(id, { now = new Date() } = {}) {
+export async function resumeCardSubscription(
+  id,
+  { now = new Date(), resumePayuni = true, forceLocalOnly = false } = {},
+) {
   const sub = await prisma.cardSubscription.findUnique({ where: { id } });
   if (!sub) {
     const err = new Error('找不到訂閱');
@@ -492,17 +1046,48 @@ export async function resumeCardSubscription(id, { now = new Date() } = {}) {
     throw err;
   }
   if (sub.periodTimes > 0 && sub.chargedCount >= sub.periodTimes) {
-    return prisma.cardSubscription.update({
+    const subscription = await prisma.cardSubscription.update({
       where: { id },
       data: { status: 'COMPLETED' },
     });
+    return { subscription, payuniResume: { ok: true, skipped: true, message: '期數已滿' } };
   }
+
+  let payuniResume = { ok: true, skipped: true };
+  if (resumePayuni) {
+    try {
+      payuniResume = await resumePayuniRecurringForSubscription(sub);
+    } catch (e) {
+      payuniResume = { ok: false, message: e.message || '恢復 PayUNi 續期失敗' };
+    }
+    if (!payuniResume.ok && !payuniResume.skipped && !forceLocalOnly) {
+      const err = new Error(
+        payuniResume.message ||
+          'PayUNi 續期未能啟用，本機訂閱未恢復（避免顯示已恢復卻不扣款）',
+      );
+      err.statusCode = 409;
+      err.payuniResume = payuniResume;
+      throw err;
+    }
+  }
+
   const next =
     sub.nextChargeAt > now ? sub.nextChargeAt : computeNextChargeAt(sub.periodType, now);
-  return prisma.cardSubscription.update({
+  const subscription = await prisma.cardSubscription.update({
     where: { id },
-    data: { status: 'ACTIVE', nextChargeAt: next, failCount: 0, lastError: null },
+    data: {
+      status: 'ACTIVE',
+      nextChargeAt: next,
+      failCount: 0,
+      lastError:
+        payuniResume?.ok && !payuniResume.skipped
+          ? '已恢復（含 PayUNi 續期）'
+          : payuniResume && !payuniResume.ok && !payuniResume.skipped
+            ? `本機已恢復；PayUNi：${String(payuniResume.message || '').slice(0, 120)}`
+            : null,
+    },
   });
+  return { subscription, payuniResume };
 }
 
 let schedulerTimer = null;

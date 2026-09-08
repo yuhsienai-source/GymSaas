@@ -21,6 +21,14 @@ model Branch {
   /// 員工端關聯顯示用代碼（如 HP）；會員介面仍用 name
   code        String?   @unique
   address     String?     // 👈 補上這個欄位 (加上 ? 代表允許為空，避免影響舊資料)
+  /// 場館介紹（文字）
+  introText   String?     @db.Text
+  /// 場館介紹圖片 URL 陣列
+  introImages Json?
+  /// 場館介紹影片 URL 陣列
+  introVideos Json?
+  /// 是否對外顯示即時人數
+  showOccupancy Boolean   @default(true)
   /// 折讓單／發票列印抬頭（營業人名稱）；未設則回退環境變數或「體育客」
   invoiceSellerName String?
   /// 折讓單抬頭統編（8 碼）
@@ -50,6 +58,9 @@ model Branch {
   ptContracts     PTContract[]
   memberBranches  MemberBranch[]
   gateDevices     GateDevice[]
+  announcements   Announcement[]
+  faqItems        FaqItem[]
+  memberGroups    MemberGroup[]
 }
 
 model Venue {
@@ -62,6 +73,7 @@ model Venue {
   classes     Class[]
   classSeries ClassSeries[]
   stations    VenueStation[]
+  bookings    VenueBooking[]
 }
 
 // 場地站點：教練排課時可再選細項訓練位置
@@ -110,8 +122,10 @@ model Member {
   /// 請假結束時間；非空且 now < leaveUntil → 禁止以無限／月費通行進場（效期已於請假開始時預先順延）
   leaveUntil DateTime?
 
-  cashWallet  Float          @default(0.0) // 真金白銀
-  bonusWallet Float          @default(0.0) // 贈送的運動金
+  /// 真金白銀（DB CHECK >= 0；見 prisma/sql/gate_concurrency.sql）
+  cashWallet  Float          @default(0.0)
+  /// 贈送運動金（DB CHECK >= 0）
+  bonusWallet Float          @default(0.0)
 
   // 【新增】防弊與社群登入綁定
   lineId          String?      @unique // LINE 唯一授權碼 (可選綁定)
@@ -124,7 +138,21 @@ model Member {
   /// 會員已於自助／櫃檯回答過是否啟用人臉（舊會員登入須先回答才進綁定）
   facePreferenceSet Boolean    @default(false)
   papagoFaceId    String?      @unique // PAPAGO Face8 人臉特徵 ID (臨櫃註冊綁定)
+  /// 警示帳號 (防弊：若為 true 則強制人工查驗)
   isAlert         Boolean      @default(false) // 警示帳號 (防弊：若為 true 則強制人工查驗)
+
+  email           String?
+  /// 身分證／居留證／護照（開卡／自助註冊必填；舊資料可空。外國客可填居留證或護照）
+  idNumber        String?      @unique
+  /// M | F | OTHER
+  gender          String?
+  birthDate       DateTime?
+  /// 證件正面照片 API 路徑標記（實際檔在 uploads/id-photos）
+  idPhotoUrl      String?
+  /// 證件反面照片 API 路徑標記
+  idPhotoBackUrl  String?
+  /// 團體課點數課餘額
+  pointsBalance   Int          @default(0)
 
   // createdAt 欄位，型態是時間。紀錄這個會員是什麼時候建立的。
   // @default(now()) 會在資料寫入的瞬間，自動抓取當下的時間，這是現代 SaaS 系統的標配欄位。
@@ -144,10 +172,108 @@ model Member {
   memberLeaves      MemberLeave[]
   contractSignatures MemberContractSignature[]
   phoneOtps         PhoneOtp[]
+  emailOtps         EmailOtp[]
+  deviceAuditLogs   MemberDeviceAuditLog[]
   /// 會員綁定分店（進出場須符合綁定場館；AC↔HP 可互進）
   branches          MemberBranch[]
   /// 總部合規補償異動日誌
   hqCompensationLogs HqCompensationLog[]
+  memberGroupMembers MemberGroupMember[]
+  memberNotes        MemberNote[]
+  classLeaves        ClassLeave[]
+  makeupRegistrations MakeupRegistration[]
+  trainingRecords    TrainingRecord[]
+  selfTrainingPlans  SelfTrainingPlan[]
+  venueBookings      VenueBooking[]
+  familyCardMembers  FamilyCardMember[]
+  memberPointsLedger MemberPointsLedger[]
+  lotteryEntries     LotteryEntry[]
+  inBodyVouchers     InBodyVoucher[]
+  giftCardsPurchased GiftCard[] @relation("GiftCardPurchaser")
+  giftCardsRedeemed  GiftCard[] @relation("GiftCardRedeemer")
+  paymentBlacklist   PaymentBlacklist?
+  notificationLogs   NotificationLog[]
+  classAttendances   ClassAttendance[]
+  idPhotos           MemberIdPhoto[]
+  idPhotoDeleteRequests IdPhotoDeleteRequest[]
+  idPhotoAccessLogs  IdPhotoAccessLog[]
+}
+
+/// 會員證件版本（正／反面；現行＋歷史；實際檔在本機或 R2）
+model MemberIdPhoto {
+  id             String    @id // MIDP…
+  memberId       Int
+  member         Member    @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  /// front | back
+  side           String
+  storageKey     String
+  contentHash    String?
+  byteSize       Int
+  mimeType       String    @default("image/jpeg")
+  isCurrent      Boolean   @default(true)
+  supersededAt   DateTime?
+  /// 歷史版：supersededAt + 1 年後可硬刪
+  versionPurgeAt DateTime?
+  /// 會籍結束基準 + 3 年（現行檔保存上限）
+  retentionUntil DateTime
+  legalHold      Boolean   @default(false)
+  deletedAt      DateTime?
+  createdAt      DateTime  @default(now())
+  /// 臨櫃代辦：上傳員工（Staff JWT）
+  uploadedByStaffId Int?
+  uploadBranchId    Int?
+  /// MEMBER_SELF | STAFF_USB_SCANNER | ONBOARDING
+  uploadSource      String?
+  consentSignatureId String?
+  /// 後端補壓浮水印雜湊（稽核）
+  watermarkHash     String?
+
+  @@index([memberId, side, isCurrent])
+  @@index([versionPurgeAt])
+  @@index([retentionUntil])
+  @@index([deletedAt])
+}
+
+/// 會員申請清除證件（須櫃檯核准後才刪）
+model IdPhotoDeleteRequest {
+  id              String    @id // IPDR…
+  memberId        Int
+  member          Member    @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  /// front | back | both
+  side            String
+  reason          String?
+  /// PENDING | APPROVED | REJECTED | CANCELLED
+  status          String    @default("PENDING")
+  requestedAt     DateTime  @default(now())
+  resolvedAt      DateTime?
+  resolverStaffId Int?
+  resolveNote     String?
+
+  @@index([memberId, status])
+  @@index([status, requestedAt])
+}
+
+/// 證件存取／異動稽核（append-only）
+model IdPhotoAccessLog {
+  id            String   @id // IPAL…
+  memberId      Int
+  member        Member   @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  photoId       String?
+  side          String?
+  /// UPLOAD | VIEW_MEMBER | VIEW_STAFF | DELETE_REQUEST | DELETE_APPROVE | DELETE_REJECT | DELETE_CANCEL | PURGE | SUPERSEDE
+  action        String
+  /// MEMBER | STAFF | SYSTEM
+  actorType     String
+  actorStaffId  Int?
+  actorMemberId Int?
+  detail        Json?
+  ipAddress     String?
+  userAgent     String?  @db.Text
+  createdAt     DateTime @default(now())
+
+  @@index([memberId, createdAt])
+  @@index([action, createdAt])
+  @@index([actorStaffId, createdAt])
 }
 
 /// 會員 ↔ 分店綁定（進出場閘機驗證）
@@ -175,6 +301,44 @@ model PhoneOtp {
   member     Member?   @relation(fields: [memberId], references: [id], onDelete: SetNull)
 
   @@index([phone, purpose, createdAt])
+}
+
+/** Email OTP（登入／註冊／換機；code 僅存 hash，禁明碼入庫／日誌） */
+model EmailOtp {
+  id         Int       @id @default(autoincrement())
+  email      String
+  codeHash   String
+  purpose    String    // LOGIN | REGISTER | DEVICE_RESET
+  expiresAt  DateTime
+  consumedAt DateTime?
+  attempts   Int       @default(0)
+  createdAt  DateTime  @default(now())
+  memberId   Int?
+  member     Member?   @relation(fields: [memberId], references: [id], onDelete: SetNull)
+
+  @@index([email, purpose, createdAt])
+  @@index([memberId, purpose, createdAt])
+}
+
+/// 裝置綁定／換機稽核（append-only）
+model MemberDeviceAuditLog {
+  id          Int      @id @default(autoincrement())
+  memberId    Int
+  member      Member   @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  operatorId  Int?
+  /// OPS_BIND | OPS_UNBIND | ADMIN_RESET | SELF_SWITCH
+  action      String
+  oldDeviceId String?
+  newDeviceId String?
+  oldDav      Int      @default(0)
+  newDav      Int      @default(0)
+  reason      String?
+  ip          String?
+  userAgent   String?
+  createdAt   DateTime @default(now())
+
+  @@index([memberId, createdAt])
+  @@index([action, createdAt])
 }
 
 // 2. 全新新增的進出場紀錄表
@@ -220,6 +384,8 @@ model CheckInLog {
   @@index([memberId, status, checkOutAt])
   /// 容留／在場列表：status=ACTIVE AND checkOutAt IS NULL
   @@index([status, checkOutAt])
+  /// Partial unique（Prisma 無法表達）：uniq_active_member_checkin
+  /// ON ("memberId") WHERE status='ACTIVE' AND checkOutAt IS NULL → npm run db:constraints
 }
 
 /// 進出場閘機／掃碼裝置（綁定分店；憑 deviceKey 驗證，不可由前端任意選店）
@@ -265,9 +431,13 @@ model Promotion {
   /// 無限使用：有效天數＝unitDays × periodCount（購案延長用）
   durationDays Int?
   requiresMemberContract Boolean @default(false) // 需簽署會員合約
-  enableCardRecurring    Boolean @default(false) // 啟用信用卡定期定額（無限使用：每期＝price、總期數＝periodCount）
-  /// 定期定額每期金額（啟用時後端強制＝price）
+  enableCardRecurring    Boolean @default(false) // 啟用信用卡定期定額（無限使用：首期＝price、後續＝recurringAmount、總期數＝periodCount）
+  /// 定期定額後續扣款金額（可與首期 price 不同；啟用時必填）
   recurringAmount        Float?
+  /// PayUNi 續期 Hash · 臨櫃（商店後台「串接資訊」；空則用 PAYUNI_PERIOD_HASH／HASHES）
+  payuniPeriodHash       String?
+  /// PayUNi 續期 Hash · 會員線上（空則用 PAYUNI_PERIOD_HASH_ONLINE／HASHES …:online）
+  payuniPeriodHashOnline String?
   price       Float     // 實際要收取的現金 (500)；COMPENSATION 強制 0
   bonusGiven  Float     // TIMED：贈送運動金；UNLIMITED 固定 0（不入錢包）；COMPENSATION 必須 > 0
   isActive    Boolean   @default(true) // 上下架狀態 (老闆隨時可停賣)
@@ -291,6 +461,8 @@ model CoursePlan {
   /// SALE＝可售方案｜COMPENSATION＝客訴補償課程（price 必須 0；禁出現在櫃檯／POS 購案）
   kind        String    @default("SALE")
   planType    String    // CUSTOM_PT(客製化私教) | GROUP(團體課程)
+  /// 團體課子類：SERIES(期班) | POINTS(點數) | UNLIMITED_PASS(吃到飽) | PACKAGE(包班)；私教可空
+  groupClassKind String?
   planMode    String    @default("STANDING") // STANDING(長註) | CAMPAIGN(活動檔期)
   saleStartAt DateTime?
   saleEndAt   DateTime?
@@ -308,6 +480,10 @@ model CoursePlan {
   recurringAmount4    Float?
   /// 4 期方案：第4期扣款金額
   recurringAmountFinal Float?
+  /// PayUNi 續期 Hash · 臨櫃（商店後台「串接資訊」；空則用 PAYUNI_PERIOD_HASH／HASHES）
+  payuniPeriodHash     String?
+  /// PayUNi 續期 Hash · 會員線上（空則用 PAYUNI_PERIOD_HASH_ONLINE／HASHES …:online）
+  payuniPeriodHashOnline String?
   /// 是否提供「課程第二人+$500(課程當日現場支付)」選項（結帳不入應付金額）
   enableSecondPerson Boolean @default(false)
   /// 加贈禮名稱；入購物車／訂單快照，金額 $0
@@ -462,6 +638,10 @@ model Trainer {
   name        String
   /// 對外顯示名稱（會員／LINE／公開介面）；預設匿名
   displayName String    @default("匿名")
+  /// 教練對外簡介（會員端教練介紹）
+  bio         String?   @db.Text
+  /// 教練照片 URL
+  photoUrl    String?
   phone       String    @unique
   role        String    @default("NORMAL") // NORMAL(一般教練), MANAGER(主管教練)
   isActive    Boolean   @default(true)
@@ -475,6 +655,12 @@ model Trainer {
   branches    TrainerBranch[] // 該教練可授課的分店
   timeOffs    TrainerTimeOff[]
   consultGuests ConsultGuest[]
+  trainingRecords TrainingRecord[]
+  selfTrainingPlans SelfTrainingPlan[]
+  commissionRules CoachCommissionRule[]
+  commissionLedger CoachCommissionLedger[]
+  googleCalendarLink GoogleCalendarLink?
+  venueBookings VenueBooking[]
 }
 
 // 教練排休／不可預約時段（會員與排課需避開）
@@ -596,6 +782,9 @@ model Class {
   capacity Int @default(1)
 
   reservations Reservation[]
+  attendances  ClassAttendance[]
+  checkInTokens ClassCheckInToken[]
+  makeupSlots  MakeupSlot[]
 
   @@index([seriesId])
   @@index([trainerId, startAt])
@@ -617,6 +806,9 @@ model Reservation {
   source         String        @default("TRAINER")
   bookedAt       DateTime      @default(now())
 
+  classLeave     ClassLeave?
+  attendance     ClassAttendance?
+
   @@index([classId, status])
   @@index([memberId, status])
   @@index([consultGuestId])
@@ -637,6 +829,7 @@ model ConsultGuest {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
   reservations Reservation[]
+  allocations  ConsultAllocation[]
 
   @@unique([trainerId, phone])
   @@index([phone])
@@ -672,6 +865,8 @@ model Order {
   status        String   @default("PENDING") // 狀態：PENDING, PAID, FAILED
   merchantNo    String?  // 統一金流端產生的交易序號
   invoiceNumber String?  // ezPay 回傳的電子發票字軌號碼
+  /// PENDING | ISSUED | FAILED | SKIPPED（非同步開票佇列）
+  invoiceStatus String?
   /// 合併結帳工作階段（CHK…）
   checkoutSessionId String?
   createdAt     DateTime @default(now())
@@ -717,6 +912,8 @@ model CardSubscription {
   lastChargeAt   DateTime?
   failCount      Int      @default(0)
   lastError      String?
+  /// 每月扣款日（1–28）；null＝依 periodType 天數遞延
+  chargeDayOfMonth Int?
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
   charges        CardSubscriptionCharge[]
@@ -746,6 +943,9 @@ model MemberLeave {
   /// ACTIVE=請假中 | ENDED=已結束（含提早銷假）| CANCELLED=作廢
   status             String    @default("ACTIVE")
   reason             String?
+  /// 請假證明物件 storageKey（local／R2，非公開 URL）
+  proofStorageKey    String?
+  proofFileName      String?
   staffId            Int?
   createdAt          DateTime  @default(now())
   endedAt            DateTime?
@@ -858,6 +1058,8 @@ model SaleOrder {
   itemDesc      String
   merchantNo    String?
   invoiceNumber String?
+  /// PENDING | ISSUED | FAILED | SKIPPED
+  invoiceStatus String?
   carrierNum    String? // 發票載具（手機條碼／自然人憑證）
   buyerUbn      String? // 公司統編（B2B）
   loveCode      String? // 發票捐贈碼（愛心碼）
@@ -896,6 +1098,8 @@ model CheckoutSession {
   recurringAmount Float?
   /// 最末期扣款金額（課程 4 期）
   recurringAmountFinal Float?
+  /// 結帳當下選定的 PayUNi 續期 Hash（方案欄或 env map）
+  payuniPeriodHash String?
   creditHash      String?
   carrierNum      String?
   buyerUbn        String?
@@ -903,6 +1107,8 @@ model CheckoutSession {
   status          String   @default("PENDING") // PENDING | PAID | FAILED | CANCELLED
   merchantNo      String?
   invoiceNumber   String?
+  /// PENDING | ISSUED | FAILED | SKIPPED
+  invoiceStatus   String?
   saleOrderId     String?  @unique
   orderId         String?  @unique
   /// 私教課程購物車快照：[{ coursePlanId, name, qty, unitPrice, lineTotal, sessions, totalSessions, branchId }]
@@ -993,6 +1199,10 @@ model Staff {
   trainerProfile Trainer?
 
   hqCompensationLogs HqCompensationLog[]
+  staffAttendances StaffAttendance[]
+  staffLeaves      StaffLeave[]
+  staffSchedules   StaffSchedule[]
+  memberNotes      MemberNote[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -1058,3 +1268,563 @@ model ShiftHandover {
   @@index([branchId, startedAt])
   @@index([branchId, slot, startedAt])
 }
+
+// ==========================================
+// 8. CMS／內容（公告、FAQ、留言）
+// ==========================================
+model Announcement {
+  id          Int      @id @default(autoincrement())
+  branchId    Int?
+  branch      Branch?  @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  title       String
+  body        String   @db.Text
+  /// ACTIVITY | CLOSURE | GENERAL
+  category    String   @default("GENERAL")
+  pushEnabled Boolean  @default(false)
+  publishedAt DateTime @default(now())
+  expiresAt   DateTime?
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([isActive, publishedAt])
+  @@index([branchId, isActive])
+}
+
+model FaqItem {
+  id        Int      @id @default(autoincrement())
+  branchId  Int?
+  branch    Branch?  @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  category  String   @default("GENERAL")
+  question  String
+  answer    String   @db.Text
+  sortOrder Int      @default(0)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  @@index([branchId, isActive, sortOrder])
+}
+
+model ContactMessage {
+  id        Int      @id @default(autoincrement())
+  name      String
+  email     String?
+  phone     String?
+  message   String   @db.Text
+  /// NEW | READ | REPLIED
+  status    String   @default("NEW")
+  staffNote String?
+  createdAt DateTime @default(now())
+  repliedAt DateTime?
+
+  @@index([status, createdAt])
+}
+
+// ==========================================
+// 9. 會員群組、備註、黑名單
+// ==========================================
+model MemberGroup {
+  id          Int      @id @default(autoincrement())
+  branchId    Int?
+  branch      Branch?  @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  name        String
+  description String?
+  createdAt   DateTime @default(now())
+
+  members MemberGroupMember[]
+
+  @@index([branchId])
+}
+
+model MemberGroupMember {
+  memberId Int
+  groupId  Int
+  member   Member      @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  group    MemberGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+
+  @@id([memberId, groupId])
+}
+
+model MemberNote {
+  id        Int      @id @default(autoincrement())
+  memberId  Int
+  member    Member   @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  staffId   Int?
+  staff     Staff?   @relation(fields: [staffId], references: [id], onDelete: SetNull)
+  content   String   @db.Text
+  /// STAFF_ONLY | SHARED
+  visibility String  @default("SHARED")
+  createdAt DateTime @default(now())
+
+  @@index([memberId, createdAt])
+}
+
+model PaymentBlacklist {
+  id        Int      @id @default(autoincrement())
+  memberId  Int      @unique
+  member    Member   @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  reason    String
+  note      String?
+  staffId   Int?
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  clearedAt DateTime?
+
+  @@index([isActive])
+}
+
+// ==========================================
+// 10. 課程請假、補課、簽到
+// ==========================================
+model ClassLeave {
+  id             Int          @id @default(autoincrement())
+  memberId       Int
+  member         Member       @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  reservationId  Int          @unique
+  reservation    Reservation  @relation(fields: [reservationId], references: [id], onDelete: Cascade)
+  reason         String?
+  /// PENDING | APPROVED | REJECTED
+  status         String       @default("PENDING")
+  /// 是否依規定請假（false → 扣課／扣點）
+  withinPolicy   Boolean      @default(true)
+  deductedSessions Int        @default(0)
+  deductedPoints   Int        @default(0)
+  staffId        Int?
+  createdAt      DateTime     @default(now())
+
+  @@index([memberId, status])
+}
+
+model MakeupSlot {
+  id          Int      @id @default(autoincrement())
+  classId     Int
+  class       Class    @relation(fields: [classId], references: [id], onDelete: Cascade)
+  capacity    Int      @default(1)
+  notifySent  Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  registrations MakeupRegistration[]
+
+  @@index([classId])
+}
+
+model MakeupRegistration {
+  id            Int        @id @default(autoincrement())
+  memberId      Int
+  member        Member     @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  makeupSlotId  Int
+  makeupSlot    MakeupSlot @relation(fields: [makeupSlotId], references: [id], onDelete: Cascade)
+  /// 原缺席預約 id（可空）
+  originalReservationId Int?
+  status        String     @default("REGISTERED")
+  createdAt     DateTime   @default(now())
+
+  @@unique([memberId, makeupSlotId])
+  @@index([makeupSlotId])
+}
+
+model ClassCheckInToken {
+  id        Int      @id @default(autoincrement())
+  classId   Int
+  class     Class    @relation(fields: [classId], references: [id], onDelete: Cascade)
+  token     String   @unique
+  /// PRIVATE_COACH | GROUP_VENUE
+  kind      String   @default("GROUP_VENUE")
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([classId, expiresAt])
+}
+
+model ClassAttendance {
+  id             Int          @id @default(autoincrement())
+  classId        Int
+  class          Class        @relation(fields: [classId], references: [id], onDelete: Cascade)
+  reservationId  Int          @unique
+  reservation    Reservation  @relation(fields: [reservationId], references: [id], onDelete: Cascade)
+  memberId       Int?
+  member         Member?      @relation(fields: [memberId], references: [id], onDelete: SetNull)
+  checkedInAt    DateTime     @default(now())
+  /// QR | STAFF
+  method         String       @default("QR")
+
+  @@index([classId, checkedInAt])
+}
+
+// ==========================================
+// 11. 訓練紀錄、場地預約、諮詢分配
+// ==========================================
+model TrainingRecord {
+  id        Int      @id @default(autoincrement())
+  memberId  Int
+  member    Member   @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  trainerId Int
+  trainer   Trainer  @relation(fields: [trainerId], references: [id], onDelete: Cascade)
+  title     String
+  content   Json?
+  sharedAt  DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([memberId, createdAt])
+  @@index([trainerId])
+}
+
+model SelfTrainingPlan {
+  id        Int      @id @default(autoincrement())
+  memberId  Int
+  member    Member   @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  trainerId Int?
+  trainer   Trainer? @relation(fields: [trainerId], references: [id], onDelete: SetNull)
+  title     String
+  exercises Json?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([memberId])
+}
+
+model VenueBooking {
+  id        Int      @id @default(autoincrement())
+  venueId   Int
+  venue     Venue    @relation(fields: [venueId], references: [id], onDelete: Cascade)
+  stationId Int?
+  memberId  Int?
+  member    Member?  @relation(fields: [memberId], references: [id], onDelete: SetNull)
+  trainerId Int?
+  trainer   Trainer? @relation(fields: [trainerId], references: [id], onDelete: SetNull)
+  startAt   DateTime
+  endAt     DateTime
+  status    String   @default("CONFIRMED")
+  note      String?
+  createdAt DateTime @default(now())
+
+  @@index([venueId, startAt])
+  @@index([trainerId, startAt])
+}
+
+model ConsultAllocation {
+  id             Int          @id @default(autoincrement())
+  consultGuestId Int
+  consultGuest   ConsultGuest @relation(fields: [consultGuestId], references: [id], onDelete: Cascade)
+  trainerId      Int
+  /// AUTO | MANUAL
+  assignMode     String       @default("MANUAL")
+  staffId        Int?
+  note           String?
+  createdAt      DateTime     @default(now())
+
+  @@index([consultGuestId])
+  @@index([trainerId])
+}
+
+// ==========================================
+// 12. 教練拆帳
+// ==========================================
+model CoachCommissionRule {
+  id          Int      @id @default(autoincrement())
+  trainerId   Int?
+  trainer     Trainer? @relation(fields: [trainerId], references: [id], onDelete: Cascade)
+  /// PRIVATE | GROUP
+  courseKind  String   @default("PRIVATE")
+  /// PERFORMANCE | HOURLY | PER_HEAD
+  payModel    String   @default("PERFORMANCE")
+  baseSalary  Float    @default(0)
+  /// 階段百分比 JSON：[{ minRevenue, rate }]
+  tierRates   Json?
+  /// 固定鐘點費（HOURLY）
+  hourlyRate  Float?
+  /// 人頭抽成（PER_HEAD）
+  perHeadRate Float?
+  /// 扣除：刷卡手續費率、發票稅率等
+  deductRates Json?
+  /// 考核分數影響係數
+  scoreFactor Json?
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+
+  @@index([trainerId, courseKind])
+}
+
+model CoachCommissionLedger {
+  id          String   @id // CCL...
+  trainerId   Int
+  trainer     Trainer  @relation(fields: [trainerId], references: [id], onDelete: Cascade)
+  periodStart DateTime
+  periodEnd   DateTime
+  grossAmount Float
+  deductions  Float    @default(0)
+  netAmount   Float
+  detail      Json?
+  createdAt   DateTime @default(now())
+
+  @@index([trainerId, periodStart])
+}
+
+// ==========================================
+// 13. 員工考勤／請假／排班
+// ==========================================
+model StaffAttendance {
+  id        Int      @id @default(autoincrement())
+  staffId   Int
+  staff     Staff    @relation(fields: [staffId], references: [id], onDelete: Cascade)
+  branchId  Int?
+  punchIn   DateTime
+  punchOut  DateTime?
+  note      String?
+  createdAt DateTime @default(now())
+
+  @@index([staffId, punchIn])
+}
+
+model StaffLeave {
+  id        Int      @id @default(autoincrement())
+  staffId   Int
+  staff     Staff    @relation(fields: [staffId], references: [id], onDelete: Cascade)
+  startAt   DateTime
+  endAt     DateTime
+  reason    String?
+  proofUrl  String?
+  /// PENDING | APPROVED | REJECTED
+  status    String   @default("PENDING")
+  createdAt DateTime @default(now())
+
+  @@index([staffId, status])
+}
+
+model StaffSchedule {
+  id        Int      @id @default(autoincrement())
+  staffId   Int
+  staff     Staff    @relation(fields: [staffId], references: [id], onDelete: Cascade)
+  branchId  Int?
+  startAt   DateTime
+  endAt     DateTime
+  /// SHIFT | OFF
+  slotType  String   @default("SHIFT")
+  note      String?
+  createdAt DateTime @default(now())
+
+  @@index([staffId, startAt])
+  @@index([branchId, startAt])
+}
+
+// ==========================================
+// 14. 行銷／CRM
+// ==========================================
+model MarketingCampaign {
+  id          Int      @id @default(autoincrement())
+  name        String
+  /// DORMANT_BALANCE | DORMANT_VISIT | NO_RENEW | UNUSED_SESSIONS | POST_CONSULT
+  segment     String
+  message     String   @db.Text
+  scheduledAt DateTime?
+  sentAt      DateTime?
+  status      String   @default("DRAFT")
+  createdAt   DateTime @default(now())
+
+  pushLogs PushCampaignLog[]
+
+  @@index([status, scheduledAt])
+}
+
+model PushCampaignLog {
+  id         Int               @id @default(autoincrement())
+  campaignId Int
+  campaign   MarketingCampaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  memberId   Int
+  channel    String            @default("LINE")
+  status     String            @default("SENT")
+  sentAt     DateTime          @default(now())
+
+  @@index([campaignId])
+  @@index([memberId])
+}
+
+model ReferralOffer {
+  id            Int      @id @default(autoincrement())
+  name          String
+  discountPct   Float?
+  discountAmt   Float?
+  referrerBonus Float?
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+}
+
+model AddOnOffer {
+  id          Int      @id @default(autoincrement())
+  name        String
+  productId   Int?
+  price       Float
+  minCartAmt  Float?
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+}
+
+model MemberPointsLedger {
+  id        Int      @id @default(autoincrement())
+  memberId  Int
+  member    Member   @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  delta     Int
+  balance   Int
+  reason    String
+  refType   String?
+  refId     String?
+  createdAt DateTime @default(now())
+
+  @@index([memberId, createdAt])
+}
+
+model GiftCard {
+  id           String   @id // GFC...
+  purchaserId  Int?
+  purchaser    Member?  @relation("GiftCardPurchaser", fields: [purchaserId], references: [id], onDelete: SetNull)
+  redeemerId   Int?
+  redeemer     Member?  @relation("GiftCardRedeemer", fields: [redeemerId], references: [id], onDelete: SetNull)
+  amount       Float
+  code         String   @unique
+  status       String   @default("ACTIVE")
+  expiresAt    DateTime?
+  redeemedAt   DateTime?
+  createdAt    DateTime @default(now())
+
+  @@index([status])
+}
+
+model FamilyCard {
+  id        Int      @id @default(autoincrement())
+  name      String
+  ownerId   Int
+  promotionId Int?
+  maxMembers Int     @default(4)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  members FamilyCardMember[]
+}
+
+model FamilyCardMember {
+  familyCardId Int
+  memberId     Int
+  familyCard   FamilyCard @relation(fields: [familyCardId], references: [id], onDelete: Cascade)
+  member       Member     @relation(fields: [memberId], references: [id], onDelete: Cascade)
+
+  @@id([familyCardId, memberId])
+}
+
+model LotteryPool {
+  id        Int      @id @default(autoincrement())
+  name      String
+  drawAt    DateTime?
+  status    String   @default("OPEN")
+  createdAt DateTime @default(now())
+
+  entries LotteryEntry[]
+}
+
+model LotteryEntry {
+  id        Int         @id @default(autoincrement())
+  poolId    Int
+  pool      LotteryPool @relation(fields: [poolId], references: [id], onDelete: Cascade)
+  memberId  Int
+  member    Member      @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  note      String?
+  createdAt DateTime    @default(now())
+
+  @@unique([poolId, memberId])
+}
+
+model InBodyVoucher {
+  id        Int      @id @default(autoincrement())
+  memberId  Int
+  member    Member   @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  code      String   @unique
+  status    String   @default("ACTIVE")
+  redeemedAt DateTime?
+  createdAt DateTime @default(now())
+
+  @@index([memberId, status])
+}
+
+model GoogleCalendarLink {
+  id           Int      @id @default(autoincrement())
+  trainerId    Int      @unique
+  trainer      Trainer  @relation(fields: [trainerId], references: [id], onDelete: Cascade)
+  calendarId   String?
+  accessToken  String?  @db.Text
+  refreshToken String?  @db.Text
+  syncEnabled  Boolean  @default(false)
+  updatedAt    DateTime @updatedAt
+}
+
+model NotificationLog {
+  id        Int      @id @default(autoincrement())
+  memberId  Int?
+  member    Member?  @relation(fields: [memberId], references: [id], onDelete: SetNull)
+  channel   String   // EMAIL | LINE | PUSH
+  kind      String   // PAYMENT | REMINDER | BOOKING | INVOICE | CONTRACT
+  subject   String?
+  body      String?  @db.Text
+  status    String   @default("SENT")
+  createdAt DateTime @default(now())
+
+  @@index([memberId, createdAt])
+  @@index([kind, createdAt])
+}
+
+/// 乙禾端末成功暫存（confirm 前斷線 → 日結對帳）
+model YipayTerminalCapture {
+  id          String    @id // YCAP…
+  /// ORDER | SALE | CHECKOUT
+  targetType  String
+  targetId    String
+  amount      Float
+  rrn         String?
+  authCode    String?
+  cardLast4   String?
+  branchId    Int?
+  staffId     Int?
+  terminalRef String?
+  /// PENDING_CONFIRM | CONFIRMED | ORPHAN | VOIDED
+  status      String    @default("PENDING_CONFIRM")
+  raw         Json?
+  confirmedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([status, createdAt])
+  @@index([targetType, targetId])
+  @@index([rrn])
+  @@index([branchId, createdAt])
+}
+
+/// ezPay 開票非同步任務（分腿可重試；CHK 開票失敗不沖回已收款）
+model InvoiceIssueJob {
+  id            String   @id @default(cuid())
+  /// CHECKOUT | ORDER | SALE
+  refType       String
+  /// CHK… / TYK… / SAL… / CRS…
+  refId         String
+  /// SALE | PROMO | PT | ORDER | ALL
+  leg           String
+  amount        Float
+  itemDesc      String
+  buyerName     String?
+  carrierNum    String?
+  buyerUbn      String?
+  loveCode      String?
+  /// 來源合併結帳（稽核／回寫 SPLIT）
+  checkoutId    String?
+  /// PENDING | SUCCESS | FAILED
+  status        String   @default("PENDING")
+  retryCount    Int      @default(0)
+  lastError     String?
+  invoiceNumber String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@unique([refId, leg])
+  @@index([status, retryCount])
+  @@index([refId])
+  @@index([checkoutId, status])
+}
+

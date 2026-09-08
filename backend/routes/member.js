@@ -3,8 +3,9 @@ import express from 'express';
 import prisma from '../lib/prisma.js';
 import { verifyMember, verifyMemberDevice } from '../middleware/jwtAuth.js';
 import { signGateQrToken, QR_TTL_MS } from '../lib/qrToken.js';
-import { buildCardCheckoutRequest, parseCardPayOptions } from '../lib/payuni.js';
-import { assertPromotionSellable, promotionSellablePrismaWhere, buildTopupItemDesc } from '../lib/promotion.js';
+import { buildCardCheckoutRequest, parseCardPayOptions, resolvePayuniPeriodHash } from '../lib/payuni.js';
+import { requestLinePayOnlinePayment } from '../lib/linepay.js';
+import { assertPromotionSellable, promotionSellablePrismaWhere, buildTopupItemDesc, resolvePromotionRecurringAmount } from '../lib/promotion.js';
 import {
   assertMemberSignedPromotionContracts,
   assertMemberSignedNewMemberContract,
@@ -32,6 +33,8 @@ import {
   memberTokenDeviceOpts,
   readRequestDeviceId,
 } from '../lib/memberDevice.js';
+import { throwDeviceMismatchResetRequired, deviceResetErrorBody } from '../lib/deviceReset.js';
+import memberMarketingRoutes from './memberMarketing.js';
 
 const router = express.Router();
 
@@ -59,6 +62,11 @@ function serializeMemberProfile(member) {
     hasLineBound: Boolean(member.lineId),
     hasDeviceBound: Boolean(member.deviceId),
     createdAt: member.createdAt,
+    idPhotoUrl: member.idPhotoUrl || null,
+    idPhotoBackUrl: member.idPhotoBackUrl || null,
+    email: member.email || null,
+    gender: member.gender || null,
+    birthDate: member.birthDate || null,
     /** 綁定分店（正式名稱，會員端顯示） */
     branches,
     branchLabel: branches.length ? branches.map((b) => b.name).join('、') : null,
@@ -82,6 +90,11 @@ const PROFILE_SELECT = {
   lineId: true,
   deviceId: true,
   createdAt: true,
+  idPhotoUrl: true,
+  idPhotoBackUrl: true,
+  email: true,
+  gender: true,
+  birthDate: true,
   branches: {
     include: {
       branch: { select: { id: true, name: true, code: true, isActive: true } },
@@ -92,6 +105,7 @@ const PROFILE_SELECT = {
 // 整包海關：以下所有路由必須持有 type: 'member' JWT，且本機裝置須吻合綁定
 router.use(verifyMember);
 router.use(verifyMemberDevice);
+router.use('/marketing', memberMarketingRoutes);
 
 // ==========================================
 // 1. 會員個人檔案
@@ -211,19 +225,16 @@ router.post('/bind-device', async (req, res) => {
       return res.status(404).json({ status: 'error', message: '找不到該會員' });
     }
     await assertMemberReadyToBind(member);
-    if (!member.lineId) {
-      return res.status(400).json({
-        status: 'error',
-        message: '請先綁定 LINE（綁定 LINE 時會一併綁定本機裝置）',
-      });
-    }
     if (member.deviceId && member.deviceId !== deviceId) {
-      return res.status(403).json({
-        status: 'error',
-        message: '此帳號已綁定其他裝置，請洽櫃檯解除後再綁定',
-      });
+      try {
+        await throwDeviceMismatchResetRequired(member);
+      } catch (mismatchErr) {
+        return res
+          .status(mismatchErr.statusCode || 403)
+          .json(deviceResetErrorBody(mismatchErr));
+      }
     }
-    const bindPatch = deviceBindUpdateIfChanged(member.deviceId, deviceId);
+    const bindPatch = deviceBindUpdateIfChanged(member.deviceId, deviceId, memberId);
     const updated = bindPatch
       ? await prisma.member.update({
           where: { id: memberId },
@@ -355,6 +366,8 @@ async function handleGenerateQr(req, res) {
       return res.status(error.statusCode).json({
         status: 'error',
         message: error.message,
+        ...(error.code ? { code: error.code } : {}),
+        ...(error.memberId != null ? { memberId: error.memberId } : {}),
       });
     }
     console.error(error);
@@ -582,14 +595,15 @@ router.get('/promotions', async (req, res) => {
 });
 
 // ==========================================
-// 6. 會員自助線上儲值（PayUNi UPP）
-// POST /api/member/orders  Body: { promotionId }
+// 6. 會員自助線上儲值（PayUNi 刷卡 或 LinePay Online）
+// POST /api/member/orders  Body: { promotionId, payMethod?: CARD|LINEPAY, … }
 // 嚴禁任意 amount；memberId 只從 JWT 取
 // ==========================================
 router.post('/orders', async (req, res) => {
   const memberId = req.user.memberId;
   const {
     promotionId,
+    payMethod,
     cardMode,
     cardInst,
     periodType,
@@ -609,12 +623,20 @@ router.post('/orders', async (req, res) => {
     return res.status(400).json({
       status: 'error',
       message:
-        '⛔ 非法參數：線上訂單只允許 promotionId、cardMode、cardInst、periodType、periodTimes；金額由後端查 Promotion 決定，身分只認 JWT',
+        '⛔ 非法參數：線上訂單只允許 promotionId、payMethod、cardMode、cardInst、periodType、periodTimes；金額由後端查 Promotion 決定，身分只認 JWT',
     });
   }
 
   if (promotionId === undefined) {
     return res.status(400).json({ status: 'error', message: '參數錯誤：必須提供 promotionId' });
+  }
+
+  const payMethodNorm = String(payMethod || 'CARD').toUpperCase();
+  if (!['CARD', 'LINEPAY'].includes(payMethodNorm)) {
+    return res.status(400).json({
+      status: 'error',
+      message: 'payMethod 僅支援 CARD（PayUNi）或 LINEPAY（線上付款）',
+    });
   }
 
   try {
@@ -637,6 +659,68 @@ router.post('/orders', async (req, res) => {
       return res.status(404).json({ status: 'error', message: '找不到該會員' });
     }
 
+    if (payMethodNorm === 'LINEPAY') {
+      if (cardMode && String(cardMode).toUpperCase() === 'RECURRING') {
+        return res.status(400).json({
+          status: 'error',
+          message: 'LinePay 線上付款不支援定期定額，請改用刷卡',
+        });
+      }
+
+      const orderId = resolveTopupOrderId({
+        cardMode: 'LUMP',
+        promotion,
+      });
+      const newOrder = await prisma.order.create({
+        data: {
+          id: orderId,
+          memberId,
+          amount: promotion.price,
+          itemDesc: buildTopupItemDesc(promotion, '線上'),
+          payMethod: 'LINEPAY',
+          payBreakdown: { LINEPAY: promotion.price },
+          cardAmount: 0,
+          cardMode: 'LUMP',
+          status: 'PENDING',
+        },
+      });
+
+      let lp;
+      try {
+        lp = await requestLinePayOnlinePayment({
+          orderId: newOrder.id,
+          amount: newOrder.amount,
+          productName: newOrder.itemDesc,
+          client: 'member',
+        });
+      } catch (lpErr) {
+        await prisma.order.update({
+          where: { id: newOrder.id },
+          data: { status: 'CANCELLED' },
+        });
+        throw lpErr;
+      }
+      await prisma.order.update({
+        where: { id: newOrder.id },
+        data: { merchantNo: `LP:${lp.transactionId}` },
+      });
+
+      return res.json({
+        status: 'success',
+        message: '訂單建立成功，請完成 LinePay 線上付款',
+        data: {
+          payMethod: 'LINEPAY',
+          linePayMode: 'ONLINE',
+          paymentUrl: lp.paymentUrl,
+          transactionId: lp.transactionId,
+          orderId: newOrder.id,
+          promotionId: promotion.id,
+          amount: promotion.price,
+          bonusGiven: promotion.bonusGiven,
+        },
+      });
+    }
+
     let cardOpts;
     try {
       cardOpts = parseCardPayOptions(
@@ -645,6 +729,25 @@ router.post('/orders', async (req, res) => {
       );
     } catch (error) {
       return res.status(error.statusCode || 400).json({ status: 'error', message: error.message });
+    }
+
+    let recurringAmount = null;
+    if (cardOpts.cardMode === 'RECURRING') {
+      const periodCount = parseInt(promotion.periodCount, 10);
+      if (!Number.isInteger(periodCount) || periodCount <= 0) {
+        return res.status(400).json({
+          status: 'error',
+          message: '此儲值方案未設定有效期期數，無法使用定期定額',
+        });
+      }
+      cardOpts.periodTimes = periodCount;
+      recurringAmount = resolvePromotionRecurringAmount(promotion);
+      if (!recurringAmount) {
+        return res.status(400).json({
+          status: 'error',
+          message: '此儲值方案未設定定期定額扣款金額',
+        });
+      }
     }
 
     const orderId = resolveTopupOrderId({
@@ -663,6 +766,7 @@ router.post('/orders', async (req, res) => {
         cardInst: cardOpts.cardInst,
         periodType: cardOpts.periodType,
         periodTimes: cardOpts.periodTimes,
+        recurringAmount,
         status: 'PENDING',
       },
     });
@@ -675,14 +779,18 @@ router.post('/orders', async (req, res) => {
       cardInst: cardOpts.cardInst,
       periodType: cardOpts.periodType,
       periodTimes: cardOpts.periodTimes,
-      periodAmt: newOrder.amount,
-      recurringAmount: newOrder.amount,
+      periodAmt: recurringAmount ?? newOrder.amount,
+      recurringAmount: recurringAmount ?? newOrder.amount,
+      payuniPeriodHash: resolvePayuniPeriodHash({ channel: 'online', promotion }),
+      channel: 'online',
+      promotion,
     });
 
     res.json({
       status: 'success',
       message: '訂單建立成功，準備導向金流',
       data: {
+        payMethod: 'CARD',
         actionUrl,
         payload: payuniPayload,
         orderId: newOrder.id,

@@ -13,9 +13,11 @@ import {
   parseTopupQtyFromItemDesc,
   computeTopupAmount,
   isUnlimitedPromotion,
+  resolvePromotionRecurringAmount,
   resolveRecurringPeriodDays,
   remainingExpireDays,
   buildRecurringInvoiceItemDesc,
+  UNLIMITED_MEMBER_PLAN,
 } from '../lib/promotion.js';
 import {
   assertMemberSignedPromotionContracts,
@@ -43,13 +45,25 @@ import {
   verifyWebhookHash,
   parseCardPayOptions,
   extractCardTradeMeta,
+  isPayuniNotifySuccess,
+  resolvePayuniOrderRef,
+  resolvePayuniPeriodHash,
+  resolveBindCreditHash,
+  maybeCancelBindVerifyAuth,
 } from '../lib/payuni.js';
 import {
   createSubscriptionFromPaidOrder,
+  ensureSubscriptionForPaidRecurringOrder,
   processDueSubscriptions,
   cancelCardSubscription,
   pauseCardSubscription,
   resumeCardSubscription,
+  applyCardSubscriptionCreditUpdate,
+  buildSubscriptionRebindRequest,
+  toRebindStatusView,
+  REBIND_PENDING_MARKER,
+  repairPlaceholderNextChargeAts,
+  syncPeriodNextChargeAtsFromPayuni,
 } from '../lib/cardSubscription.js';
 import {
   settleCancelSubscription,
@@ -88,6 +102,7 @@ import {
 import { issueInvoice, normalizeInvoiceOptions } from '../lib/ezpay.js';
 import {
   appendInvoiceReverseNote,
+  assertRealInvoiceForAllowance,
   executeInvoiceReverse,
   resolveOrderInvoiceReverse,
   resolveSaleInvoiceReverse,
@@ -95,7 +110,7 @@ import {
   reevaluateCheckoutSessionStatus,
   prorateCheckoutWalletCash,
 } from '../lib/ezpayReverse.js';
-import { allocateUniqueMemberNo } from '../lib/memberNo.js';
+import { allocateUniqueMemberNo, isValidMemberNo } from '../lib/memberNo.js';
 import { registerFace } from '../lib/papago.js';
 import {
   identifyMember,
@@ -105,8 +120,16 @@ import {
 } from '../lib/memberIdentify.js';
 import { setMemberBranches, listMemberBranches } from '../lib/memberBranch.js';
 import { deviceBindUpdateData, deviceBindUpdateIfChanged } from '../lib/memberDevice.js';
-import { posPayReturnRedirect, topupPayReturnRedirect, checkoutPayReturnRedirect } from '../lib/frontendUrl.js';
+import { opsResetMemberDevice } from '../lib/deviceReset.js';
+import {
+  clientIp,
+  clientUserAgent,
+} from '../lib/memberDeviceAudit.js';
+import { normalizeEmail } from '../lib/emailOtp.js';
+import { assertRequiredIdNumber } from '../lib/deviceReset.js';
+import { posPayReturnRedirect, topupPayReturnRedirect, checkoutPayReturnRedirect, payReturnRedirect } from '../lib/frontendUrl.js';
 import { fulfillCardSaleOrder, restockSaleStock } from '../lib/inventory.js';
+import { confirmLinePayPayment, payLinePayPosWithOneTimeKey } from '../lib/linepay.js';
 import { broadcastOccupancy } from '../lib/occupancy.js';
 import {
   processCheckOut,
@@ -114,9 +137,18 @@ import {
   checkOutSuccessPayload,
 } from '../lib/gateCheckout.js';
 import { fulfillCheckoutSession, runOpsCheckout } from '../lib/checkout.js';
+import { confirmYipayCheckout, confirmYipayOrder, confirmYipaySale } from '../lib/yipay.js';
+import { reconcileYipayDay } from '../lib/yipayCapture.js';
+import { listInvoiceJobs, retryInvoiceJob } from '../lib/invoiceQueue.js';
 import { resolveTopupOrderId } from '../lib/orderIds.js';
 import { formatGateAccessNo, resolveGateLogId } from '../lib/gateAccessNo.js';
 import { cancelPtPurchase } from '../lib/ptCancel.js';
+import {
+  getIdPhotoMetaForMember,
+  normalizeIdPhotoSide,
+  redeemLocalIdPhotoAccessToken,
+  uploadMemberIdPhoto,
+} from '../lib/idPhoto.js';
 
 
 
@@ -126,6 +158,132 @@ const router = express.Router();
 // 🚨 【金流 Webhook 中樞】(必須放在 verifyStaff 上方)
 // 網址：POST /api/ops/payuni/webhook
 // ==========================================
+
+/** 續期收款 Notify 的 MerTradeNo 常非本系統單號：以金額＋近期 PENDING RECURRING 回填 */
+async function resolvePendingRecurringOrderRef(tradeData, preferredRef) {
+  if (preferredRef && /^(CHK|SAL|CRS|TYK|CRC)/i.test(String(preferredRef))) {
+    return preferredRef;
+  }
+  const amt = Number(
+    tradeData?.AuthAmt ?? tradeData?.FAmt ?? tradeData?.TradeAmt ?? NaN,
+  );
+  if (!Number.isFinite(amt) || amt <= 0) return preferredRef;
+
+  const since = new Date(Date.now() - 6 * 60 * 60 * 1000);
+  const session = await prisma.checkoutSession.findFirst({
+    where: {
+      status: 'PENDING',
+      cardMode: 'RECURRING',
+      createdAt: { gte: since },
+      OR: [{ cardAmount: amt }, { amount: amt }],
+    },
+    orderBy: { createdAt: 'desc' },
+  });
+  if (session) {
+    console.warn(
+      `[PayUNi] 續期 Notify MerTradeNo=${tradeData?.MerTradeNo} → PENDING CHK ${session.id}（$${amt}）`,
+    );
+    return session.id;
+  }
+
+  const order = await prisma.order.findFirst({
+    where: {
+      status: 'PENDING',
+      cardMode: 'RECURRING',
+      createdAt: { gte: since },
+      amount: amt,
+    },
+    orderBy: { createdAt: 'desc' },
+  });
+  if (order) {
+    console.warn(
+      `[PayUNi] 續期 Notify MerTradeNo=${tradeData?.MerTradeNo} → PENDING 訂單 ${order.id}（$${amt}）`,
+    );
+    return order.id;
+  }
+  return preferredRef;
+}
+
+/**
+ * 乙禾已 PAID 後的續期「僅約定」Notify：
+ * PayUNi 常覆寫 MerTradeNo／ProdDesc，且可能無 CreditHash（僅 PeriodTradeNo）。
+ * 以 PeriodAmt＋近期「已入帳、尚未寫入約定」的 CHK／訂單／換卡訂閱對應。
+ */
+async function resolvePaidRecurringBindRef(tradeData, preferredRef) {
+  if (preferredRef && /^(CHK|SAL|CRS|TYK|CRC)/i.test(String(preferredRef))) {
+    return preferredRef;
+  }
+  const hasPeriodSignal =
+    Boolean(tradeData?.PeriodTradeNo) ||
+    Boolean(tradeData?.CreditHash) ||
+    Boolean(tradeData?.CreditToken) ||
+    String(tradeData?.ResCode || '') === '00';
+  if (!hasPeriodSignal) return preferredRef;
+
+  const periodAmt = Number(tradeData?.PeriodAmt ?? NaN);
+  const since = new Date(Date.now() - 6 * 60 * 60 * 1000);
+  const unboundHash = {
+    OR: [{ creditHash: null }, { creditHash: '' }],
+  };
+
+  const session = await prisma.checkoutSession.findFirst({
+    where: {
+      status: 'PAID',
+      cardMode: 'RECURRING',
+      createdAt: { gte: since },
+      AND: [unboundHash],
+      ...(Number.isFinite(periodAmt) && periodAmt > 0
+        ? { recurringAmount: periodAmt }
+        : {}),
+    },
+    orderBy: { updatedAt: 'desc' },
+  });
+  if (session) {
+    console.warn(
+      `[PayUNi] 續期約定 Notify MerTradeNo=${tradeData?.MerTradeNo} → PAID CHK ${session.id}` +
+        (Number.isFinite(periodAmt) ? `（PeriodAmt=$${periodAmt}）` : ''),
+    );
+    return session.id;
+  }
+
+  const order = await prisma.order.findFirst({
+    where: {
+      status: 'PAID',
+      cardMode: 'RECURRING',
+      createdAt: { gte: since },
+      AND: [unboundHash],
+      ...(Number.isFinite(periodAmt) && periodAmt > 0
+        ? { OR: [{ recurringAmount: periodAmt }, { amount: periodAmt }] }
+        : {}),
+    },
+    orderBy: { updatedAt: 'desc' },
+  });
+  if (order) {
+    const ref = order.checkoutSessionId || order.id;
+    console.warn(
+      `[PayUNi] 續期約定 Notify MerTradeNo=${tradeData?.MerTradeNo} → PAID 訂單 ${order.id} → ${ref}`,
+    );
+    return ref;
+  }
+
+  const sub = await prisma.cardSubscription.findFirst({
+    where: {
+      lastError: REBIND_PENDING_MARKER,
+      updatedAt: { gte: since },
+      ...(Number.isFinite(periodAmt) && periodAmt > 0 ? { amount: periodAmt } : {}),
+    },
+    orderBy: { updatedAt: 'desc' },
+  });
+  if (sub) {
+    console.warn(
+      `[PayUNi] 續期約定 Notify MerTradeNo=${tradeData?.MerTradeNo} → 換卡訂閱 ${sub.id}`,
+    );
+    return sub.id;
+  }
+
+  return preferredRef;
+}
+
 router.post('/payuni/webhook', async (req, res) => {
   const { EncryptInfo, HashInfo } = req.body;
 
@@ -144,16 +302,81 @@ router.post('/payuni/webhook', async (req, res) => {
     const tradeData = decryptInfo(EncryptInfo);
     console.log("📥 收到統一金流 Webhook 解密資料:", tradeData);
     
-    // Status="SUCCESS" 且 TradeStatus="1" 才代表真正付款成功
-    if (tradeData.Status === 'SUCCESS' && tradeData.TradeStatus === '1') {
-      const orderId = tradeData.MerTradeNo;
+    // UPP：Status+TradeStatus；續期收款：常無 TradeStatus，改看 ResCode／AuthAmt
+    if (!isPayuniNotifySuccess(tradeData)) {
+      console.warn(
+        `[PayUNi] Notify 未視為成功入帳 Status=${tradeData.Status} TradeStatus=${tradeData.TradeStatus} ResCode=${tradeData.ResCode}`,
+      );
+      return res.status(200).send('OK');
+    }
 
-      // 3a. 合併結帳（CHK…）
+    let orderId = resolvePayuniOrderRef(tradeData);
+    orderId = await resolvePendingRecurringOrderRef(tradeData, orderId);
+    orderId = await resolvePaidRecurringBindRef(tradeData, orderId);
+
+    if (!orderId) {
+      console.error('[PayUNi] Notify 成功但無法解析本系統單號', {
+        MerTradeNo: tradeData.MerTradeNo,
+        ProdDesc: tradeData.ProdDesc,
+        PeriodTradeNo: tradeData.PeriodTradeNo,
+        PeriodAmt: tradeData.PeriodAmt,
+      });
+      return res.status(200).send('OK');
+    }
+
+    // 3.0 訂閱換卡／補綁：ProdDesc／MerTradeNo 指向 CardSubscription（CRS…）
+    {
+      const subHit = await prisma.cardSubscription.findUnique({
+        where: { id: String(orderId) },
+      });
+      if (subHit) {
+        const cardMeta = extractCardTradeMeta(tradeData);
+        try {
+          const updated = await applyCardSubscriptionCreditUpdate(subHit.id, {
+            creditHash: resolveBindCreditHash(cardMeta, tradeData),
+            periodTradeNo: cardMeta.periodTradeNo || tradeData.PeriodTradeNo,
+          });
+          if (updated) {
+            console.log(`✅ 訂閱 ${subHit.id} 換卡／補綁 Notify 已回寫約定（CreditHash／PeriodTradeNo）`);
+          } else {
+            console.warn(
+              `[PayUNi] 訂閱 ${subHit.id} Notify 成功但無 CreditHash／PeriodTradeNo 可寫`,
+            );
+          }
+        } catch (rebindErr) {
+          console.error(`❌ 訂閱 ${subHit.id} 換卡回寫失敗:`, rebindErr.message);
+        }
+        try {
+          await maybeCancelBindVerifyAuth(tradeData);
+        } catch (voidErr) {
+          console.error(`[PayUNi] 訂閱 ${subHit.id} 驗卡取消授權例外:`, voidErr.message);
+        }
+        return res.status(200).send('OK');
+      }
+    }
+
+    // 3a. 合併結帳（CHK…）
       if (String(orderId || '').startsWith('CHK')) {
         const cardMeta = extractCardTradeMeta(tradeData);
-        const fulfilled = await fulfillCheckoutSession(orderId, tradeData.TradeNo, cardMeta);
-        if (fulfilled) {
-          console.log(`✅ 合併結帳 ${orderId} 刷卡入帳成功`);
+        try {
+          const fulfilled = await fulfillCheckoutSession(
+            orderId,
+            tradeData.TradeNo || tradeData.PeriodTradeNo,
+            cardMeta,
+          );
+          if (fulfilled) {
+            console.log(`✅ 合併結帳 ${orderId} 刷卡入帳成功`);
+          }
+        } catch (chkErr) {
+          console.error(
+            `❌ 合併結帳 ${orderId} 入帳／開票失敗（已沖回業務單據；刷卡款請人工退）：`,
+            chkErr.message,
+          );
+        }
+        try {
+          await maybeCancelBindVerifyAuth(tradeData);
+        } catch (voidErr) {
+          console.error(`[PayUNi] CHK ${orderId} 驗卡取消授權例外:`, voidErr.message);
         }
         return res.status(200).send('OK');
       }
@@ -161,18 +384,56 @@ router.post('/payuni/webhook', async (req, res) => {
       // 3b. POS 銷貨（SAL…）
       if (String(orderId || '').startsWith('SAL')) {
         const cardMeta = extractCardTradeMeta(tradeData);
-        const fulfilled = await fulfillCardSaleOrder(orderId, tradeData.TradeNo, null, cardMeta);
-        if (fulfilled) {
-          console.log(`✅ 銷貨 ${orderId} 刷卡入帳＋扣庫成功`);
+        try {
+          const fulfilled = await fulfillCardSaleOrder(orderId, tradeData.TradeNo, null, cardMeta);
+          if (fulfilled) {
+            console.log(`✅ 銷貨 ${orderId} 刷卡入帳＋扣庫成功`);
+          }
+        } catch (salErr) {
+          console.error(
+            `❌ 銷貨 ${orderId} 入帳／開票失敗（已沖回；刷卡款請人工退）：`,
+            salErr.message,
+          );
         }
         return res.status(200).send('OK');
       }
 
-      // 3c. 儲值 Order
+      // 3c. 儲值／購案 Order（CRS／TYK…）
       const order = await prisma.order.findUnique({ 
         where: { id: orderId },
-        include: { member: true }
+        include: { member: true },
       });
+
+      // 合併結帳子單：一律走 CHK fulfill（避免 Order 已 PAID、Session 仍 PENDING、訂閱未建）
+      if (order?.checkoutSessionId && String(order.checkoutSessionId).startsWith('CHK')) {
+        const cardMeta = extractCardTradeMeta(tradeData);
+        try {
+          const fulfilled = await fulfillCheckoutSession(
+            order.checkoutSessionId,
+            tradeData.TradeNo || tradeData.PeriodTradeNo,
+            cardMeta,
+          );
+          if (fulfilled) {
+            console.log(
+              `✅ 合併結帳 ${order.checkoutSessionId}（經訂單 ${orderId}）刷卡入帳成功`,
+            );
+          }
+        } catch (chkErr) {
+          console.error(
+            `❌ 合併結帳 ${order.checkoutSessionId} 入帳失敗：`,
+            chkErr.message,
+          );
+        }
+        try {
+          await maybeCancelBindVerifyAuth(tradeData);
+        } catch (voidErr) {
+          console.error(
+            `[PayUNi] CHK ${order.checkoutSessionId} 驗卡取消授權例外:`,
+            voidErr.message,
+          );
+        }
+        return res.status(200).send('OK');
+      }
 
       if (order && order.status === 'PENDING') {
         // 從 itemDesc 解析商品 ID（格式：... | 商品#123）
@@ -188,7 +449,7 @@ router.post('/payuni/webhook', async (req, res) => {
             where: { id: orderId },
             data: {
               status: 'PAID',
-              merchantNo: tradeData.TradeNo,
+              merchantNo: tradeData.TradeNo || tradeData.PeriodTradeNo || order.merchantNo,
               ...(cardMeta.creditHash ? { creditHash: cardMeta.creditHash } : {}),
               ...(cardMeta.cardInst ? { cardInst: cardMeta.cardInst } : {}),
             },
@@ -222,50 +483,93 @@ router.post('/payuni/webhook', async (req, res) => {
             await createSubscriptionFromPaidOrder(paidOrder, {
               promotion: promotionForSub,
               creditHash: cardMeta.creditHash || paidOrder?.creditHash,
+              periodTradeNo: cardMeta.periodTradeNo || tradeData.PeriodTradeNo,
+              dateList: cardMeta.dateList || tradeData.DateList || null,
             });
           } catch (subErr) {
             console.error(`❌ 訂單 ${orderId} 建立定期定額訂閱失敗:`, subErr.message);
           }
         }
 
-        // 🚀 觸發 ezPay 開立電子發票（含刷卡時預存的手機載具）
+        // 開立電子發票；失敗則沖回履約並標 FAILED（刷卡款須人工退）
         try {
-          const isRecurringInvoice =
-            String(order.cardMode || '').toUpperCase() === 'RECURRING';
-          let invoiceItemDesc = order.itemDesc;
-          if (isRecurringInvoice) {
-            const promoMatch = String(order.itemDesc || '').match(/\| ([^|]+) \| UNLIMITED/);
-            const promoName =
-              promoMatch?.[1]?.trim() ||
-              String(order.itemDesc || '')
-                .split('|')[1]
-                ?.trim() ||
-              '月卡';
-            invoiceItemDesc = buildRecurringInvoiceItemDesc(promoName, { periodIndex: 1 });
-          }
-          const invoiceResult = await issueInvoice({
-            id: orderId,
-            amount: order.amount,
-            itemDesc: invoiceItemDesc,
-            buyerName: order.member.name,
-            carrierNum: order.carrierNum || null,
-            buyerUbn: order.buyerUbn || null,
-            loveCode: order.loveCode || null,
-          });
-
-          if (invoiceResult.Status === 'SUCCESS') {
-            const invoiceData = JSON.parse(invoiceResult.Result);
-            await prisma.order.update({
-              where: { id: orderId },
-              data: { invoiceNumber: invoiceData.InvoiceNumber },
-            });
-            console.log(`🧾 訂單 ${orderId} 發票開立成功：${invoiceData.InvoiceNumber}`);
-          } else {
-            console.error(`❌ 訂單 ${orderId} 發票開立失敗！ezPay 拒絕原因：`, invoiceResult.Message || invoiceResult);
-          }
+          await tryIssueOrderInvoice(order, order.member.name);
         } catch (invoiceError) {
-          console.error(`❌ 訂單 ${orderId} 發票模組發生例外錯誤:`, invoiceError.message);
+          console.error(`❌ 訂單 ${orderId} 發票失敗，沖回交易:`, invoiceError.message);
+          try {
+            const promoMatch = (order.itemDesc || '').match(/商品#(\d+)/);
+            const promotionId = promoMatch ? parseInt(promoMatch[1], 10) : null;
+            await prisma.$transaction(async (tx) => {
+              const paid = await tx.order.findUnique({ where: { id: orderId } });
+              if (!paid || paid.status !== 'PAID') return;
+              if (promotionId) {
+                const promotion = await tx.promotion.findUnique({ where: { id: promotionId } });
+                const member = await tx.member.findUnique({ where: { id: paid.memberId } });
+                if (promotion && member) {
+                  if (isUnlimitedPromotion(promotion)) {
+                    const days = promotion.durationDays || 0;
+                    let nextExpire = member.expireDate ? new Date(member.expireDate) : null;
+                    if (nextExpire && days > 0) nextExpire.setDate(nextExpire.getDate() - days);
+                    const stillValid = nextExpire && nextExpire.getTime() > Date.now();
+                    await tx.member.update({
+                      where: { id: member.id },
+                      data: {
+                        expireDate: stillValid ? nextExpire : null,
+                        plan: stillValid ? member.plan || UNLIMITED_MEMBER_PLAN : '計時會員',
+                      },
+                    });
+          } else {
+                    const qty = parseTopupQtyFromItemDesc(paid.itemDesc) || 1;
+                    const cash = promotion.price * qty;
+                    const bonus = promotion.bonusGiven * qty;
+                    await tx.member.update({
+                      where: { id: member.id },
+                      data: {
+                        cashWallet: {
+                          decrement: Math.min(cash, Number(member.cashWallet) || 0),
+                        },
+                        bonusWallet: {
+                          decrement: Math.min(bonus, Number(member.bonusWallet) || 0),
+                        },
+                      },
+                    });
+                  }
+                }
+              }
+              await tx.order.update({
+                where: { id: orderId },
+                data: {
+                  status: 'FAILED',
+                  invoiceNumber: null,
+                  itemDesc: `${paid.itemDesc || ''}｜電子發票開立失敗，交易取消`.slice(0, 500),
+                },
+              });
+            });
+            console.error(
+              `⚠️ 訂單 ${orderId} 因開票失敗已標 FAILED；PayUNi 刷卡款請人工退款（TradeNo=${tradeData.TradeNo}）`,
+            );
+          } catch (abortErr) {
+            console.error(`訂單 ${orderId} 開票失敗後沖回例外:`, abortErr.message);
+          }
         }
+      } else if (
+        order &&
+        order.status === 'PAID' &&
+        String(order.cardMode || '').toUpperCase() === 'RECURRING'
+      ) {
+        // 舊 Notify／無 CreditHash 時可能已入帳卻未建訂閱 → 補建
+        const cardMeta = extractCardTradeMeta(tradeData);
+        try {
+          const sub = await ensureSubscriptionForPaidRecurringOrder(order, {
+            creditHash: cardMeta.creditHash || order.creditHash,
+            periodTradeNo: cardMeta.periodTradeNo || tradeData.PeriodTradeNo,
+            dateList: cardMeta.dateList || tradeData.DateList || null,
+          });
+          if (sub) {
+            console.log(`🔁 訂單 ${orderId} 已補建／確認定期定額訂閱 ${sub.id}`);
+          }
+        } catch (subErr) {
+          console.error(`❌ 訂單 ${orderId} 補建定期定額失敗:`, subErr.message);
       }
     }
 
@@ -388,6 +692,151 @@ function handlePayuniBrowserReturn(req, res) {
 
 router.post('/payuni/return', handlePayuniBrowserReturn);
 router.get('/payuni/return', handlePayuniBrowserReturn);
+
+// ==========================================
+// LinePay Confirm／Cancel（公開；須在 verifyStaff 之前）
+// ConfirmURL 帶 transactionId + orderId（= MerTradeNo / CHK…）
+// ==========================================
+async function handleLinePayConfirm(req, res) {
+  try {
+    const q = { ...(req.query || {}), ...(req.body || {}) };
+    const transactionId = String(q.transactionId || '').trim();
+    const orderId = String(q.orderId || '').trim();
+    if (!transactionId || !orderId) {
+      return res.status(400).json({ status: 'error', message: '缺少 transactionId 或 orderId' });
+    }
+
+    let redirectTarget = checkoutPayReturnRedirect({ checkoutId: orderId });
+
+    if (orderId.startsWith('CHK')) {
+      const session = await prisma.checkoutSession.findUnique({ where: { id: orderId } });
+      if (!session) {
+        return res.status(404).json({ status: 'error', message: '找不到結帳單' });
+      }
+      const bd =
+        session.payBreakdown && typeof session.payBreakdown === 'object'
+          ? session.payBreakdown
+          : {};
+      const amount = Math.round(Number(bd.LINEPAY || session.amount));
+      await confirmLinePayPayment({ transactionId, amount });
+      await fulfillCheckoutSession(orderId, `LP:${transactionId}`, null);
+      redirectTarget = checkoutPayReturnRedirect({ checkoutId: orderId });
+    } else if (orderId.startsWith('SAL')) {
+      const sale = await prisma.saleOrder.findUnique({ where: { id: orderId } });
+      if (!sale) {
+        return res.status(404).json({ status: 'error', message: '找不到銷貨單' });
+      }
+      const bd =
+        sale.payBreakdown && typeof sale.payBreakdown === 'object' ? sale.payBreakdown : {};
+      const amount = Math.round(Number(bd.LINEPAY || sale.amount));
+      await confirmLinePayPayment({ transactionId, amount });
+      await fulfillCardSaleOrder(orderId, `LP:${transactionId}`, null, null);
+      redirectTarget = posPayReturnRedirect({ saleId: orderId });
+    } else {
+      const order = await prisma.order.findUnique({ where: { id: orderId } });
+      if (!order) {
+        return res.status(404).json({ status: 'error', message: '找不到訂單' });
+      }
+      const bd =
+        order.payBreakdown && typeof order.payBreakdown === 'object' ? order.payBreakdown : {};
+      const amount = Math.round(Number(bd.LINEPAY || order.amount));
+      await confirmLinePayPayment({ transactionId, amount });
+      if (order.status === 'PENDING') {
+        const promoMatch = (order.itemDesc || '').match(/商品#(\d+)/);
+        const promotionId = promoMatch ? parseInt(promoMatch[1], 10) : null;
+        await prisma.$transaction(async (tx) => {
+          await tx.order.update({
+            where: { id: orderId },
+            data: { status: 'PAID', merchantNo: `LP:${transactionId}` },
+          });
+          if (promotionId) {
+            const promotion = await tx.promotion.findUnique({ where: { id: promotionId } });
+            if (promotion) {
+              const qty = parseTopupQtyFromItemDesc(order.itemDesc);
+              await fulfillPromotionPurchase(tx, order.memberId, promotion, { qty });
+            }
+          }
+        });
+        const paid = await prisma.order.findUnique({ where: { id: orderId } });
+        const member = paid
+          ? await prisma.member.findUnique({ where: { id: paid.memberId } })
+          : null;
+        if (paid && member) {
+          await tryIssueOrderInvoice(paid, member.name);
+        }
+      }
+      const client = String(q.client || '').toLowerCase();
+      redirectTarget =
+        client === 'member'
+          ? payReturnRedirect({ orderId })
+          : topupPayReturnRedirect({ orderId });
+    }
+
+    return res.redirect(302, redirectTarget);
+  } catch (error) {
+    console.error('[LinePay] confirm 失敗:', error);
+    return res.status(500).json({
+      status: 'error',
+      message: error.message || 'LinePay 確認失敗',
+    });
+  }
+}
+
+async function handleLinePayCancel(req, res) {
+  const q = { ...(req.query || {}), ...(req.body || {}) };
+  const orderId = String(q.orderId || '').trim();
+  const client = String(q.client || '').toLowerCase();
+  try {
+    let target;
+    if (client === 'member') {
+      target = payReturnRedirect(orderId ? { orderId } : {});
+    } else if (orderId.startsWith('CHK')) {
+      target = checkoutPayReturnRedirect({ checkoutId: orderId });
+    } else if (orderId.startsWith('SAL')) {
+      target = posPayReturnRedirect({ saleId: orderId });
+    } else if (orderId) {
+      target = topupPayReturnRedirect({ orderId });
+    } else {
+      target = checkoutPayReturnRedirect({});
+    }
+    const u = new URL(target);
+    u.searchParams.set('pay', 'cancelled');
+    return res.redirect(302, u.toString());
+  } catch (error) {
+    console.error('[LinePay] cancel 導向失敗:', error);
+    return res.status(500).json({ status: 'error', message: error.message });
+  }
+}
+
+router.get('/linepay/confirm', handleLinePayConfirm);
+router.post('/linepay/confirm', handleLinePayConfirm);
+router.get('/linepay/cancel', handleLinePayCancel);
+router.post('/linepay/cancel', handleLinePayCancel);
+
+/**
+ * 短效證件調閱兌換（無 Staff JWT；token 即憑證）
+ * GET /api/ops/id-photo-access/:token
+ */
+router.get('/id-photo-access/:token', async (req, res) => {
+  try {
+    const file = await redeemLocalIdPhotoAccessToken(req.params.token, req);
+    res.setHeader('Content-Type', file.contentType || 'image/jpeg');
+    res.setHeader('Content-Disposition', 'inline');
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    return res.send(file.buf);
+  } catch (error) {
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({
+        status: 'error',
+        code: error.code,
+        message: error.message,
+      });
+    }
+    console.error(error);
+    return res.status(500).json({ status: 'error', message: '調閱失敗' });
+  }
+});
 
 // 所有 ops.js 內的路由，強制通過員工海關驗證
 // 交易異動（退費／取消／訂閱請假）限 DUTY 以上；其餘限櫃檯模組
@@ -553,17 +1002,34 @@ async function tryIssueOrderInvoice(order, buyerName) {
       console.log(`🧾 訂單 ${order.id} 發票：${invoiceData.InvoiceNumber}`);
       return invoiceData.InvoiceNumber;
     }
-    console.error(`❌ 訂單 ${order.id} 發票失敗:`, invoiceResult.Message || invoiceResult);
-    return null;
+    const message = invoiceResult.Message || String(invoiceResult);
+    console.error(`❌ 訂單 ${order.id} 發票失敗:`, message);
+    const err = new Error(`電子發票開立失敗：${message}`);
+    err.statusCode = 502;
+    throw err;
   } catch (error) {
+    if (error.statusCode) throw error;
     console.error(`❌ 訂單 ${order.id} 發票例外:`, error.message);
-    return null;
+    const err = new Error(`電子發票開立失敗：${error.message}`);
+    err.statusCode = 502;
+    throw err;
   }
 }
 
 // ==========================================
 // 信用卡定期定額訂閱管理
 // ==========================================
+
+function assertSubscriptionBranchAccess(req, sub) {
+  const branchId = sub?.promotion?.branchId ?? sub?.coursePlan?.branchId ?? null;
+  if (branchId == null) {
+    if (isAdminUser(req.user)) return;
+    const err = new Error('⛔ 訂閱缺少分店綁定，請洽管理員');
+    err.statusCode = 403;
+    throw err;
+  }
+  assertBranchAccess(req, branchId);
+}
 
 /**
  * 以訂閱編號或訂單編號解析 CardSubscription
@@ -608,7 +1074,7 @@ async function resolveSubscriptionByRef(ref, { include } = {}) {
       if (byCharge) return { sub: byCharge, message: null };
     }
 
-    // 4) 訂單存在但無訂閱（一次付清／現金月卡）
+    // 4) 訂單存在但無訂閱列
     const order = await prisma.order.findUnique({
       where: { id: raw },
       select: {
@@ -620,18 +1086,53 @@ async function resolveSubscriptionByRef(ref, { include } = {}) {
         amount: true,
         invoiceNumber: true,
         payMethod: true,
+        creditHash: true,
+        recurringAmount: true,
+        recurringAmountFinal: true,
+        periodType: true,
+        periodTimes: true,
+        cardAmount: true,
+        merchantNo: true,
       },
     });
     if (order) {
       const isRecurring = String(order.cardMode || '').toUpperCase() === 'RECURRING';
-      if (isUnlimitedTopupOrder(order.itemDesc) && !isRecurring) {
+      if (isUnlimitedTopupOrder(order.itemDesc)) {
+        // 定期定額已付款但缺 CreditHash 時，補建訂閱列（供取消／請假）；失敗則改走訂單效期結算
+        if (isRecurring && order.status === 'PAID') {
+          try {
+            const promoMatch = (order.itemDesc || '').match(/商品#(\d+)/);
+            const promotionId = promoMatch ? parseInt(promoMatch[1], 10) : null;
+            const promotion = promotionId
+              ? await prisma.promotion.findUnique({ where: { id: promotionId } })
+              : null;
+            if (promotion) {
+              const created = await createSubscriptionFromPaidOrder(order, {
+                promotion,
+                creditHash: order.creditHash,
+              });
+              if (created) {
+                const full = await prisma.cardSubscription.findUnique({
+                  where: { id: created.id },
+                  ...withInclude,
+                });
+                if (full) return { sub: full, message: null };
+              }
+            }
+          } catch (backfillErr) {
+            console.warn(
+              `[取消訂閱] 訂單 ${order.id} 補建訂閱失敗，改走效期結算:`,
+              backfillErr.message,
+            );
+          }
+        }
         return { sub: null, unlimitedOrder: order, message: null };
       }
       return {
         sub: null,
         unlimitedOrder: null,
         message: isRecurring
-          ? '此定期定額訂單尚未建立訂閱（可能刷卡未完成或缺少 CreditHash），無法取消訂閱'
+          ? '此定期定額訂單尚未建立訂閱（可能刷卡未完成），且非無限月卡，無法取消訂閱'
           : '這筆不是訂閱制月卡訂單，請改走退費折讓或取消交易',
       };
     }
@@ -646,19 +1147,93 @@ async function resolveSubscriptionByRef(ref, { include } = {}) {
   };
 }
 
+/** 臨櫃篩選：優先會員編號 memberNo（6 碼），否則相容內部 memberId */
+async function resolveOpsMemberIdParam({ memberNo, memberId } = {}) {
+  const no = String(memberNo || '').trim().toUpperCase();
+  if (no) {
+    if (!isValidMemberNo(no)) {
+      const err = new Error('會員編號格式無效（須為 6 碼大寫英數）');
+      err.statusCode = 400;
+      throw err;
+    }
+    const m = await prisma.member.findUnique({
+      where: { memberNo: no },
+      select: { id: true },
+    });
+    if (!m) {
+      const err = new Error('找不到該會員編號');
+      err.statusCode = 404;
+      throw err;
+    }
+    return m.id;
+  }
+  if (memberId !== undefined && memberId !== null && memberId !== '') {
+    const id = Number(memberId);
+    if (!Number.isInteger(id) || id <= 0) {
+      const err = new Error('memberId 無效');
+      err.statusCode = 400;
+      throw err;
+    }
+    return id;
+  }
+  return undefined;
+}
+
 router.get('/card-subscriptions', async (req, res) => {
   try {
-    const memberIdRaw = req.query.memberId;
     const status = req.query.status ? String(req.query.status).toUpperCase() : null;
     const where = {};
-    if (memberIdRaw !== undefined && memberIdRaw !== '') {
-      const memberId = parseInt(memberIdRaw, 10);
-      if (!Number.isInteger(memberId)) {
-        return res.status(400).json({ status: 'error', message: 'memberId 無效' });
-      }
-      where.memberId = memberId;
-    }
+    const memberId = await resolveOpsMemberIdParam({
+      memberNo: req.query.memberNo,
+      memberId: req.query.memberId,
+    });
+    if (memberId != null) where.memberId = memberId;
     if (status) where.status = status;
+
+    // 補建：已付款定期定額缺訂閱列（舊版無 CreditHash 略過）
+    const orphanWhere = {
+      status: 'PAID',
+      cardMode: 'RECURRING',
+      ...(where.memberId ? { memberId: where.memberId } : {}),
+    };
+    const orphanOrders = await prisma.order.findMany({
+      where: orphanWhere,
+      orderBy: { createdAt: 'desc' },
+      take: 30,
+      select: {
+        id: true,
+        status: true,
+        cardMode: true,
+        creditHash: true,
+        itemDesc: true,
+        memberId: true,
+        recurringAmount: true,
+        recurringAmountFinal: true,
+        periodType: true,
+        periodTimes: true,
+        cardAmount: true,
+        amount: true,
+        merchantNo: true,
+        checkoutSessionId: true,
+      },
+    });
+    for (const orphan of orphanOrders) {
+      try {
+        const created = await ensureSubscriptionForPaidRecurringOrder(orphan);
+        // 子單已入帳但 CHK 仍 PENDING → 對齊狀態，避免櫃檯輪詢卡住
+        if (created && orphan.checkoutSessionId?.startsWith('CHK')) {
+          await prisma.checkoutSession.updateMany({
+            where: { id: orphan.checkoutSessionId, status: 'PENDING' },
+            data: {
+              status: 'PAID',
+              merchantNo: orphan.merchantNo || undefined,
+            },
+          });
+        }
+      } catch (backfillErr) {
+        console.warn(`[訂閱一覽] 訂單 ${orphan.id} 補建失敗:`, backfillErr.message);
+      }
+    }
 
     const rows = await prisma.cardSubscription.findMany({
       where,
@@ -687,6 +1262,15 @@ router.get('/card-subscriptions', async (req, res) => {
             branch: { select: { id: true, name: true, code: true } },
           },
         },
+        coursePlan: {
+          select: {
+            id: true,
+            name: true,
+            price: true,
+            branchId: true,
+            branch: { select: { id: true, name: true, code: true } },
+          },
+        },
         charges: {
           orderBy: { periodIndex: 'desc' },
           take: 5,
@@ -697,16 +1281,26 @@ router.get('/card-subscriptions', async (req, res) => {
     });
 
     const filtered = rows.filter((r) => {
+      const branchId = r.promotion?.branchId ?? r.coursePlan?.branchId ?? null;
+      if (branchId == null) {
+        // 無分店綁定：ADMIN 可見；一般員工略過（避免誤放行）
+        return isAdminUser(req.user);
+      }
       try {
-        assertBranchAccess(req, r.promotion.branchId);
+        assertBranchAccess(req, branchId);
         return true;
       } catch {
         return false;
       }
     });
 
-    res.json({ status: 'success', data: filtered });
+    const repaired = await repairPlaceholderNextChargeAts(filtered);
+    const synced = await syncPeriodNextChargeAtsFromPayuni(repaired);
+    res.json({ status: 'success', data: synced });
   } catch (error) {
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({ status: 'error', message: error.message });
+    }
     console.error(error);
     res.status(500).json({ status: 'error', message: '讀取訂閱失敗' });
   }
@@ -732,7 +1326,7 @@ router.post('/card-subscriptions/run-due', async (req, res) => {
 router.post('/card-subscriptions/:id/cancel', async (req, res) => {
   try {
     const { sub, unlimitedOrder, message } = await resolveSubscriptionByRef(req.params.id, {
-      include: { promotion: { select: { branchId: true } } },
+      include: { promotion: { select: { branchId: true } }, coursePlan: { select: { branchId: true } } },
     });
 
     const expirePolicy = String(req.body?.expirePolicy || 'KEEP').toUpperCase();
@@ -795,14 +1389,16 @@ router.post('/card-subscriptions/:id/cancel', async (req, res) => {
     }
 
     if (!sub) return res.status(404).json({ status: 'error', message: message || '找不到訂閱' });
-    assertBranchAccess(req, sub.promotion.branchId);
+    assertSubscriptionBranchAccess(req, sub);
 
     // 新結算流程：效期政策 + 可選折讓；舊呼叫（無參數）仍只停續扣
+    const forceLocalOnly = Boolean(req.body?.forceLocalOnly);
     if (hasSettleFields || expirePolicy !== 'KEEP') {
       const result = await settleCancelSubscription(sub.id, {
         reason: req.body?.reason,
         expirePolicy,
         doAllowance: req.body?.doAllowance,
+        forceLocalOnly,
       });
       const inv =
         result.invoice?.action === 'allowance'
@@ -819,7 +1415,9 @@ router.post('/card-subscriptions/:id/cancel', async (req, res) => {
         const order = result.order || (sub.originOrderId
           ? await prisma.order.findUnique({ where: { id: sub.originOrderId } })
           : null);
-        const sellerHeader = await resolveInvoiceSellerHeader(sub.promotion.branchId);
+        const sellerHeader = await resolveInvoiceSellerHeader(
+          sub.promotion?.branchId ?? sub.coursePlan?.branchId ?? null,
+        );
         allowanceSlip = await savePrintableAllowanceSlip({
           reverseResult: result.invoice,
           orderId: order?.id || sub.originOrderId || null,
@@ -835,16 +1433,40 @@ router.post('/card-subscriptions/:id/cancel', async (req, res) => {
       }
       return res.json({
         status: 'success',
-        message: `訂閱已取消；${exp}${inv}`,
+        message: `訂閱已取消；${exp}${inv}${
+          result.payuniStop && !result.payuniStop.skipped
+            ? result.payuniStop.ok
+              ? '；PayUNi 續期已終止'
+              : `；⚠ PayUNi 續期可能未停（${result.payuniStop.message || '請至統一金流後台手動終止'}）`
+            : ''
+        }`,
         data: { ...result, subscriptionId: sub.id, allowanceSlip },
       });
     }
 
-    const updated = await cancelCardSubscription(sub.id, { reason: req.body?.reason });
-    res.json({ status: 'success', message: '訂閱已取消（效期未變更）', data: updated });
+    const updated = await cancelCardSubscription(sub.id, {
+      reason: req.body?.reason,
+      forceLocalOnly,
+    });
+    const payuniStop = updated?.payuniStop;
+    const payuniMsg =
+      payuniStop && !payuniStop.skipped
+        ? payuniStop.ok
+          ? '；PayUNi 續期已終止'
+          : `；⚠ PayUNi 續期可能未停（${payuniStop.message || '請至統一金流後台手動終止'}）`
+        : '';
+    res.json({
+      status: 'success',
+      message: `訂閱已取消（效期未變更）${payuniMsg}`,
+      data: updated,
+    });
   } catch (error) {
     if (error.statusCode) {
-      return res.status(error.statusCode).json({ status: 'error', message: error.message });
+      return res.status(error.statusCode).json({
+        status: 'error',
+        message: error.message,
+        data: error.payuniStop ? { payuniStop: error.payuniStop } : undefined,
+      });
     }
     console.error(error);
     res.status(500).json({ status: 'error', message: '取消訂閱失敗' });
@@ -857,6 +1479,7 @@ router.get('/card-subscriptions/:id/cancel-preview', async (req, res) => {
     const { sub, unlimitedOrder, message } = await resolveSubscriptionByRef(req.params.id, {
       include: {
         promotion: true,
+        coursePlan: true,
         member: {
           select: {
             id: true,
@@ -895,7 +1518,7 @@ router.get('/card-subscriptions/:id/cancel-preview', async (req, res) => {
     }
 
     if (!sub) return res.status(404).json({ status: 'error', message: message || '找不到訂閱' });
-    assertBranchAccess(req, sub.promotion.branchId);
+    assertSubscriptionBranchAccess(req, sub);
 
     const now = new Date();
     const unusedDays = remainingExpireDays(sub.member?.expireDate, now);
@@ -927,13 +1550,21 @@ router.get('/card-subscriptions/:id/cancel-preview', async (req, res) => {
           originOrderId: sub.originOrderId || null,
         },
         member: sub.member,
-        promotion: {
-          id: sub.promotion.id,
-          name: sub.promotion.name,
-          usageType: sub.promotion.usageType,
-          unitDays: sub.promotion.unitDays,
-          durationDays: sub.promotion.durationDays,
-        },
+        promotion: sub.promotion
+          ? {
+              id: sub.promotion.id,
+              name: sub.promotion.name,
+              usageType: sub.promotion.usageType,
+              unitDays: sub.promotion.unitDays,
+              durationDays: sub.promotion.durationDays,
+            }
+          : null,
+        coursePlan: sub.coursePlan
+          ? {
+              id: sub.coursePlan.id,
+              name: sub.coursePlan.name,
+            }
+          : null,
         expirePolicies: EXPIRE_POLICIES,
         unusedDays,
         periodDays,
@@ -963,41 +1594,243 @@ router.get('/card-subscriptions/:id/cancel-preview', async (req, res) => {
 router.post('/card-subscriptions/:id/pause', async (req, res) => {
   try {
     const { sub, message } = await resolveSubscriptionByRef(req.params.id, {
-      include: { promotion: { select: { branchId: true } } },
+      include: { promotion: { select: { branchId: true } }, coursePlan: { select: { branchId: true } } },
     });
     if (!sub) return res.status(404).json({ status: 'error', message: message || '找不到訂閱' });
-    assertBranchAccess(req, sub.promotion.branchId);
-    const updated = await pauseCardSubscription(sub.id);
+    assertSubscriptionBranchAccess(req, sub);
+    const updated = await pauseCardSubscription(sub.id, {
+      forceLocalOnly: Boolean(req.body?.forceLocalOnly),
+    });
+    const payuniStop = updated?.payuniStop;
+    const payuniMsg =
+      payuniStop && !payuniStop.skipped
+        ? payuniStop.ok
+          ? '；PayUNi 續期已暫停'
+          : `；⚠ PayUNi 續期可能未停（${payuniStop.message || '請至統一金流後台手動暫停'}）`
+        : '';
     res.json({
       status: 'success',
-      message: '訂閱已暫停續扣（效期仍持續計算；請假請改用請假 API）',
+      message: `訂閱已暫停續扣（效期仍持續計算；請假請改用請假 API）${payuniMsg}`,
       data: updated,
     });
   } catch (error) {
     if (error.statusCode) {
-      return res.status(error.statusCode).json({ status: 'error', message: error.message });
+      return res.status(error.statusCode).json({
+        status: 'error',
+        message: error.message,
+        data: error.payuniStop ? { payuniStop: error.payuniStop } : undefined,
+      });
     }
     console.error(error);
     res.status(500).json({ status: 'error', message: '暫停訂閱失敗' });
   }
 });
 
-router.post('/card-subscriptions/:id/resume', async (req, res) => {
+/**
+ * 查詢訂閱對應的 PayUNi 續期排程（period/query）
+ * GET /api/ops/card-subscriptions/:id/payuni-period
+ */
+router.get('/card-subscriptions/:id/payuni-period', async (req, res) => {
   try {
     const { sub, message } = await resolveSubscriptionByRef(req.params.id, {
-      include: { promotion: { select: { branchId: true } } },
+      include: { promotion: { select: { branchId: true } }, coursePlan: { select: { branchId: true } } },
     });
     if (!sub) return res.status(404).json({ status: 'error', message: message || '找不到訂閱' });
-    assertBranchAccess(req, sub.promotion.branchId);
-    await settleExpiredLeave(sub.memberId);
-    const updated = await resumeCardSubscription(sub.id);
-    res.json({ status: 'success', message: '訂閱已恢復', data: updated });
+    assertSubscriptionBranchAccess(req, sub);
+    const {
+      extractPeriodTradeNo,
+      queryPayuniPeriod,
+      summarizePayuniPeriodSchedule,
+    } = await import('../lib/payuni.js');
+    const periodTradeNo = extractPeriodTradeNo(sub);
+    if (!periodTradeNo) {
+      return res.json({
+        status: 'success',
+        message: '此訂閱非 PayUNi 續期頁（無 PeriodTradeNo）',
+        data: { subscriptionId: sub.id, periodTradeNo: null, creditHash: sub.creditHash },
+      });
+    }
+    const query = await queryPayuniPeriod({ periodTradeNo });
+    const schedule = query.ok ? summarizePayuniPeriodSchedule(query.data) : null;
+    res.json({
+      status: query.ok ? 'success' : 'error',
+      message: query.message || (query.ok ? '查詢成功' : '查詢失敗'),
+      data: {
+        subscriptionId: sub.id,
+        subscriptionStatus: sub.status,
+        periodTradeNo,
+        schedule,
+        raw: query.data || null,
+      },
+    });
   } catch (error) {
     if (error.statusCode) {
       return res.status(error.statusCode).json({ status: 'error', message: error.message });
     }
     console.error(error);
+    res.status(500).json({ status: 'error', message: '查詢 PayUNi 續期失敗' });
+  }
+});
+
+/**
+ * 僅重試停 PayUNi 續期／約定（本機訂閱狀態不變更）
+ * POST /api/ops/card-subscriptions/:id/stop-payuni
+ * body: { mode?: 'terminate'|'suspend' }
+ */
+router.post('/card-subscriptions/:id/stop-payuni', async (req, res) => {
+  try {
+    const { sub, message } = await resolveSubscriptionByRef(req.params.id, {
+      include: { promotion: { select: { branchId: true } }, coursePlan: { select: { branchId: true } } },
+    });
+    if (!sub) return res.status(404).json({ status: 'error', message: message || '找不到訂閱' });
+    assertSubscriptionBranchAccess(req, sub);
+    const modeRaw = String(req.body?.mode || 'terminate').toLowerCase();
+    const mode =
+      modeRaw === 'suspend' || modeRaw === 'pause'
+        ? 'suspend'
+        : modeRaw === 'restart' || modeRaw === 'resume'
+          ? 'restart'
+          : 'terminate';
+    const {
+      stopPayuniRecurringForSubscription,
+      resumePayuniRecurringForSubscription,
+    } = await import('../lib/payuni.js');
+    const payuniStop =
+      mode === 'restart'
+        ? await resumePayuniRecurringForSubscription(sub)
+        : await stopPayuniRecurringForSubscription(sub, { mode });
+    if (payuniStop?.ok) {
+      await prisma.cardSubscription.update({
+        where: { id: sub.id },
+        data: {
+          lastError:
+            mode === 'suspend'
+              ? 'PayUNi 續期已暫停（手動同步）'
+              : mode === 'restart'
+                ? 'PayUNi 續期已啟用（手動同步）'
+                : 'PayUNi 續期已終止（手動同步）',
+        },
+      });
+    }
+    res.status(payuniStop?.ok ? 200 : 409).json({
+      status: payuniStop?.ok ? 'success' : 'error',
+      message: payuniStop?.ok
+        ? mode === 'suspend'
+          ? 'PayUNi 續期已暫停'
+          : mode === 'restart'
+            ? 'PayUNi 續期已啟用'
+            : 'PayUNi 續期已終止'
+        : payuniStop?.message || '同步 PayUNi 續期失敗',
+      data: { subscriptionId: sub.id, payuniStop },
+    });
+  } catch (error) {
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({ status: 'error', message: error.message });
+    }
+    console.error(error);
+    res.status(500).json({ status: 'error', message: '停 PayUNi 續期失敗' });
+  }
+});
+
+router.post('/card-subscriptions/:id/resume', async (req, res) => {
+  try {
+    const { sub, message } = await resolveSubscriptionByRef(req.params.id, {
+      include: { promotion: { select: { branchId: true } }, coursePlan: { select: { branchId: true } } },
+    });
+    if (!sub) return res.status(404).json({ status: 'error', message: message || '找不到訂閱' });
+    assertSubscriptionBranchAccess(req, sub);
+    await settleExpiredLeave(sub.memberId);
+    const current = await prisma.cardSubscription.findUnique({ where: { id: sub.id } });
+    if (!current) return res.status(404).json({ status: 'error', message: '找不到訂閱' });
+    if (current.status === 'ACTIVE') {
+      return res.json({
+        status: 'success',
+        message: '訂閱已是啟用狀態（請假到期已自動恢復）',
+        data: current,
+      });
+    }
+    const updated = await resumeCardSubscription(current.id, {
+      forceLocalOnly: Boolean(req.body?.forceLocalOnly),
+    });
+    const payuniResume = updated?.payuniResume;
+    const payuniMsg =
+      payuniResume && !payuniResume.skipped
+        ? payuniResume.ok
+          ? '；PayUNi 續期已啟用'
+          : `；⚠ PayUNi 續期可能未啟用（${payuniResume.message || '請至統一金流後台手動啟用'}）`
+        : '';
+    res.json({
+      status: 'success',
+      message: `訂閱已恢復${payuniMsg}`,
+      data: updated,
+    });
+  } catch (error) {
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({
+        status: 'error',
+        message: error.message,
+        data: error.payuniResume ? { payuniResume: error.payuniResume } : undefined,
+      });
+    }
+    console.error(error);
     res.status(500).json({ status: 'error', message: '恢復訂閱失敗' });
+  }
+});
+
+/**
+ * 臨櫃換卡：開 PayUNi 續期頁（$1 驗證授權後取消）；Notify 回寫 CreditHash
+ * POST /api/ops/card-subscriptions/:id/rebind
+ */
+router.post('/card-subscriptions/:id/rebind', async (req, res) => {
+  try {
+    const { sub, message } = await resolveSubscriptionByRef(req.params.id, {
+      include: {
+        promotion: { select: { branchId: true } },
+        coursePlan: { select: { branchId: true } },
+      },
+    });
+    if (!sub) return res.status(404).json({ status: 'error', message: message || '找不到訂閱' });
+    assertSubscriptionBranchAccess(req, sub);
+    const bind = await buildSubscriptionRebindRequest(sub.id, { channel: 'counter' });
+    res.json({
+      status: 'success',
+      message: bind.messageHint || '請完成 PayUNi 換卡約定',
+      data: bind,
+    });
+  } catch (error) {
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({ status: 'error', message: error.message });
+    }
+    console.error(error);
+    res.status(500).json({ status: 'error', message: '開換卡頁失敗' });
+  }
+});
+
+/**
+ * 換卡輪詢（不回傳原始 CreditHash）
+ * GET /api/ops/card-subscriptions/:id/rebind-status
+ */
+router.get('/card-subscriptions/:id/rebind-status', async (req, res) => {
+  try {
+    const { sub, message } = await resolveSubscriptionByRef(req.params.id, {
+      include: {
+        promotion: { select: { branchId: true } },
+        coursePlan: { select: { branchId: true } },
+      },
+    });
+    if (!sub) return res.status(404).json({ status: 'error', message: message || '找不到訂閱' });
+    assertSubscriptionBranchAccess(req, sub);
+    const fresh = await prisma.cardSubscription.findUnique({ where: { id: sub.id } });
+    res.json({
+      status: 'success',
+      data: toRebindStatusView(fresh),
+    });
+  } catch (error) {
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({ status: 'error', message: error.message });
+    }
+    console.error(error);
+    res.status(500).json({ status: 'error', message: '讀取換卡狀態失敗' });
   }
 });
 
@@ -1006,7 +1839,10 @@ router.post('/card-subscriptions/:id/resume', async (req, res) => {
 // ==========================================
 router.get('/member-leaves', async (req, res) => {
   try {
-    const memberId = req.query.memberId ? Number(req.query.memberId) : undefined;
+    const memberId = await resolveOpsMemberIdParam({
+      memberNo: req.query.memberNo,
+      memberId: req.query.memberId,
+    });
     const status = req.query.status ? String(req.query.status) : undefined;
     const rows = await listMemberLeaves({ memberId, status });
     // 分店過濾：有訂閱則看方案分店；無則放行 ADMIN，DUTY 需 memberId
@@ -1015,10 +1851,10 @@ router.get('/member-leaves', async (req, res) => {
       if (row.subscriptionId) {
         const sub = await prisma.cardSubscription.findUnique({
           where: { id: row.subscriptionId },
-          include: { promotion: { select: { branchId: true } } },
+          include: { promotion: { select: { branchId: true } }, coursePlan: { select: { branchId: true } } },
         });
         try {
-          if (sub) assertBranchAccess(req, sub.promotion.branchId);
+          if (sub) assertSubscriptionBranchAccess(req, sub);
           filtered.push(row);
         } catch {
           /* skip */
@@ -1029,6 +1865,9 @@ router.get('/member-leaves', async (req, res) => {
     }
     res.json({ status: 'success', data: filtered });
   } catch (error) {
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({ status: 'error', message: error.message });
+    }
     console.error(error);
     res.status(500).json({ status: 'error', message: '讀取請假失敗' });
   }
@@ -1036,18 +1875,21 @@ router.get('/member-leaves', async (req, res) => {
 
 router.post('/member-leaves', async (req, res) => {
   try {
-    const memberId = Number(req.body?.memberId);
-    if (!Number.isInteger(memberId) || memberId <= 0) {
-      return res.status(400).json({ status: 'error', message: '請提供 memberId' });
+    const memberId = await resolveOpsMemberIdParam({
+      memberNo: req.body?.memberNo,
+      memberId: req.body?.memberId,
+    });
+    if (memberId == null) {
+      return res.status(400).json({ status: 'error', message: '請提供會員編號' });
     }
     const subId = req.body?.subscriptionId ? String(req.body.subscriptionId).trim() : undefined;
     if (subId) {
       const sub = await prisma.cardSubscription.findUnique({
         where: { id: subId },
-        include: { promotion: { select: { branchId: true } } },
+        include: { promotion: { select: { branchId: true } }, coursePlan: { select: { branchId: true } } },
       });
       if (!sub) return res.status(404).json({ status: 'error', message: '找不到訂閱' });
-      assertBranchAccess(req, sub.promotion.branchId);
+      assertSubscriptionBranchAccess(req, sub);
     }
 
     const result = await startMemberLeave({
@@ -1056,15 +1898,26 @@ router.post('/member-leaves', async (req, res) => {
       reason: req.body?.reason,
       staffId: req.user?.id ?? null,
       subscriptionId: subId,
+      forceLocalOnly: Boolean(req.body?.forceLocalOnly),
     });
+    const payuniMsg =
+      result.payuniStop && !result.payuniStop.skipped
+        ? result.payuniStop.ok
+          ? '；PayUNi 續期已暫停'
+          : `；⚠ PayUNi 續期可能未停（${result.payuniStop.message || '請至統一金流後台手動暫停'}）`
+        : '';
     res.json({
       status: 'success',
-      message: `已請假 ${result.leave.days} 天（至 ${new Date(result.leave.endAt).toLocaleDateString('zh-TW')}）；效期已順延，定期定額已暫停`,
+      message: `已請假 ${result.leave.days} 天（至 ${new Date(result.leave.endAt).toLocaleDateString('zh-TW')}）；效期已順延，定期定額已暫停${payuniMsg}`,
       data: result,
     });
   } catch (error) {
     if (error.statusCode) {
-      return res.status(error.statusCode).json({ status: 'error', message: error.message });
+      return res.status(error.statusCode).json({
+        status: 'error',
+        message: error.message,
+        data: error.payuniStop ? { payuniStop: error.payuniStop } : undefined,
+      });
     }
     console.error(error);
     res.status(500).json({ status: 'error', message: '請假失敗' });
@@ -1081,9 +1934,9 @@ router.post('/member-leaves/:id/end', async (req, res) => {
     if (leave.subscriptionId) {
       const sub = await prisma.cardSubscription.findUnique({
         where: { id: leave.subscriptionId },
-        include: { promotion: { select: { branchId: true } } },
+        include: { promotion: { select: { branchId: true } }, coursePlan: { select: { branchId: true } } },
       });
-      if (sub) assertBranchAccess(req, sub.promotion.branchId);
+      if (sub) assertSubscriptionBranchAccess(req, sub);
     }
 
     const result = await endMemberLeaveEarly({
@@ -1091,6 +1944,7 @@ router.post('/member-leaves/:id/end', async (req, res) => {
       leaveId: leave.id,
       reason: req.body?.reason,
       resumeSubscription: req.body?.resumeSubscription !== false,
+      forceLocalOnly: Boolean(req.body?.forceLocalOnly),
     });
     res.json({
       status: 'success',
@@ -1099,7 +1953,11 @@ router.post('/member-leaves/:id/end', async (req, res) => {
     });
   } catch (error) {
     if (error.statusCode) {
-      return res.status(error.statusCode).json({ status: 'error', message: error.message });
+      return res.status(error.statusCode).json({
+        status: 'error',
+        message: error.message,
+        data: error.payuniResume ? { payuniResume: error.payuniResume } : undefined,
+      });
     }
     console.error(error);
     res.status(500).json({ status: 'error', message: '銷假失敗' });
@@ -1116,9 +1974,9 @@ router.post('/member-leaves/:id/complete', async (req, res) => {
     if (leave.subscriptionId) {
       const sub = await prisma.cardSubscription.findUnique({
         where: { id: leave.subscriptionId },
-        include: { promotion: { select: { branchId: true } } },
+        include: { promotion: { select: { branchId: true } }, coursePlan: { select: { branchId: true } } },
       });
-      if (sub) assertBranchAccess(req, sub.promotion.branchId);
+      if (sub) assertSubscriptionBranchAccess(req, sub);
     }
     const result = await completeMemberLeaveOnSchedule(leave.id);
     res.json({ status: 'success', message: '請假已結案，訂閱已恢復續扣', data: result });
@@ -1306,6 +2164,58 @@ router.post('/shift/:id/close', async (req, res) => {
   }
 });
 
+// ——— 乙禾日結／發票佇列（一般櫃檯即可；DUTY+ 延伸路由亦有同路徑）———
+router.get('/yipay/reconcile', async (req, res) => {
+  try {
+    const branchId =
+      req.query.branchId != null && req.query.branchId !== ''
+        ? Number(req.query.branchId)
+        : req.user?.branchId;
+    if (branchId != null && Number.isFinite(branchId)) {
+      assertBranchAccess(req, branchId);
+    }
+    const data = await reconcileYipayDay(req.query.day || req.query.date, {
+      branchId: Number.isFinite(branchId) ? branchId : null,
+      edcCount: req.query.edcCount,
+      edcAmount: req.query.edcAmount,
+    });
+    return res.json({ status: 'success', data });
+  } catch (error) {
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({ status: 'error', message: error.message });
+    }
+    console.error(error);
+    return res.status(500).json({ status: 'error', message: '乙禾日結對帳失敗' });
+  }
+});
+
+router.get('/invoice-jobs', async (req, res) => {
+  try {
+    const items = await listInvoiceJobs({
+      status: req.query.status,
+      take: req.query.take,
+      checkoutId: req.query.checkoutId,
+    });
+    return res.json({ status: 'success', data: { items } });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ status: 'error', message: '查詢開票任務失敗' });
+  }
+});
+
+router.post('/invoice-jobs/:id/retry', async (req, res) => {
+  try {
+    const job = await retryInvoiceJob(req.params.id);
+    return res.json({ status: 'success', message: '已重新排隊開票', data: job });
+  } catch (error) {
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({ status: 'error', message: error.message });
+    }
+    console.error(error);
+    return res.status(500).json({ status: 'error', message: '重試開票失敗' });
+  }
+});
+
 // ==========================================
 // 臨櫃合併結帳：商品 + 購案同一購物車
 // POST /api/ops/checkout
@@ -1316,6 +2226,7 @@ router.post('/checkout', async (req, res) => {
     const result = await runOpsCheckout(req, req.body || {});
     return res.json({
       status: 'success',
+      code: result.code || undefined,
       message: result.message,
       data: result.data,
     });
@@ -1325,6 +2236,67 @@ router.post('/checkout', async (req, res) => {
     }
     console.error(error);
     return res.status(500).json({ status: 'error', message: error.message || '合併結帳失敗' });
+  }
+});
+
+/**
+ * 乙禾／凱基固定式刷卡機：端末成功後櫃檯確認入帳＋ezPay
+ * POST /api/ops/confirm-yipay  { checkoutId? | orderId? | saleId?, terminalRef? }
+ */
+router.post('/confirm-yipay', async (req, res) => {
+  const { checkoutId, orderId, saleId, terminalRef, ...illegal } = req.body || {};
+  if (Object.keys(illegal).length > 0) {
+    return res.status(400).json({
+      status: 'error',
+      message: `⛔ 非法參數：只允許 checkoutId、orderId、saleId、terminalRef，已拒絕 [${Object.keys(illegal).join(', ')}]`,
+    });
+  }
+  try {
+    if (checkoutId) {
+      const data = await confirmYipayCheckout(String(checkoutId).trim(), {
+        terminalRef,
+        staffId: req.user?.id,
+      });
+      return res.json({
+        status: 'success',
+        message: data.needsPeriodBind
+          ? data.messageHint ||
+            '乙禾首期已入帳；請完成 PayUNi 續期頁約定'
+          : data.alreadyPaid
+            ? '此結帳單已入帳'
+            : '乙禾刷卡已確認入帳',
+        data,
+      });
+    }
+    if (saleId) {
+      const data = await confirmYipaySale(String(saleId).trim(), {
+        terminalRef,
+        staffId: req.user?.id,
+      });
+      return res.json({
+        status: 'success',
+        message: data.alreadyPaid ? '此銷貨單已入帳' : '乙禾刷卡已確認入帳',
+        data,
+      });
+    }
+    if (orderId) {
+      const data = await confirmYipayOrder(String(orderId).trim(), { terminalRef });
+      return res.json({
+        status: 'success',
+        message: data.alreadyPaid ? '此訂單已入帳' : '乙禾刷卡已確認入帳',
+        data,
+      });
+    }
+    return res.status(400).json({
+      status: 'error',
+      message: '請提供 checkoutId（CHK…）、saleId（SAL…）或 orderId',
+    });
+  } catch (error) {
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({ status: 'error', message: error.message });
+    }
+    console.error(error);
+    return res.status(500).json({ status: 'error', message: error.message || '乙禾確認入帳失敗' });
   }
 });
 
@@ -1441,6 +2413,7 @@ router.post(['/topup', '/deposit'], async (req, res) => {
     periodType,
     periodTimes,
     recurringAmount: recurringAmountRaw,
+    linePayOneTimeKey,
     ...illegalFields
   } = req.body;
 
@@ -1448,7 +2421,7 @@ router.post(['/topup', '/deposit'], async (req, res) => {
   if (forbiddenKeys.length > 0) {
     return res.status(400).json({
       status: 'error',
-      message: `⛔ 非法參數：儲值 API 只允許 memberId、promotionId、qty、payments、payMethod、voucherCode、carrierNum、buyerUbn、loveCode、cardMode、cardInst、periodType、periodTimes、recurringAmount，已拒絕 [${forbiddenKeys.join(', ')}]`,
+      message: `⛔ 非法參數：儲值 API 只允許 memberId、promotionId、qty、payments、payMethod、voucherCode、carrierNum、buyerUbn、loveCode、cardMode、cardInst、periodType、periodTimes、recurringAmount、linePayOneTimeKey，已拒絕 [${forbiddenKeys.join(', ')}]`,
     });
   }
 
@@ -1486,10 +2459,10 @@ router.post(['/topup', '/deposit'], async (req, res) => {
 
   try {
     const promotion = await prisma.promotion.findUnique({
-      where: { id: parsedPromotionId },
-    });
+        where: { id: parsedPromotionId },
+      });
 
-    if (!promotion) {
+      if (!promotion) {
       return res.status(404).json({ status: 'error', message: '找不到此促銷商品' });
     }
 
@@ -1539,19 +2512,85 @@ router.post(['/topup', '/deposit'], async (req, res) => {
       } catch (error) {
         return res.status(error.statusCode || 400).json({ status: 'error', message: error.message });
       }
+      // 臨櫃一次／分期請走乙禾；PayUNi CARD 僅定期定額
+      if (cardOpts.cardMode !== 'RECURRING') {
+        return res.status(400).json({
+          status: 'error',
+          message: '臨櫃一次付清／分期請使用「乙禾現場刷卡」（YIPAY）；PayUNi（CARD）僅用於定期定額',
+        });
+      }
       if (cardOpts.cardMode === 'RECURRING') {
-        if (recurringAmountRaw === undefined || recurringAmountRaw === null || recurringAmountRaw === '') {
-          recurringAmount = amount;
-        } else {
-          const n = typeof recurringAmountRaw === 'number'
-            ? recurringAmountRaw
-            : parseFloat(String(recurringAmountRaw));
-          if (!Number.isFinite(n) || n <= 0) {
-            return res.status(400).json({ status: 'error', message: '定期定額金額必須為正數' });
-          }
-          recurringAmount = Math.round(n * 100) / 100;
+        const periodCount = parseInt(promotion.periodCount, 10);
+        if (!Number.isInteger(periodCount) || periodCount <= 0) {
+          return res.status(400).json({
+            status: 'error',
+            message: '此儲值方案未設定有效期期數，無法使用定期定額',
+          });
+        }
+        cardOpts.periodTimes = periodCount;
+        recurringAmount = resolvePromotionRecurringAmount(promotion);
+        if (!recurringAmount) {
+          return res.status(400).json({
+            status: 'error',
+            message: '此儲值方案未設定定期定額扣款金額',
+          });
         }
       }
+    }
+
+    // 乙禾現場刷卡：PENDING，端末成功後 POST /ops/confirm-yipay
+    if (pay.needsYipay) {
+      const order = await prisma.$transaction(async (tx) => {
+        if (pay.walletAmount > 0) {
+          const m = await tx.member.findUnique({ where: { id: parsedMemberId } });
+          if (!m || m.cashWallet < pay.walletAmount) {
+            const err = new Error(
+              `零錢包（本金）不足（餘額 $${m?.cashWallet ?? 0}，應付 $${pay.walletAmount}）；運動金不可折抵`,
+            );
+        err.statusCode = 400;
+        throw err;
+          }
+          await tx.member.update({
+            where: { id: parsedMemberId },
+            data: { cashWallet: { decrement: pay.walletAmount } },
+          });
+        }
+
+        return tx.order.create({
+          data: {
+            id: resolveTopupOrderId({ promotion }),
+            memberId: parsedMemberId,
+            amount,
+            itemDesc,
+            payMethod: pay.payMethodLabel,
+            payBreakdown: pay.breakdown,
+            voucherCode: pay.voucherCode,
+            cardAmount: pay.yipayAmount,
+            carrierNum: invoiceOpts.carrierNum,
+            buyerUbn: invoiceOpts.buyerUbn,
+            loveCode: invoiceOpts.loveCode,
+            status: 'PENDING',
+          },
+        });
+      });
+
+      return res.json({
+        status: 'success',
+        message: `請於乙禾／凱基固定式刷卡機完成收款 $${pay.yipayAmount}，完成後按「確認刷卡成功」`,
+        data: {
+          orderId: order.id,
+          amount: order.amount,
+          yipayAmount: pay.yipayAmount,
+          payMethod: pay.payMethodLabel,
+          payBreakdown: pay.breakdown,
+          voucherCode: pay.voucherCode,
+          carrierNum: invoiceOpts.carrierNum,
+          buyerUbn: invoiceOpts.buyerUbn,
+          loveCode: invoiceOpts.loveCode,
+          channel: 'YIPAY',
+          terminalHint: '乙禾凱基固定式刷卡機',
+        },
+      });
     }
 
     // 含刷卡：PENDING，刷卡成功後再入帳（避免未付完先配發）
@@ -1567,7 +2606,7 @@ router.post(['/topup', '/deposit'], async (req, res) => {
             throw err;
           }
           await tx.member.update({
-            where: { id: parsedMemberId },
+        where: { id: parsedMemberId },
             data: { cashWallet: { decrement: pay.walletAmount } },
           });
         }
@@ -1608,6 +2647,9 @@ router.post(['/topup', '/deposit'], async (req, res) => {
         periodTimes: cardOpts.periodTimes,
         periodAmt: recurringAmount,
         recurringAmount,
+        payuniPeriodHash: resolvePayuniPeriodHash({ channel: 'counter', promotion }),
+        channel: 'counter',
+        promotion,
       });
 
       return res.json({
@@ -1634,7 +2676,204 @@ router.post(['/topup', '/deposit'], async (req, res) => {
       });
     }
 
-    // 無刷卡：當場入帳 + 開發票（可含零錢包折抵）
+    // 臨櫃 LinePay：POS 掃付款碼（oneTimeKey），扣款成功後入帳
+    if (pay.needsLinePay) {
+      if (cardOpts.cardMode === 'RECURRING') {
+        return res.status(400).json({
+          status: 'error',
+          message: '定期定額請使用刷卡（PayUNi），LinePay 僅支援一次付清',
+        });
+      }
+      const oneTimeKey = String(linePayOneTimeKey || '').trim();
+      if (!oneTimeKey) {
+        return res.status(400).json({
+          status: 'error',
+          message: '臨櫃 LinePay 為 POS 掃碼模式：請掃描會員 LinePay 付款碼（My Code）後再結帳',
+        });
+      }
+
+      const pendingOrder = await prisma.$transaction(async (tx) => {
+        if (pay.walletAmount > 0) {
+          const m = await tx.member.findUnique({ where: { id: parsedMemberId } });
+          if (!m || m.cashWallet < pay.walletAmount) {
+            const err = new Error(
+              `零錢包（本金）不足（餘額 $${m?.cashWallet ?? 0}，應付 $${pay.walletAmount}）；運動金不可折抵`,
+            );
+            err.statusCode = 400;
+        throw err;
+          }
+          await tx.member.update({
+            where: { id: parsedMemberId },
+            data: { cashWallet: { decrement: pay.walletAmount } },
+          });
+        }
+
+        return tx.order.create({
+          data: {
+            id: resolveTopupOrderId({ promotion }),
+            memberId: parsedMemberId,
+            amount,
+            itemDesc,
+            payMethod: pay.payMethodLabel,
+            payBreakdown: pay.breakdown,
+            voucherCode: pay.voucherCode,
+            cardAmount: 0,
+            carrierNum: invoiceOpts.carrierNum,
+            buyerUbn: invoiceOpts.buyerUbn,
+            loveCode: invoiceOpts.loveCode,
+            status: 'PENDING',
+          },
+        });
+      });
+
+      let branchName = null;
+      if (promotion.branchId) {
+        const br = await prisma.branch.findUnique({
+          where: { id: promotion.branchId },
+          select: { name: true, code: true },
+        });
+        branchName = br?.name || br?.code || null;
+      }
+
+      let lp;
+      try {
+        lp = await payLinePayPosWithOneTimeKey({
+          orderId: pendingOrder.id,
+          amount: pay.linePayAmount,
+          productName: itemDesc,
+          oneTimeKey,
+          branchId: promotion.branchId,
+          branchName,
+        });
+      } catch (lpErr) {
+        await prisma.$transaction(async (tx) => {
+          await tx.order.update({
+            where: { id: pendingOrder.id },
+            data: { status: 'CANCELLED' },
+          });
+          if (pay.walletAmount > 0) {
+            await tx.member.update({
+        where: { id: parsedMemberId },
+              data: { cashWallet: { increment: pay.walletAmount } },
+            });
+          }
+        });
+        throw lpErr;
+      }
+
+      const result = await prisma.$transaction(async (tx) => {
+        const { updatedMember, fulfillment } = await fulfillPromotionPurchase(
+          tx,
+          parsedMemberId,
+          promotion,
+          { qty: parsedQty },
+        );
+        const order = await tx.order.update({
+          where: { id: pendingOrder.id },
+        data: {
+            status: 'PAID',
+            merchantNo: `LP:${lp.transactionId}`,
+            amount: fulfillment.amount,
+            itemDesc: buildTopupItemDesc(promotion, '臨櫃', fulfillment.qty),
+          },
+        });
+        return { updatedMember, order, promotion, fulfillment };
+      });
+
+      const invoiceNumber = await tryIssueOrderInvoice(result.order, result.updatedMember.name).catch(
+        async (invErr) => {
+          await prisma.$transaction(async (tx) => {
+            const paid = await tx.order.findUnique({ where: { id: result.order.id } });
+            if (!paid || paid.status !== 'PAID') return;
+            const member = await tx.member.findUnique({ where: { id: paid.memberId } });
+            if (member && result.promotion) {
+              if (isUnlimitedPromotion(result.promotion)) {
+                const days = result.promotion.durationDays || 0;
+                let nextExpire = member.expireDate ? new Date(member.expireDate) : null;
+                if (nextExpire && days > 0) nextExpire.setDate(nextExpire.getDate() - days);
+                const stillValid = nextExpire && nextExpire.getTime() > Date.now();
+                await tx.member.update({
+                  where: { id: member.id },
+                  data: {
+                    expireDate: stillValid ? nextExpire : null,
+                    plan: stillValid ? member.plan || UNLIMITED_MEMBER_PLAN : '計時會員',
+                  },
+                });
+              } else {
+                const cash =
+                  result.fulfillment?.cashAdded ??
+                  result.promotion.price * (result.fulfillment?.qty || 1);
+                const bonus =
+                  result.fulfillment?.bonusAdded ??
+                  result.promotion.bonusGiven * (result.fulfillment?.qty || 1);
+                await tx.member.update({
+                  where: { id: member.id },
+                  data: {
+                    cashWallet: { decrement: Math.min(cash, Number(member.cashWallet) || 0) },
+                    bonusWallet: { decrement: Math.min(bonus, Number(member.bonusWallet) || 0) },
+                  },
+                });
+              }
+            }
+            if (pay.walletAmount > 0) {
+              await tx.member.update({
+                where: { id: parsedMemberId },
+                data: { cashWallet: { increment: pay.walletAmount } },
+              });
+            }
+            await tx.order.update({
+              where: { id: result.order.id },
+              data: {
+                status: 'FAILED',
+                invoiceNumber: null,
+                itemDesc: `${paid.itemDesc || ''}｜電子發票開立失敗，交易取消`.slice(0, 500),
+              },
+            });
+          });
+          try {
+            const { refundLinePayPayment } = await import('../lib/linepay.js');
+            await refundLinePayPayment({
+              transactionId: lp.transactionId,
+              refundAmount: pay.linePayAmount,
+            });
+          } catch (refundErr) {
+            console.error('Topup 開票失敗後 LinePay 退款失敗:', refundErr.message);
+            invErr.message = `${invErr.message}；LinePay 自動退款失敗請人工處理：${refundErr.message}`;
+          }
+          throw invErr;
+        },
+      );
+      const successMessage =
+        result.fulfillment.type === 'UNLIMITED'
+          ? `【體育客】會員 [${result.updatedMember.name}] 購案成功：${result.promotion.name}（效期至 ${new Date(result.fulfillment.expireDate).toLocaleDateString('zh-TW')}）`
+          : `【體育客】會員 [${result.updatedMember.name}] 儲值成功：${result.promotion.name} ×${result.fulfillment.qty}`;
+
+      return res.json({
+        status: 'success',
+        message: successMessage,
+        data: {
+          orderId: result.order.id,
+          amount: result.order.amount,
+          payMethod: pay.payMethodLabel,
+          payBreakdown: pay.breakdown,
+          linePayAmount: pay.linePayAmount,
+          linePayMode: 'POS',
+          transactionId: lp.transactionId,
+          voucherCode: pay.voucherCode,
+          invoiceNumber,
+          carrierNum: invoiceOpts.carrierNum,
+          buyerUbn: invoiceOpts.buyerUbn,
+          loveCode: invoiceOpts.loveCode,
+          promotion: {
+            id: result.promotion.id,
+            name: result.promotion.name,
+            usageType: result.promotion.usageType,
+          },
+        },
+      });
+    }
+
+    // 無刷卡／無 LinePay：當場入帳 + 開發票（可含零錢包折抵）
     const result = await prisma.$transaction(async (tx) => {
       if (pay.walletAmount > 0) {
         const m = await tx.member.findUnique({ where: { id: parsedMemberId } });
@@ -1678,7 +2917,59 @@ router.post(['/topup', '/deposit'], async (req, res) => {
       return { updatedMember, order, promotion, fulfillment };
     });
 
-    const invoiceNumber = await tryIssueOrderInvoice(result.order, result.updatedMember.name);
+    const invoiceNumber = await tryIssueOrderInvoice(result.order, result.updatedMember.name).catch(
+      async (invErr) => {
+        await prisma.$transaction(async (tx) => {
+          const paid = await tx.order.findUnique({ where: { id: result.order.id } });
+          if (!paid || paid.status !== 'PAID') return;
+          const member = await tx.member.findUnique({ where: { id: paid.memberId } });
+          if (member && result.promotion) {
+            if (isUnlimitedPromotion(result.promotion)) {
+              const days = result.promotion.durationDays || 0;
+              let nextExpire = member.expireDate ? new Date(member.expireDate) : null;
+              if (nextExpire && days > 0) nextExpire.setDate(nextExpire.getDate() - days);
+              const stillValid = nextExpire && nextExpire.getTime() > Date.now();
+              await tx.member.update({
+                where: { id: member.id },
+                data: {
+                  expireDate: stillValid ? nextExpire : null,
+                  plan: stillValid ? member.plan || UNLIMITED_MEMBER_PLAN : '計時會員',
+                },
+              });
+            } else {
+              const cash =
+                result.fulfillment?.cashAdded ??
+                result.promotion.price * (result.fulfillment?.qty || 1);
+              const bonus =
+                result.fulfillment?.bonusAdded ??
+                result.promotion.bonusGiven * (result.fulfillment?.qty || 1);
+              await tx.member.update({
+                where: { id: member.id },
+                data: {
+                  cashWallet: { decrement: Math.min(cash, Number(member.cashWallet) || 0) },
+                  bonusWallet: { decrement: Math.min(bonus, Number(member.bonusWallet) || 0) },
+                },
+              });
+            }
+          }
+          if (pay.walletAmount > 0) {
+            await tx.member.update({
+              where: { id: parsedMemberId },
+              data: { cashWallet: { increment: pay.walletAmount } },
+            });
+          }
+          await tx.order.update({
+            where: { id: result.order.id },
+            data: {
+              status: 'FAILED',
+              invoiceNumber: null,
+              itemDesc: `${paid.itemDesc || ''}｜電子發票開立失敗，交易取消`.slice(0, 500),
+            },
+          });
+        });
+        throw invErr;
+      },
+    );
 
     const successMessage =
       result.fulfillment.type === 'UNLIMITED'
@@ -1730,13 +3021,24 @@ router.post(['/topup', '/deposit'], async (req, res) => {
 // ==========================================
 // 0.02 【臨櫃開卡】綁電話＋綁定分店
 // POST /api/ops/members
-// Body: { name, phone, branchIds?: number[], faceEnabled?: boolean }
+// Body: { name, phone, idNumber, branchIds?: number[], faceEnabled?: boolean, email?: string }
 // 方案／效期禁止前端指定：未購方案一律分鐘計費、無效期
 // faceEnabled=true 時建立後需簽署生物辨識同意書（allowBiometrics 仍由簽署同步）
+// phone、idNumber 必填；外國客 idNumber 可填居留證或護照
 // ==========================================
 router.post('/members', async (req, res) => {
-  const { name, phone, allowBiometrics, plan, expireDate, branchIds, faceEnabled, ...rest } =
-    req.body || {};
+  const {
+    name,
+    phone,
+    allowBiometrics,
+    plan,
+    expireDate,
+    branchIds,
+    faceEnabled,
+    email,
+    idNumber,
+    ...rest
+  } = req.body || {};
 
   if (plan !== undefined || expireDate !== undefined) {
     return res.status(400).json({
@@ -1755,20 +3057,30 @@ router.post('/members', async (req, res) => {
   if (Object.keys(rest).length > 0) {
     return res.status(400).json({
       status: 'error',
-      message: `⛔ 非法參數：開卡只允許 name、phone、branchIds、faceEnabled，已拒絕 [${Object.keys(rest).join(', ')}]`,
+      message: `⛔ 非法參數：開卡只允許 name、phone、branchIds、faceEnabled、email、idNumber，已拒絕 [${Object.keys(rest).join(', ')}]`,
     });
   }
 
-  if (!name || !phone) {
+  if (!name || !phone || !String(idNumber || '').trim()) {
     return res.status(400).json({
       status: 'error',
-      message: '開卡失敗：姓名與手機號碼為必填',
+      message: '開卡失敗：姓名、手機號碼與證件號為必填',
     });
   }
 
   const normalizedPhone = normalizePhone(phone);
   if (normalizedPhone.length < 8) {
     return res.status(400).json({ status: 'error', message: '手機號碼格式無效' });
+  }
+
+  let normalizedId;
+  try {
+    normalizedId = assertRequiredIdNumber(idNumber);
+  } catch (e) {
+    return res.status(400).json({
+      status: 'error',
+      message: e.message || '證件號格式無效（身分證／居留證／護照）',
+    });
   }
 
   const wantFace = Boolean(faceEnabled);
@@ -1805,21 +3117,37 @@ router.post('/members', async (req, res) => {
     }
   }
 
+  let normalizedEmail = null;
+  if (email !== undefined && email !== null && String(email).trim()) {
+    try {
+      normalizedEmail = normalizeEmail(email);
+    } catch (e) {
+      return res.status(400).json({ status: 'error', message: e.message || 'Email 格式無效' });
+    }
+  }
+
   try {
+    const idTaken = await prisma.member.findUnique({ where: { idNumber: normalizedId } });
+    if (idTaken) {
+      return res.status(409).json({ status: 'error', message: '此證件號已註冊' });
+    }
+
     const memberNo = await allocateUniqueMemberNo();
     const member = await prisma.$transaction(async (tx) => {
       const created = await tx.member.create({
-        data: {
+      data: {
           memberNo,
-          name: String(name).trim(),
-          phone: normalizedPhone,
+        name: String(name).trim(),
+        phone: normalizedPhone,
+          email: normalizedEmail,
+          idNumber: normalizedId,
           plan: '計時會員',
           expireDate: null,
           allowBiometrics: false,
           faceEnabled: wantFace,
           facePreferenceSet: true, // 開卡時已明確選擇是否用人臉
-          role: 'MEMBER',
-        },
+        role: 'MEMBER',
+      },
       });
       await setMemberBranches(created.id, resolvedBranchIds, tx);
       if (wantFace) {
@@ -1886,11 +3214,21 @@ router.patch('/members/:id', async (req, res) => {
   }
 
   // 解除警示僅限總部合規 API（須寫入 reason 日誌）
-  if (req.body?.isAlert === false || req.body?.isAlert === 'false' || req.body?.isAlert === 0) {
-    return res.status(400).json({
-      status: 'error',
-      message: '⛔ 解除警示請改走總部合規補償 API：POST /api/hq/members/:id/clear-alert（須填 reason）',
+  // 注意：body 帶 isAlert:false 且會員「目前為警示」才拒絕；已是未警示則略過該欄（相容誤傳）
+  const clearAlertAttempt =
+    req.body?.isAlert === false || req.body?.isAlert === 'false' || req.body?.isAlert === 0;
+  if (clearAlertAttempt) {
+    const current = await prisma.member.findUnique({
+      where: { id: memberId },
+      select: { isAlert: true },
     });
+    if (current?.isAlert) {
+      return res.status(400).json({
+        status: 'error',
+        message: '⛔ 解除警示請改走總部合規補償 API：POST /api/hq/members/:id/clear-alert（須填 reason）',
+      });
+    }
+    delete req.body.isAlert;
   }
 
   if (req.body?.lineId !== undefined || req.body?.deviceId !== undefined) {
@@ -1912,6 +3250,8 @@ router.patch('/members/:id', async (req, res) => {
     'faceEnabled',
     'name',
     'phone',
+    'email',
+    'idNumber',
     'emergencyContact',
     'emergencyContactPhone',
   ];
@@ -1922,9 +3262,35 @@ router.patch('/members/:id', async (req, res) => {
     if (key === 'phone') {
       const phone = normalizePhone(req.body.phone);
       if (phone.length < 8) {
-        return res.status(400).json({ status: 'error', message: '手機號碼格式無效' });
+        return res.status(400).json({ status: 'error', message: '手機號碼為必填且格式須有效' });
       }
       data.phone = phone;
+      continue;
+    }
+
+    if (key === 'email') {
+      const raw = String(req.body.email || '').trim();
+      if (!raw) {
+        data.email = null;
+        continue;
+      }
+      try {
+        data.email = normalizeEmail(raw);
+      } catch (e) {
+        return res.status(400).json({ status: 'error', message: e.message || 'Email 格式無效' });
+      }
+      continue;
+    }
+
+    if (key === 'idNumber') {
+      try {
+        data.idNumber = assertRequiredIdNumber(req.body.idNumber);
+      } catch (e) {
+        return res.status(400).json({
+          status: 'error',
+          message: e.message || '證件號為必填（身分證／居留證／護照）',
+        });
+      }
       continue;
     }
 
@@ -1976,8 +3342,8 @@ router.patch('/members/:id', async (req, res) => {
       resolvedBranchIds = [req.user.branchId];
     }
     if (resolvedBranchIds.length === 0) {
-      return res.status(400).json({
-        status: 'error',
+    return res.status(400).json({
+      status: 'error',
         message: '請至少綁定一間分店',
       });
     }
@@ -2002,9 +3368,9 @@ router.patch('/members/:id', async (req, res) => {
       let updated;
       if (Object.keys(data).length > 0) {
         updated = await tx.member.update({
-          where: { id: memberId },
-          data,
-        });
+      where: { id: memberId },
+      data,
+    });
       } else {
         updated = await tx.member.findUnique({ where: { id: memberId } });
         if (!updated) {
@@ -2122,7 +3488,7 @@ router.post('/members/:id/bind-device', async (req, res) => {
       return res.status(404).json({ status: 'error', message: '找不到此會員' });
     }
 
-    const bindPatch = deviceBindUpdateIfChanged(existing.deviceId, deviceId);
+    const bindPatch = deviceBindUpdateIfChanged(existing.deviceId, deviceId, memberId);
     const member = bindPatch
       ? await prisma.member.update({
           where: { id: memberId },
@@ -2153,21 +3519,150 @@ router.post('/members/:id/unbind-device', async (req, res) => {
   }
 
   try {
-    const member = await prisma.member.update({
-      where: { id: memberId },
-      data: deviceBindUpdateData({ deviceId: null }),
+    const result = await opsResetMemberDevice({
+      memberId,
+      operatorId: req.user?.id ?? null,
+      reason: '櫃檯解除裝置綁定',
+      ip: clientIp(req),
+      userAgent: clientUserAgent(req),
+      action: 'OPS_UNBIND',
     });
     res.json({
       status: 'success',
-      message: `會員 [${member.name}] 已解除裝置綁定（舊登入已失效）`,
-      data: toCounterMemberView(member),
+      message: result.message,
+      data: toCounterMemberView(result.member),
     });
   } catch (error) {
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({ status: 'error', message: error.message });
+    }
     if (error.code === 'P2025') {
       return res.status(404).json({ status: 'error', message: '找不到此會員' });
     }
     console.error(error);
     res.status(500).json({ status: 'error', message: '解除裝置綁定失敗' });
+  }
+});
+
+/**
+ * 臨櫃核身重置裝置（方案 A 備援；DUTY+）
+ * POST /api/ops/members/:id/reset-device
+ * Body 可選：{ reason }
+ */
+router.post('/members/:id/reset-device', requireDutyOrAbove, async (req, res) => {
+  const memberId = parseInt(req.params.id, 10);
+  if (!Number.isInteger(memberId)) {
+    return res.status(400).json({ status: 'error', message: '無效的會員 ID' });
+  }
+
+  try {
+    const result = await opsResetMemberDevice({
+      memberId,
+      operatorId: req.user?.id ?? null,
+      reason: req.body?.reason
+        ? String(req.body.reason).slice(0, 200)
+        : '臨櫃核身重置裝置（Email 收不到／輸入錯誤）',
+      ip: clientIp(req),
+      userAgent: clientUserAgent(req),
+      action: 'OPS_UNBIND',
+    });
+    res.json({
+      status: 'success',
+      message: result.message,
+      data: toCounterMemberView(result.member),
+    });
+  } catch (error) {
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({ status: 'error', message: error.message });
+    }
+    console.error(error);
+    res.status(500).json({ status: 'error', message: '重置裝置失敗' });
+  }
+});
+
+/** GET /api/ops/members/:id/id-photos — 狀態標記（無影像；櫃檯 ops 可查） */
+router.get('/members/:id/id-photos', async (req, res) => {
+  try {
+    const memberId = Number(req.params.id);
+    if (!Number.isFinite(memberId)) {
+      return res.status(400).json({ status: 'error', message: '無效的會員 id' });
+    }
+    const meta = await getIdPhotoMetaForMember(memberId);
+    return res.json({
+      status: 'success',
+      data: {
+        ...meta,
+        policy: {
+          retentionYears: 3,
+          versionYears: 1,
+          staffAccess: 'status_only',
+          originalRequiresDuty: true,
+          deleteRequiresApproval: true,
+          presignTtlSecHint: '180-300',
+        },
+      },
+    });
+  } catch (error) {
+    console.error(error);
+    return res.status(500).json({ status: 'error', message: '讀取證件狀態失敗' });
+  }
+});
+
+/** POST /api/ops/members/:id/id-photo — 臨櫃代辦上傳（須 consentSignatureId） */
+router.post('/members/:id/id-photo', async (req, res) => {
+  try {
+    const memberId = Number(req.params.id);
+    if (!Number.isFinite(memberId)) {
+      return res.status(400).json({ status: 'error', message: '無效會員 id' });
+    }
+    const consentSignatureId = String(req.body?.consentSignatureId || '').trim();
+    if (!consentSignatureId) {
+      return res.status(403).json({
+        status: 'error',
+        code: 'CONSENT_REQUIRED',
+        message: '臨櫃代辦上傳證件須先取得客顯授權簽章（consentSignatureId）',
+      });
+    }
+    const side = normalizeIdPhotoSide(req.body?.side || 'front');
+    const staffId = req.user?.staffId ?? req.user?.id ?? null;
+    const branchId = req.user?.branchId != null ? Number(req.user.branchId) : null;
+    const branchCode = req.body?.branchCode || req.user?.branchCode || branchId || '—';
+    const today = new Date().toISOString().slice(0, 10);
+    const watermarkText = [
+      '僅供體育客會籍查驗｜他用無效',
+      `分店代碼：${branchCode}`,
+      `經辦人員：${staffId}`,
+      `日期：${today}`,
+    ].join('｜');
+
+    const saved = await uploadMemberIdPhoto(
+      memberId,
+      req.body?.image || req.body?.dataUrl,
+      side,
+      req,
+      {
+        watermarkText,
+        uploadedByStaffId: staffId,
+        uploadBranchId: branchId,
+        uploadSource: 'STAFF_USB_SCANNER',
+        consentSignatureId,
+      },
+    );
+    return res.json({
+      status: 'success',
+      message: '臨櫃證件已上傳',
+      data: saved,
+    });
+  } catch (error) {
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({
+        status: 'error',
+        code: error.code,
+        message: error.message,
+      });
+    }
+    console.error(error);
+    return res.status(500).json({ status: 'error', message: '臨櫃證件上傳失敗' });
   }
 });
 
@@ -2340,7 +3835,7 @@ router.post('/refund', async (req, res) => {
       } = calc;
 
       const invoiceCtx = await resolveOrderInvoiceReverse(order, { refundCash, tx });
-      // 退費折讓：有「真實」發票且應退現金 > 0 才開立折讓；禁止 SPLIT:／複合標記與 $0 全額折讓
+      // 退費折讓：必須有已開立成功的真實發票，且應退現金 > 0
       const pickRealInvoice = (n) => {
         const s = String(n || '').trim();
         if (!s || s.startsWith('SPLIT:') || s.includes(',')) return null;
@@ -2348,7 +3843,15 @@ router.post('/refund', async (req, res) => {
       };
       const resolvedInv =
         pickRealInvoice(invoiceCtx.invoiceNumber) || pickRealInvoice(invoiceNumberInput);
-      if (resolvedInv && refundCash > 0) {
+
+      if (refundCash > 0) {
+        if (!resolvedInv) {
+          const err = new Error(
+            '退費折讓須在開票成功後才能辦理（此訂單尚無有效發票號碼）',
+          );
+          err.statusCode = 400;
+          throw err;
+        }
         invoiceCtx.invoiceNumber = resolvedInv;
         invoiceCtx.prefer = 'allowance';
         invoiceCtx.skip = false;
@@ -2360,8 +3863,7 @@ router.post('/refund', async (req, res) => {
         invoiceCtx.skip = true;
         invoiceCtx.amount = 0;
         if (!invoiceCtx.skipReason) {
-          invoiceCtx.skipReason =
-            refundCash <= 0 ? '應退現金為 0，無需折讓／作廢' : '無可用發票號碼';
+          invoiceCtx.skipReason = '應退現金為 0，無需折讓／作廢';
         }
       }
 
@@ -2746,9 +4248,34 @@ router.post('/cancel-sale', async (req, res) => {
         };
 
     if (preferMode === 'allowance') {
+      try {
+        assertRealInvoiceForAllowance(
+          invoiceCtx.invoiceNumber || sale.invoiceNumber,
+          '取消銷貨退費折讓',
+        );
+      } catch (invErr) {
+        return res.status(invErr.statusCode || 400).json({
+          status: 'error',
+          message: invErr.message,
+        });
+      }
       invoiceCtx.prefer = 'allowance';
+      invoiceCtx.skip = false;
     } else if (preferMode === 'void' && !invoiceCtx.sharedInvoice) {
       invoiceCtx.prefer = 'void';
+    } else if (invoiceCtx.prefer === 'allowance' && wasPaid && !invoiceCtx.skip) {
+      // 舊合併發票僅准折讓：同樣須有真實發票號
+      try {
+        assertRealInvoiceForAllowance(
+          invoiceCtx.invoiceNumber || sale.invoiceNumber,
+          '取消銷貨退費折讓',
+        );
+      } catch (invErr) {
+        return res.status(invErr.statusCode || 400).json({
+          status: 'error',
+          message: invErr.message,
+        });
+      }
     }
 
     let invoiceReverse = { action: 'none', invoiceNumber: null };
@@ -2839,11 +4366,11 @@ router.post('/cancel-sale', async (req, res) => {
       const descBase = `${fresh.itemDesc || ''}｜已取消${note ? `：${note}` : ''}`;
       const cancelUpdated = await tx.saleOrder.updateMany({
         where: { id, status: { in: ['PAID', 'PENDING'] } },
-        data: {
+      data: {
           status: 'CANCELLED',
           itemDesc: appendInvoiceReverseNote(descBase, invoiceReverse),
-        },
-      });
+      },
+    });
       if (cancelUpdated.count === 0) {
         const err = new Error(
           '銷貨單狀態已變更，請重新查詢（若發票已作廢／折讓請人工核對）',
@@ -3106,7 +4633,7 @@ router.post('/cancel-gate', async (req, res) => {
       const note = String(reason || '').trim() || null;
       const updated = await tx.checkInLog.update({
         where: { id },
-        data: {
+      data: {
           status: 'CANCELLED',
           cancelledAt: new Date(),
           cancelReason: note,
@@ -3253,7 +4780,7 @@ router.post('/check-ins/:logId/check-out', async (req, res) => {
     });
     broadcastCheckOut(result);
     const payload = checkOutSuccessPayload(result);
-    return res.json({
+      return res.json({
       ...payload,
       data: {
         logId: result.log.id,
@@ -3335,12 +4862,12 @@ router.get('/members/:id/contracts', async (req, res) => {
     });
 
     res.json({
-      status: 'success',
-      data: {
+        status: 'success',
+        data: {
         board,
         signatures: rows.map(serializeSignature),
-      },
-    });
+        },
+      });
   } catch (error) {
     console.error(error);
     res.status(500).json({ status: 'error', message: '讀取會員合約失敗' });
@@ -3453,8 +4980,8 @@ router.post('/members/:id/contracts/assign', async (req, res) => {
       }
       assertBranchAccess(req, promo.branchId);
       if (!promo.requiresMemberContract) {
-        return res.status(400).json({
-          status: 'error',
+    return res.status(400).json({
+      status: 'error',
           message: '此方案未勾選需簽署會員合約',
         });
       }
@@ -3605,13 +5132,13 @@ router.post('/members/:id/contracts/:signId/resign', async (req, res) => {
     await syncMemberAllowBiometrics(memberId);
 
     res.json({
-      status: 'success',
+            status: 'success',
       message: `電子合約 [${updated.contract.title}] ${serializeSignature(updated).versionLabel || ''} 已改為待重簽（舊簽名已留存稽核）`,
-      data: {
+            data: {
         signature: serializeSignature(updated),
         history,
-      },
-    });
+            },
+          });
   } catch (error) {
     console.error(error);
     res.status(500).json({ status: 'error', message: '電子合約重簽準備失敗' });
@@ -3814,7 +5341,7 @@ router.post('/orders', async (req, res) => {
 
   if (amount !== undefined || itemDesc !== undefined || Object.keys(rest).length > 0) {
     return res.status(400).json({
-      status: 'error',
+          status: 'error',
       message:
         '⛔ 非法參數：線上訂單只允許 memberId、promotionId、cardMode、cardInst、periodType、periodTimes；金額一律由後端查 Promotion 表決定',
     });
@@ -3839,7 +5366,7 @@ router.post('/orders', async (req, res) => {
     const member = await prisma.member.findUnique({
       where: { id: parseInt(memberId, 10) },
     });
-    if (!member) {
+      if (!member) {
       return res.status(404).json({ status: 'error', message: '找不到此會員' });
     }
 
@@ -3851,6 +5378,25 @@ router.post('/orders', async (req, res) => {
       );
     } catch (error) {
       return res.status(error.statusCode || 400).json({ status: 'error', message: error.message });
+    }
+
+    let recurringAmount = null;
+    if (cardOpts.cardMode === 'RECURRING') {
+      const periodCount = parseInt(promotion.periodCount, 10);
+      if (!Number.isInteger(periodCount) || periodCount <= 0) {
+        return res.status(400).json({
+          status: 'error',
+          message: '此儲值方案未設定有效期期數，無法使用定期定額',
+        });
+      }
+      cardOpts.periodTimes = periodCount;
+      recurringAmount = resolvePromotionRecurringAmount(promotion);
+      if (!recurringAmount) {
+        return res.status(400).json({
+          status: 'error',
+          message: '此儲值方案未設定定期定額扣款金額',
+        });
+      }
     }
 
     const orderId = resolveTopupOrderId({
@@ -3871,6 +5417,7 @@ router.post('/orders', async (req, res) => {
         cardInst: cardOpts.cardInst,
         periodType: cardOpts.periodType,
         periodTimes: cardOpts.periodTimes,
+        recurringAmount,
         status: 'PENDING',
       },
     });
@@ -3883,8 +5430,11 @@ router.post('/orders', async (req, res) => {
       cardInst: cardOpts.cardInst,
       periodType: cardOpts.periodType,
       periodTimes: cardOpts.periodTimes,
-      periodAmt: newOrder.amount,
-      recurringAmount: newOrder.amount,
+      periodAmt: recurringAmount ?? newOrder.amount,
+      recurringAmount: recurringAmount ?? newOrder.amount,
+      payuniPeriodHash: resolvePayuniPeriodHash({ channel: 'online', promotion }),
+      channel: 'online',
+      promotion,
     });
 
     res.json({
@@ -4040,9 +5590,9 @@ router.get('/members', async (req, res) => {
       prisma.member.count({ where }),
       prisma.member.findMany({
         where,
-        select: {
+      select: {
           id: true, memberNo: true, name: true, phone: true, plan: true, expireDate: true,
-          cashWallet: true, bonusWallet: true,
+        cashWallet: true, bonusWallet: true,
           papagoFaceId: true, isAlert: true, allowBiometrics: true, faceEnabled: true,
           deviceId: true, lineId: true,
           emergencyContact: true, emergencyContactPhone: true,
@@ -4103,7 +5653,7 @@ router.get('/members', async (req, res) => {
               allowBiometrics,
               planName: planNameByMember.get(m.id) || m.plan,
             }),
-            papagoFaceId: m.papagoFaceId ? '(已綁定)' : null,
+        papagoFaceId: m.papagoFaceId ? '(已綁定)' : null,
           };
           if (!lite) {
             view.contracts = boardByMember.get(m.id) || [];

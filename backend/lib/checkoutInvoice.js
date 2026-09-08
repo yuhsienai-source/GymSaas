@@ -13,12 +13,23 @@ function parseSplitInvoiceParts(sessionInvoiceNumber) {
   return body.split(',').map((x) => x.trim()).filter(Boolean);
 }
 
+function mapLegToRefType(leg) {
+  const L = String(leg || '').toUpperCase();
+  if (L === 'SALE') return 'SALE';
+  return 'ORDER';
+}
+
 /**
  * 對 CHK 子單據分別開立 ezPay 發票（MerchantOrderNo = 子單號）
- * CheckoutSession.invoiceNumber 改存 SPLIT:逗號串接（僅顯示／稽核，不作廢依據）
- * 已開票子單會略過（冪等重試安全）
+ * 開票失敗 → 寫入 InvoiceIssueJob（不沖回已收款），回傳 partial
  *
- * @returns {{ invoices: Array<{ leg: string, id: string, invoiceNumber: string|null, amount: number, ok: boolean, skipped?: boolean, message?: string }>, invoiceNumber: string|null }}
+ * @returns {{
+ *   invoices: Array<object>,
+ *   invoiceNumber: string|null,
+ *   invoiceJobs: Array<object>,
+ *   partial: boolean,
+ *   code: 'OK'|'PARTIAL_INVOICE'|null
+ * }}
  */
 export async function issueSplitCheckoutInvoices({
   checkoutId,
@@ -31,7 +42,13 @@ export async function issueSplitCheckoutInvoices({
     where: { id: String(checkoutId || '').trim() },
   });
   if (!session) {
-    return { invoices: [], invoiceNumber: null };
+    return {
+      invoices: [],
+      invoiceNumber: null,
+      invoiceJobs: [],
+      partial: false,
+      code: null,
+    };
   }
 
   const opts = {
@@ -42,6 +59,17 @@ export async function issueSplitCheckoutInvoices({
   };
 
   const invoices = [];
+  const invoiceJobs = [];
+
+  async function stampInvoiceStatus(refType, refId, invoiceStatus, invoiceNumber) {
+    const data = { invoiceStatus };
+    if (invoiceNumber != null) data.invoiceNumber = invoiceNumber;
+    if (refType === 'SALE') {
+      await prisma.saleOrder.update({ where: { id: refId }, data }).catch(() => {});
+    } else {
+      await prisma.order.update({ where: { id: refId }, data }).catch(() => {});
+    }
+  }
 
   async function issueOne({ leg, id, amount, itemDesc, stamp, existingInvoiceNumber }) {
     const amt = roundMoney(amount);
@@ -61,6 +89,37 @@ export async function issueSplitCheckoutInvoices({
       return;
     }
 
+    const failJob = async (message) => {
+      const { upsertFailedInvoiceJob, scheduleInvoiceJob } = await import('./invoiceQueue.js');
+      const job = await upsertFailedInvoiceJob({
+        refType: mapLegToRefType(leg),
+        refId: id,
+        leg,
+        amount: amt,
+        itemDesc: itemDesc || leg,
+        buyerName: opts.buyerName,
+        carrierNum: opts.carrierNum,
+        buyerUbn: opts.buyerUbn,
+        loveCode: opts.loveCode,
+        checkoutId: session.id,
+        lastError: message,
+      });
+      invoiceJobs.push(job);
+      await stampInvoiceStatus(mapLegToRefType(leg), id, 'FAILED');
+      invoices.push({
+        leg,
+        id,
+        invoiceNumber: null,
+        amount: amt,
+        ok: false,
+        queued: true,
+        jobId: job.id,
+        message,
+      });
+      scheduleInvoiceJob(job.id);
+      console.error(`❌ 軟拆開票失敗 ${leg} ${id} → 已入佇列 ${job.id}:`, message);
+    };
+
     try {
       const invoiceResult = await issueInvoice({
         id,
@@ -72,23 +131,25 @@ export async function issueSplitCheckoutInvoices({
         const invoiceData = JSON.parse(invoiceResult.Result);
         const invoiceNumber = invoiceData.InvoiceNumber;
         await stamp(invoiceNumber);
+        await stampInvoiceStatus(mapLegToRefType(leg), id, 'ISSUED', invoiceNumber);
+        // 若先前有 FAILED 任務，標成功
+        await prisma.invoiceIssueJob
+          .updateMany({
+            where: { refId: id, leg: String(leg).toUpperCase(), status: { not: 'SUCCESS' } },
+            data: {
+              status: 'SUCCESS',
+              invoiceNumber,
+              lastError: null,
+            },
+          })
+          .catch(() => {});
         invoices.push({ leg, id, invoiceNumber, amount: amt, ok: true });
         console.log(`🧾 軟拆開票 ${leg} ${id} → ${invoiceNumber} $${amt}`);
       } else {
-        const message = invoiceResult.Message || String(invoiceResult);
-        invoices.push({ leg, id, invoiceNumber: null, amount: amt, ok: false, message });
-        console.error(`❌ 軟拆開票失敗 ${leg} ${id}:`, message);
+        await failJob(invoiceResult.Message || String(invoiceResult));
       }
     } catch (err) {
-      invoices.push({
-        leg,
-        id,
-        invoiceNumber: null,
-        amount: amt,
-        ok: false,
-        message: err.message,
-      });
-      console.error(`❌ 軟拆開票例外 ${leg} ${id}:`, err.message);
+      await failJob(err.message || String(err));
     }
   }
 
@@ -104,7 +165,7 @@ export async function issueSplitCheckoutInvoices({
         stamp: async (invoiceNumber) => {
           await prisma.saleOrder.update({
             where: { id: sale.id },
-            data: { invoiceNumber },
+            data: { invoiceNumber, invoiceStatus: 'ISSUED' },
           });
         },
       });
@@ -123,7 +184,7 @@ export async function issueSplitCheckoutInvoices({
         stamp: async (invoiceNumber) => {
           await prisma.order.update({
             where: { id: order.id },
-            data: { invoiceNumber },
+            data: { invoiceNumber, invoiceStatus: 'ISSUED' },
           });
         },
       });
@@ -148,7 +209,7 @@ export async function issueSplitCheckoutInvoices({
       stamp: async (invoiceNumber) => {
         await prisma.order.update({
           where: { id: order.id },
-          data: { invoiceNumber },
+          data: { invoiceNumber, invoiceStatus: 'ISSUED' },
         });
       },
     });
@@ -161,17 +222,22 @@ export async function issueSplitCheckoutInvoices({
     ]),
   ];
   const joined = mergedParts.join(',');
+  const partial = invoices.some((i) => i && i.ok === false);
 
   await prisma.checkoutSession.update({
     where: { id: session.id },
     data: {
-      invoiceNumber: joined ? `SPLIT:${joined}` : null,
+      invoiceNumber: joined ? `SPLIT:${joined}` : session.invoiceNumber,
+      invoiceStatus: partial ? 'FAILED' : joined ? 'ISSUED' : session.invoiceStatus,
     },
   });
 
   return {
     invoices,
     invoiceNumber: mergedParts[0] || null,
+    invoiceJobs,
+    partial,
+    code: partial ? 'PARTIAL_INVOICE' : invoices.length ? 'OK' : null,
   };
 }
 

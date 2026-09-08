@@ -7,7 +7,10 @@ import { parseMemberIdentityQrPayload } from './memberIdentityQr.js';
 import { isValidMemberNo } from './memberNo.js';
 
 export function normalizePhone(phone) {
-  return String(phone || '').replace(/[\s\-()]/g, '').trim();
+  return String(phone || '')
+    .replace(/[\s\-()]/g, '')
+    .replace(/^\+/, '')
+    .trim();
 }
 
 export function toCounterMemberView(member) {
@@ -37,6 +40,8 @@ export function toCounterMemberView(member) {
     memberNo: member.memberNo || null,
     name: member.name,
     phone: member.phone,
+    email: member.email || null,
+    idNumber: member.idNumber || null,
     emergencyContact: member.emergencyContact || null,
     emergencyContactPhone: member.emergencyContactPhone || null,
     plan: member.plan,

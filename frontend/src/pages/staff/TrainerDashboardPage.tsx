@@ -10,6 +10,7 @@ import type {
   TrainerInboxItem,
 } from '../../types/api';
 import TrainerBookPanel from '../../components/staff/trainer/TrainerBookPanel';
+import TrainerCheckInPanel from '../../components/staff/trainer/TrainerCheckInPanel';
 import TrainerHistoryPanel from '../../components/staff/trainer/TrainerHistoryPanel';
 import TrainerInboxList from '../../components/staff/trainer/TrainerInboxList';
 import TrainerScheduleList from '../../components/staff/trainer/TrainerScheduleList';
@@ -435,6 +436,14 @@ export default function TrainerDashboardPage() {
                     }}
                     emptyTitle="近期沒有課程"
                     emptyDesc="尚無未來排程（含團課、私教、諮詢）。團課請至「總部 HQ／團課管理」排程。"
+                  />
+                </div>
+                <div className="mt-lg">
+                  <TrainerCheckInPanel
+                    classItem={selectedClass}
+                    viewAsTrainerId={
+                      viewAsTrainerId === '' ? undefined : Number(viewAsTrainerId)
+                    }
                   />
                 </div>
               </PageSection>

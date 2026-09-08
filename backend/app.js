@@ -17,9 +17,19 @@ import inventoryOpsRoutes from './routes/inventoryOps.js';
 import reportsRoutes from './routes/reports.js';
 import contractsRoutes from './routes/contracts.js';
 import onboardingRoutes from './routes/onboarding.js';
+import cmsRoutes from './routes/cms.js';
+import marketingRoutes from './routes/marketing.js';
+import { hrAdminRouter, hrSelfRouter } from './routes/hr.js';
+import { coachExtTrainerRouter, coachExtAdminRouter } from './routes/coachExt.js';
+import memberExtRoutes from './routes/memberExt.js';
+import opsExtensionsRoutes from './routes/opsExtensions.js';
 import { attachOccupancyWebSocket } from './lib/occupancy.js';
+import { attachGateAlertWebSocket } from './lib/gateAlert.js';
 import { backfillMissingMemberNos } from './lib/memberNo.js';
 import { startCardRecurringScheduler } from './lib/cardSubscription.js';
+import { purgeExpiredIdPhotos } from './lib/idPhoto.js';
+import { idPhotoStorageDriver } from './lib/idPhotoStorage.js';
+import { bootInvoiceQueue } from './lib/invoiceQueue.js';
 
 const app = express();
 const PORT = process.env.PORT || 8000;
@@ -134,7 +144,7 @@ app.get('/', (req, res) => {
     message: '體育客 GymSaaS Backend API（前後端分離｜本服務不提供 UI）',
     data: {
       health: '/api/health',
-      websocket: '/ws/occupancy',
+      websocket: ['/ws/occupancy', '/ws/gate-alert'],
       docsNote: '請由獨立前端網域呼叫本 API；FRONTEND_URL 僅用於 OAuth／金流瀏覽器回流',
     },
   });
@@ -155,19 +165,29 @@ app.get('/api/health', (req, res) => {
 app.use('/api/gate', gateRoutes);
 // 較長路徑須掛在 /api/ops 之前，否則會被 ops 中介層攔截
 app.use('/api/ops/inventory', inventoryOpsRoutes);
+// ops 須先於 opsExtensions：PayUNi／LinePay 公開回流在 verifyStaff 之前註冊；
+// 未匹配再 next() 到 opsExtensions（DUTY+ 延伸）
 app.use('/api/ops', opsRoutes);
+app.use('/api/ops', opsExtensionsRoutes);
 app.use('/api/ops', posRoutes);
 app.use('/api/member', memberRoutes);
+app.use('/api/member', memberExtRoutes);
 app.use('/api/trainer', trainerRoutes);
 // 較長路徑須掛在 /api/hq 之前，否則 hq 的 requireAdmin 會擋住 DUTY 報表
 app.use('/api/hq/reports', reportsRoutes);
 app.use('/api/hq/contracts', contractsRoutes);
+app.use('/api/hq/marketing', marketingRoutes);
+app.use('/api/hq/hr', hrAdminRouter);
+app.use('/api/hq/coach', coachExtAdminRouter);
 app.use('/api/hq', hqRoutes);
+app.use('/api/staff/hr', hrSelfRouter);
+app.use('/api/trainer/ext', coachExtTrainerRouter);
 app.use('/api/pt', ptRoutes);
 app.use('/api/auth', authRoutes);
 app.use('/api/onboarding', onboardingRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/board', boardRoutes);
+app.use('/api/cms', cmsRoutes);
 
 // 未匹配的非 API 路徑：一律 JSON 404（不回 HTML）
 app.use((req, res) => {
@@ -179,9 +199,10 @@ app.use((req, res) => {
 
 const server = http.createServer(app);
 attachOccupancyWebSocket(server);
+attachGateAlertWebSocket(server);
 
 server.listen(PORT, () => {
-  console.log(`[體育客 API] Port ${PORT}｜純後端｜WS /ws/occupancy`);
+  console.log(`[體育客 API] Port ${PORT}｜純後端｜WS /ws/occupancy · /ws/gate-alert`);
   const apiPub = String(process.env.API_PUBLIC_URL || process.env.BASE_URL || '').trim();
   const fe = String(process.env.FRONTEND_URL || '').trim();
   if (/localhost|127\.0\.0\.1/i.test(apiPub) && /localhost|127\.0\.0\.1/i.test(fe || 'localhost')) {
@@ -190,6 +211,17 @@ server.listen(PORT, () => {
     );
   }
   startCardRecurringScheduler();
+  bootInvoiceQueue().catch((err) => console.warn('[invoiceQueue] boot:', err.message));
+  // 證件：歷史版 1 年／保存期 3 年到期硬刪（每 6 小時）
+  const runIdPhotoPurge = () => {
+    purgeExpiredIdPhotos()
+      .then(({ purged }) => {
+        if (purged > 0) console.log(`[證件歸檔] 已清除 ${purged} 筆到期影像（storage=${idPhotoStorageDriver()}）`);
+      })
+      .catch((err) => console.error('[證件歸檔] purge 失敗:', err.message));
+  };
+  runIdPhotoPurge();
+  setInterval(runIdPhotoPurge, 6 * 60 * 60 * 1000);
   backfillMissingMemberNos()
     .then((n) => {
       if (n > 0) console.log(`[體育客] 已補發 ${n} 組會員編號`);

@@ -229,6 +229,7 @@ export async function adjustProductStock(tx, {
 
 /**
  * 嘗試開立 ezPay 發票並回寫 SaleOrder.invoiceNumber
+ * @returns {string} 發票號碼；失敗則拋錯（呼叫端應沖回交易）
  */
 export async function tryIssueSaleInvoice(saleOrder, buyerName) {
   try {
@@ -251,11 +252,17 @@ export async function tryIssueSaleInvoice(saleOrder, buyerName) {
       console.log(`🧾 銷貨 ${saleOrder.id} 發票：${invoiceData.InvoiceNumber}`);
       return invoiceData.InvoiceNumber;
     }
-    console.error(`❌ 銷貨 ${saleOrder.id} 發票失敗:`, invoiceResult.Message || invoiceResult);
-    return null;
+    const message = invoiceResult.Message || String(invoiceResult);
+    console.error(`❌ 銷貨 ${saleOrder.id} 發票失敗:`, message);
+    const err = new Error(`電子發票開立失敗：${message}`);
+    err.statusCode = 502;
+    throw err;
   } catch (error) {
+    if (error.statusCode) throw error;
     console.error(`❌ 銷貨 ${saleOrder.id} 發票例外:`, error.message);
-    return null;
+    const err = new Error(`電子發票開立失敗：${error.message}`);
+    err.statusCode = 502;
+    throw err;
   }
 }
 
@@ -302,6 +309,43 @@ export async function fulfillCardSaleOrder(
     return { ...sale, invoiceNumber: null };
   }
 
-  const invoiceNumber = await tryIssueSaleInvoice(sale, sale.member?.name);
-  return { ...sale, invoiceNumber };
+  try {
+    const invoiceNumber = await tryIssueSaleInvoice(sale, sale.member?.name);
+    return { ...sale, invoiceNumber };
+  } catch (invErr) {
+    await abortPaidSaleAfterInvoiceFailure(sale.id, staffId, invErr.message);
+    throw invErr;
+  }
+}
+
+/** 開票失敗：回補庫存、退零錢包、標 FAILED */
+export async function abortPaidSaleAfterInvoiceFailure(saleId, staffId = null, reason = '電子發票開立失敗') {
+  await prisma.$transaction(async (tx) => {
+    const fresh = await tx.saleOrder.findUnique({
+      where: { id: saleId },
+      include: { items: true },
+    });
+    if (!fresh || fresh.status !== 'PAID') return;
+
+    await restockSaleStock(tx, fresh, staffId);
+
+    const breakdown =
+      fresh.payBreakdown && typeof fresh.payBreakdown === 'object' ? fresh.payBreakdown : {};
+    const walletCash = Math.round((Number(breakdown.WALLET_CASH) || 0) * 100) / 100;
+    if (walletCash > 0 && fresh.memberId) {
+      await tx.member.update({
+        where: { id: fresh.memberId },
+        data: { cashWallet: { increment: walletCash } },
+      });
+    }
+
+    await tx.saleOrder.update({
+      where: { id: fresh.id },
+      data: {
+        status: 'FAILED',
+        invoiceNumber: null,
+        itemDesc: `${fresh.itemDesc || ''}｜${reason}，交易取消`.slice(0, 500),
+      },
+    });
+  });
 }

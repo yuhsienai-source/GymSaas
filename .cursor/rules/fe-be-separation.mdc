@@ -7,7 +7,7 @@ alwaysApply: true
 
 - 可執行程式碼只在 `backend/`（API）與 `frontend/`（SPA）。
 - 根目錄禁止復活 `public/*.html`、`routes/`、`app.js`、`express.static`。
-- 改後端時遵守 `backend/.cursorrules`；改前端時遵守 `frontend/.cursorrules`。
+- **Master**：根目錄 `.cursorrules`；改後端另遵 `backend/.cursorrules`；改前端另遵 `frontend/.cursorrules`。
 - 後端只回 JSON（OAuth／金流對 `FRONTEND_URL` 的 302 除外）。
 - 前端禁止寫 Prisma／Express／自創儲值金額／會員門禁直傳 `memberId`。
 - `FRONTEND_URL` 與 `API_PUBLIC_URL` 必須分離。

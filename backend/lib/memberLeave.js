@@ -6,12 +6,84 @@ import {
   remainingExpireDays,
   shiftDateByDays,
 } from './promotion.js';
-import { resumeCardSubscription } from './cardSubscription.js';
+import {
+  resolveExpectedNextChargeAt,
+  resumeCardSubscription,
+} from './cardSubscription.js';
+import {
+  extractPeriodTradeNo,
+  stopPayuniRecurringForSubscription,
+} from './payuni.js';
 
 function httpError(message, statusCode = 400) {
   const err = new Error(message);
   err.statusCode = statusCode;
   return err;
+}
+
+/**
+ * 請假順延後的下次扣款日（本地 00:00）
+ * 若 DB 仍是 2099 佔位，先推算真實預期日再 +days
+ */
+function shiftSubscriptionNextChargeAt(sub, leaveDays, now = new Date()) {
+  const base = resolveExpectedNextChargeAt(sub, now);
+  const shifted = shiftDateByDays(base, leaveDays);
+  shifted.setHours(0, 0, 0, 0);
+  return shifted;
+}
+
+/**
+ * 請假開始前：PERIOD 訂閱必須先 suspend PayUNi，否則畫面請假金流仍扣
+ */
+async function suspendPayuniForLeave(sub, { forceLocalOnly = false } = {}) {
+  if (!sub || !extractPeriodTradeNo(sub)) {
+    return { ok: true, skipped: true, message: '無 PayUNi 續期單' };
+  }
+  let payuniStop;
+  try {
+    payuniStop = await stopPayuniRecurringForSubscription(sub, { mode: 'suspend' });
+  } catch (e) {
+    payuniStop = { ok: false, message: e.message || '暫停 PayUNi 續期失敗' };
+  }
+  if (!payuniStop.ok && !payuniStop.skipped && !forceLocalOnly) {
+    const err = httpError(
+      payuniStop.message ||
+        'PayUNi 續期尚未暫停，請假未建立（避免顯示已請假卻仍扣款）',
+      409,
+    );
+    err.payuniStop = payuniStop;
+    throw err;
+  }
+  return payuniStop;
+}
+
+/**
+ * 銷假後恢復訂閱；閘機／自動銷假用 forceLocalOnly，避免卡入場
+ */
+async function resumeSubscriptionAfterLeave(
+  subId,
+  { now = new Date(), forceLocalOnly = true } = {},
+) {
+  if (!subId) return null;
+  const sub = await prisma.cardSubscription.findUnique({ where: { id: subId } });
+  if (!sub || sub.status !== 'PAUSED') return sub;
+  try {
+    const resumed = await resumeCardSubscription(sub.id, { now, forceLocalOnly });
+    if (
+      resumed?.payuniResume &&
+      !resumed.payuniResume.ok &&
+      !resumed.payuniResume.skipped
+    ) {
+      console.warn(
+        `[請假銷假] ${subId} 本機已恢復，PayUNi：${resumed.payuniResume.message || '未啟用'}`,
+      );
+    }
+    return resumed?.subscription || resumed;
+  } catch (e) {
+    console.warn(`[請假銷假] 恢復訂閱失敗 ${subId}:`, e.message);
+    if (!forceLocalOnly) throw e;
+    return sub;
+  }
 }
 
 /**
@@ -69,10 +141,7 @@ export async function settleExpiredLeave(memberId, { now = new Date() } = {}) {
 
   const subId = active?.subscriptionId;
   if (subId) {
-    const sub = await prisma.cardSubscription.findUnique({ where: { id: subId } });
-    if (sub?.status === 'PAUSED') {
-      await resumeCardSubscription(sub.id, { now });
-    }
+    await resumeSubscriptionAfterLeave(subId, { now, forceLocalOnly: true });
   }
 
   return result;
@@ -82,7 +151,7 @@ export async function settleExpiredLeave(memberId, { now = new Date() } = {}) {
  * 開始請假
  * - 效期：expireDate 預先 +days（時鐘不空轉）
  * - 進場：leaveUntil = endAt，閘機拒絕月費通行
- * - 訂閱：若有 ACTIVE 則暫停，nextChargeAt 順延 +days
+ * - 訂閱：PERIOD 先 PayUNi suspend，再本機 PAUSED + nextChargeAt 順延 +days
  */
 export async function startMemberLeave({
   memberId,
@@ -90,7 +159,10 @@ export async function startMemberLeave({
   reason,
   staffId,
   subscriptionId,
+  forceLocalOnly = false,
   now = new Date(),
+  proofStorageKey = null,
+  proofFileName = null,
 } = {}) {
   const leaveDays = parseInt(days, 10);
   if (!Number.isInteger(leaveDays) || leaveDays <= 0 || leaveDays > 365) {
@@ -121,11 +193,17 @@ export async function startMemberLeave({
   }
 
   const sub = await findActiveSubscriptionForMember(memberId, { subscriptionId });
+  const payuniStop = await suspendPayuniForLeave(sub, { forceLocalOnly });
+
   const startAt = new Date(now);
   const endAt = shiftDateByDays(startAt, leaveDays);
   const expireDateBefore = member.expireDate ? new Date(member.expireDate) : null;
-  const nextChargeAtBefore = sub?.nextChargeAt ? new Date(sub.nextChargeAt) : null;
+  // 快照用「可顯示的預期扣款日」（含把 2099 佔位還原），銷假／稽核才有意義
+  const nextChargeAtBefore = sub ? resolveExpectedNextChargeAt(sub, now) : null;
   const newExpire = computeMemberExpireDate(member.expireDate, leaveDays, now);
+  const nextChargeAtAfter = sub
+    ? shiftSubscriptionNextChargeAt(sub, leaveDays, now)
+    : null;
 
   const leave = await prisma.$transaction(async (tx) => {
     const row = await tx.memberLeave.create({
@@ -140,6 +218,8 @@ export async function startMemberLeave({
         status: 'ACTIVE',
         reason: reason ? String(reason).trim().slice(0, 200) : null,
         staffId: staffId ?? null,
+        proofStorageKey: proofStorageKey ? String(proofStorageKey).slice(0, 500) : null,
+        proofFileName: proofFileName ? String(proofFileName).trim().slice(0, 120) : null,
       },
     });
 
@@ -151,22 +231,36 @@ export async function startMemberLeave({
       },
     });
 
+    const payuniNote =
+      payuniStop && !payuniStop.skipped
+        ? payuniStop.ok
+          ? '；PayUNi 已暫停'
+          : `；PayUNi：${String(payuniStop.message || '').slice(0, 80)}`
+        : '';
+
     if (sub && sub.status === 'ACTIVE') {
       await tx.cardSubscription.update({
         where: { id: sub.id },
         data: {
           status: 'PAUSED',
-          nextChargeAt: shiftDateByDays(sub.nextChargeAt, leaveDays),
-          lastError: `請假中至 ${endAt.toISOString().slice(0, 10)}`,
+          nextChargeAt: nextChargeAtAfter,
+          lastError: `請假中至 ${endAt.toISOString().slice(0, 10)}${payuniNote}`.slice(
+            0,
+            200,
+          ),
         },
       });
     } else if (sub && sub.status === 'PAUSED') {
-      // 已暫停續扣：仍順延下次扣款，避免銷假後立刻扣
+      // 已暫停續扣：仍順延下次扣款，避免銷假後立刻扣；必要時已補 suspend
       await tx.cardSubscription.update({
         where: { id: sub.id },
         data: {
-          nextChargeAt: shiftDateByDays(sub.nextChargeAt, leaveDays),
-          lastError: `請假中至 ${endAt.toISOString().slice(0, 10)}（原已暫停）`,
+          nextChargeAt: nextChargeAtAfter,
+          lastError:
+            `請假中至 ${endAt.toISOString().slice(0, 10)}（原已暫停）${payuniNote}`.slice(
+              0,
+              200,
+            ),
         },
       });
     }
@@ -183,6 +277,7 @@ export async function startMemberLeave({
     leave,
     member: updatedMember,
     subscription: updatedSub,
+    payuniStop,
     remainingDaysBefore: remainingExpireDays(expireDateBefore, now),
     expireDateAfter: newExpire,
   };
@@ -196,6 +291,7 @@ export async function endMemberLeaveEarly({
   leaveId,
   reason,
   resumeSubscription = true,
+  forceLocalOnly = false,
   now = new Date(),
 } = {}) {
   const leave = leaveId
@@ -247,10 +343,11 @@ export async function endMemberLeaveEarly({
         where: { id: leave.subscriptionId },
       });
       if (sub) {
+        const rolled = shiftSubscriptionNextChargeAt(sub, -unusedLeaveDays, now);
         await tx.cardSubscription.update({
           where: { id: sub.id },
           data: {
-            nextChargeAt: shiftDateByDays(sub.nextChargeAt, -unusedLeaveDays),
+            nextChargeAt: rolled,
             lastError: null,
           },
         });
@@ -260,14 +357,10 @@ export async function endMemberLeaveEarly({
 
   let subscription = null;
   if (resumeSubscription && leave.subscriptionId) {
-    const sub = await prisma.cardSubscription.findUnique({
-      where: { id: leave.subscriptionId },
+    subscription = await resumeSubscriptionAfterLeave(leave.subscriptionId, {
+      now,
+      forceLocalOnly,
     });
-    if (sub?.status === 'PAUSED') {
-      subscription = await resumeCardSubscription(sub.id, { now });
-    } else {
-      subscription = sub;
-    }
   }
 
   return {
@@ -300,12 +393,10 @@ export async function completeMemberLeaveOnSchedule(leaveId, { now = new Date() 
   });
 
   if (leave.subscriptionId) {
-    const sub = await prisma.cardSubscription.findUnique({
-      where: { id: leave.subscriptionId },
+    await resumeSubscriptionAfterLeave(leave.subscriptionId, {
+      now,
+      forceLocalOnly: true,
     });
-    if (sub?.status === 'PAUSED') {
-      await resumeCardSubscription(sub.id, { now });
-    }
   }
 
   return prisma.memberLeave.findUnique({
@@ -321,8 +412,20 @@ export async function listMemberLeaves({ memberId, status, take = 50 } = {}) {
       ...(status ? { status: String(status) } : {}),
     },
     include: {
-      member: { select: { id: true, name: true, memberNo: true, phone: true, leaveUntil: true, expireDate: true, plan: true } },
-      subscription: { select: { id: true, status: true, nextChargeAt: true, amount: true } },
+      member: {
+        select: {
+          id: true,
+          name: true,
+          memberNo: true,
+          phone: true,
+          leaveUntil: true,
+          expireDate: true,
+          plan: true,
+        },
+      },
+      subscription: {
+        select: { id: true, status: true, nextChargeAt: true, amount: true },
+      },
     },
     orderBy: { createdAt: 'desc' },
     take: Math.min(100, take),
@@ -354,11 +457,8 @@ export async function assertMemberNotOnLeave(member, { now = new Date(), tx } = 
 
   const subId = active?.subscriptionId;
   if (subId) {
-    // 用 root client 恢復訂閱，避免卡在進場長交易裡
-    const sub = await prisma.cardSubscription.findUnique({ where: { id: subId } });
-    if (sub?.status === 'PAUSED') {
-      await resumeCardSubscription(sub.id, { now });
-    }
+    // 用 root client 恢復訂閱，避免卡在進場長交易裡；PayUNi 失敗不擋入場
+    await resumeSubscriptionAfterLeave(subId, { now, forceLocalOnly: true });
   }
   return updated;
 }

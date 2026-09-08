@@ -1,5 +1,6 @@
 import { Link } from 'react-router-dom';
 import type { ReactNode } from 'react';
+import BrandMark from '../BrandMark';
 
 export type GateFlashResult = {
   ok: boolean;
@@ -34,7 +35,7 @@ export default function GateLayout({
           ← 離開
         </Link>
         <div className="brand brand--gate">
-          <span className="brand__mark">體</span>
+          <BrandMark />
           <span className="brand__text">
             門禁閘機
             <small>進／出場同一會員碼 · 刷臉 · 裝置綁定</small>

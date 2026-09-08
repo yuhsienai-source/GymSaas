@@ -12,6 +12,37 @@ export function getBoardCapacity() {
   return DEFAULT_CAPACITY;
 }
 
+/**
+ * 容留人數顯示開關（Branch.showOccupancy）
+ * @param {{ branchId?: number|null }} [opts]
+ * @returns {Promise<{ isDisplay: boolean, branchId: number|null, branches?: { id: number, name: string, showOccupancy: boolean }[] }>}
+ */
+export async function getOccupancyDisplaySettings({ branchId } = {}) {
+  const bid = branchId != null ? parseInt(String(branchId), 10) : null;
+  if (Number.isInteger(bid) && bid > 0) {
+    const branch = await prisma.branch.findFirst({
+      where: { id: bid, isActive: true },
+      select: { id: true, name: true, showOccupancy: true },
+    });
+    if (!branch) {
+      return { isDisplay: false, branchId: bid, branches: [] };
+    }
+    return {
+      isDisplay: branch.showOccupancy === true,
+      branchId: branch.id,
+      branches: [branch],
+    };
+  }
+
+  const branches = await prisma.branch.findMany({
+    where: { isActive: true },
+    select: { id: true, name: true, showOccupancy: true },
+    orderBy: { id: 'asc' },
+  });
+  const isDisplay = branches.some((b) => b.showOccupancy === true);
+  return { isDisplay, branchId: null, branches };
+}
+
 /** 統計目前在場人數（未出場且未取消） */
 export async function getOccupancySnapshot() {
   const presentCount = await prisma.checkInLog.count({

@@ -1,8 +1,9 @@
 // lib/compositePay.js — 複合付款：多選方式 + 金額分攤 + 抵用券條碼
 
-export const POS_PAY_METHODS = ['CASH', 'CARD', 'WALLET_CASH', 'VOUCHER'];
-export const TOPUP_PAY_METHODS = ['CASH', 'CARD', 'WALLET_CASH', 'VOUCHER'];
-export const CHECKOUT_PAY_METHODS = ['CASH', 'CARD', 'WALLET_CASH', 'VOUCHER'];
+/** CARD＝PayUNi（線上／定期定額）；YIPAY＝臨櫃乙禾固定式刷卡機 */
+export const POS_PAY_METHODS = ['CASH', 'CARD', 'YIPAY', 'LINEPAY', 'WALLET_CASH', 'VOUCHER'];
+export const TOPUP_PAY_METHODS = ['CASH', 'CARD', 'YIPAY', 'LINEPAY', 'WALLET_CASH', 'VOUCHER'];
+export const CHECKOUT_PAY_METHODS = ['CASH', 'CARD', 'YIPAY', 'LINEPAY', 'WALLET_CASH', 'VOUCHER'];
 
 function roundMoney(n) {
   return Math.round(Number(n) * 100) / 100;
@@ -42,7 +43,9 @@ export function parseCompositePayments(payments, totalAmount, opts = {}) {
     seen.add(method);
 
     const amount = roundMoney(row?.amount);
-    if (!Number.isFinite(amount) || amount <= 0) {
+    const cardBindOnly =
+      method === 'CARD' && Boolean(opts.allowYipayPayuniRecurring) && amount === 0;
+    if (!cardBindOnly && (!Number.isFinite(amount) || amount <= 0)) {
       const err = new Error(`${method} 分攤金額必須為正數`);
       err.statusCode = 400;
       throw err;
@@ -76,7 +79,35 @@ export function parseCompositePayments(payments, totalAmount, opts = {}) {
   const voucherLine = lines.find((l) => l.method === 'VOUCHER');
   const walletAmount = breakdown.WALLET_CASH || 0;
   const cardAmount = breakdown.CARD || 0;
+  const yipayAmount = breakdown.YIPAY || 0;
+  const linePayAmount = breakdown.LINEPAY || 0;
   const needsMember = walletAmount > 0 || Boolean(opts.requireMember);
+
+  if (cardAmount > 0 && linePayAmount > 0) {
+    const err = new Error('刷卡（PayUNi）與 LinePay 不可同時使用，請擇一');
+    err.statusCode = 400;
+    throw err;
+  }
+  if (yipayAmount > 0 && linePayAmount > 0) {
+    const err = new Error('乙禾現場刷卡與 LinePay 不可同時使用，請擇一');
+    err.statusCode = 400;
+    throw err;
+  }
+  // 月卡定期定額臨櫃：允許 YIPAY（首期）＋ CARD 標記（PayUNi 約定）；CARD 金額須為 0（不計入分攤）
+  if (cardAmount > 0 && yipayAmount > 0) {
+    if (opts.allowYipayPayuniRecurring) {
+      const err = new Error(
+        '月卡定期定額：首期金額請全部放在「乙禾現場刷卡」；PayUNi 僅於確認後開約定頁（勿把金額分給 CARD）',
+      );
+      err.statusCode = 400;
+      throw err;
+    }
+    const err = new Error(
+      '乙禾現場刷卡（YIPAY）與 PayUNi（CARD）不可同時使用：臨櫃一次請用乙禾，定期定額請用 PayUNi',
+    );
+    err.statusCode = 400;
+    throw err;
+  }
 
   return {
     methods,
@@ -87,19 +118,23 @@ export function parseCompositePayments(payments, totalAmount, opts = {}) {
     voucherAmount: voucherLine?.amount || 0,
     walletAmount,
     cardAmount,
+    yipayAmount,
+    linePayAmount,
     cashAmount: breakdown.CASH || 0,
     needsCard: cardAmount > 0,
+    needsYipay: yipayAmount > 0,
+    needsLinePay: linePayAmount > 0,
+    needsOnlinePay: cardAmount > 0 || yipayAmount > 0 || linePayAmount > 0,
     needsMember,
   };
 }
 
 /** 相容舊版單一 payMethod */
-export function coercePaymentsFromBody(body, totalAmount, allowed) {
+export function coercePaymentsFromBody(body, totalAmount, allowed, parseOpts = {}) {
   if (Array.isArray(body.payments) && body.payments.length > 0) {
-    return parseCompositePayments(body.payments, totalAmount, { allowed });
+    return parseCompositePayments(body.payments, totalAmount, { allowed, ...parseOpts });
   }
 
-  // 舊版：單一 payMethod → 全額該方式
   const method = String(body.payMethod || '').toUpperCase();
   if (!method) {
     const err = new Error('請提供 payments（複合付款）或 payMethod');
@@ -109,6 +144,6 @@ export function coercePaymentsFromBody(body, totalAmount, allowed) {
   return parseCompositePayments(
     [{ method, amount: totalAmount, voucherCode: body.voucherCode }],
     totalAmount,
-    { allowed },
+    { allowed, ...parseOpts },
   );
 }

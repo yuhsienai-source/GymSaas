@@ -2,6 +2,7 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
   useState,
   type ReactNode,
@@ -12,6 +13,7 @@ import {
   setStaffInfo,
   setStaffToken,
   clearStaffToken,
+  STAFF_AUTH_LOST_EVENT,
   type StaffInfo,
   type StaffPermission,
 } from '../lib/storage';
@@ -46,6 +48,15 @@ export function StaffAuthProvider({ children }: { children: ReactNode }) {
     clearStaffToken();
     setToken(null);
     setStaff(null);
+  }, []);
+
+  useEffect(() => {
+    const onLost = () => {
+      setToken(null);
+      setStaff(null);
+    };
+    window.addEventListener(STAFF_AUTH_LOST_EVENT, onLost);
+    return () => window.removeEventListener(STAFF_AUTH_LOST_EVENT, onLost);
   }, []);
 
   const value = useMemo(

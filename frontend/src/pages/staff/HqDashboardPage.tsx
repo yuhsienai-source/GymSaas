@@ -20,11 +20,16 @@ import type {
   Venue,
 } from '../../types/api';
 import HqBranchesTab from './hq/HqBranchesTab';
+import HqCoachTab from './hq/HqCoachTab';
+import HqCmsTab from './hq/HqCmsTab';
 import HqCompensationTab from './hq/HqCompensationTab';
 import HqContractsTab from './hq/HqContractsTab';
 import HqCoursePlansTab from './hq/HqCoursePlansTab';
+import HqCrmTab from './hq/HqCrmTab';
 import HqGateDevicesTab from './hq/HqGateDevicesTab';
+import HqHrTab from './hq/HqHrTab';
 import HqInventoryTab from './hq/HqInventoryTab';
+import HqMarketingTab from './hq/HqMarketingTab';
 import HqPeopleTab from './hq/HqPeopleTab';
 import HqPromotionsTab from './hq/HqPromotionsTab';
 import HqSalesAnalyticsTab from './hq/HqSalesAnalyticsTab';
@@ -172,6 +177,11 @@ export default function HqDashboardPage() {
         {tab === 'compensation' && (
           <HqCompensationTab branches={branches} trainers={trainers} />
         )}
+        {tab === 'cms' && <HqCmsTab {...sharedProps} />}
+        {tab === 'marketing' && <HqMarketingTab />}
+        {tab === 'crm' && <HqCrmTab branches={branches} />}
+        {tab === 'hr' && <HqHrTab {...sharedProps} />}
+        {tab === 'coach' && <HqCoachTab trainers={trainers} />}
         {tab === 'people' && <HqPeopleTab {...sharedProps} />}
         {tab === 'gateDevices' && <HqGateDevicesTab branches={branches} />}
         {tab === 'salesAnalytics' && (

@@ -18,6 +18,30 @@ export function assertTaiwanMobile(raw) {
   return phone;
 }
 
+/**
+ * 會員聯絡電話：台灣門號或國際門號（外國客）
+ * - 台灣：09xxxxxxxx（8869xxxxxxxx 正規化為 09）
+ * - 國際：國碼＋號碼共 8～15 位數字（E.164，不含 +）
+ */
+export function assertMemberPhone(raw) {
+  let phone = normalizePhone(raw);
+  if (!phone) {
+    const err = new Error('請填寫手機號碼');
+    err.statusCode = 400;
+    throw err;
+  }
+  if (/^8869\d{8}$/.test(phone)) {
+    phone = `0${phone.slice(3)}`;
+  }
+  if (/^09\d{8}$/.test(phone)) return phone;
+  if (/^[1-9]\d{7,14}$/.test(phone)) return phone;
+  const err = new Error(
+    '請輸入有效手機號碼（台灣 09 開頭 10 碼，或含國碼的國際門號，例如 +1…／+81…）',
+  );
+  err.statusCode = 400;
+  throw err;
+}
+
 function hashCode(phone, code) {
   const secret = process.env.JWT_SECRET || 'otp';
   return crypto.createHash('sha256').update(`${phone}:${code}:${secret}`).digest('hex');

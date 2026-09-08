@@ -1,6 +1,7 @@
 // lib/ptCancel.js — 取消私教課程購買（CHK 合併或獨立私教 Order）
 import prisma from './prisma.js';
 import {
+  assertRealInvoiceForAllowance,
   executeInvoiceReverse,
   resolveOrderInvoiceReverse,
   syncCheckoutInvoiceAfterReverse,
@@ -153,9 +154,17 @@ export async function cancelPtPurchase({
       const ctx = await resolveOrderInvoiceReverse(o, {
         refundCash: roundMoney(o.amount),
       });
-      if (prefer === 'allowance') ctx.prefer = 'allowance';
-      else if (!ctx.sharedInvoice) ctx.prefer = 'void';
-      else ctx.prefer = 'allowance';
+      if (prefer === 'allowance') {
+        assertRealInvoiceForAllowance(ctx.invoiceNumber || o.invoiceNumber, '私教退費折讓');
+        ctx.prefer = 'allowance';
+        ctx.skip = false;
+      } else if (!ctx.sharedInvoice) {
+        ctx.prefer = 'void';
+      } else {
+        ctx.prefer = 'allowance';
+        assertRealInvoiceForAllowance(ctx.invoiceNumber || o.invoiceNumber, '私教退費折讓');
+        ctx.skip = false;
+      }
       if (ctx.sharedInvoice) sharedInvoice = true;
       if (ctx.invoiceNumber && !ctx.skip) {
         try {

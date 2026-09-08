@@ -4,7 +4,7 @@ import { Alert, Button, Field, Input, Modal, Select } from '../ui';
 import { useToast } from '../../contexts/ToastContext';
 import InvoiceCarrierField from './InvoiceCarrierField';
 
-export type PayMethodCode = 'CASH' | 'CARD' | 'WALLET_CASH' | 'VOUCHER';
+export type PayMethodCode = 'CASH' | 'CARD' | 'YIPAY' | 'LINEPAY' | 'WALLET_CASH' | 'VOUCHER';
 
 export type CardPayMode = 'LUMP' | 'INSTALLMENT' | 'RECURRING';
 
@@ -35,13 +35,17 @@ export const DEFAULT_CARD_PAY_OPTIONS: CardPayOptions = {
 
 const METHOD_LABELS: Record<PayMethodCode, string> = {
   CASH: '現金',
-  CARD: '刷卡',
+  YIPAY: '現場刷卡',
+  CARD: 'PayUNi',
+  LINEPAY: 'LinePay',
   WALLET_CASH: '零錢包',
   VOUCHER: '抵用券',
 };
 
 const METHOD_HINTS: Partial<Record<PayMethodCode, string>> = {
-  CARD: 'PayUNi',
+  YIPAY: '乙禾／凱基',
+  CARD: '定期定額',
+  LINEPAY: 'POS 掃碼',
   WALLET_CASH: '僅本金',
   VOUCHER: '掃碼',
 };
@@ -77,6 +81,8 @@ interface CompositePayFieldsProps {
   onCardOptionsChange?: (opts: CardPayOptions) => void;
   /** 是否允許定期定額（通常依方案 enableCardRecurring） */
   allowCardRecurring?: boolean;
+  /** 限制 PayUNi 可選模式（臨櫃預設僅 RECURRING；線上可 LUMP／INSTALLMENT／RECURRING） */
+  payuniCardModes?: CardPayMode[];
   /** 定期定額可選總期數（例如課程方案 bitmask 解出的 [2]／[4]／[2,4]） */
   allowedPeriodTimes?: number[];
   /** 定期定額預設總期數（例如方案 periodCount） */
@@ -85,6 +91,14 @@ interface CompositePayFieldsProps {
   defaultRecurringAmount?: number;
   /** 鎖定期付金額（方案表定，禁止臨櫃改） */
   lockRecurringAmount?: boolean;
+  /**
+   * 月卡／課程定期定額臨櫃：允許「乙禾首期」＋「PayUNi 約定」同選；
+   * CARD 金額須為 0（僅標記），首期金額全放 YIPAY
+   */
+  allowYipayPayuniRecurring?: boolean;
+  /** 臨櫃 LinePay POS：會員付款碼（My Code／oneTimeKey） */
+  linePayOneTimeKey?: string;
+  onLinePayOneTimeKeyChange?: (key: string) => void;
 }
 
 /**
@@ -109,19 +123,33 @@ export default function CompositePayFields({
   cardOptions = DEFAULT_CARD_PAY_OPTIONS,
   onCardOptionsChange,
   allowCardRecurring = false,
+  payuniCardModes,
   allowedPeriodTimes,
   defaultPeriodTimes,
   defaultRecurringAmount,
   lockRecurringAmount = false,
+  allowYipayPayuniRecurring = false,
+  linePayOneTimeKey = '',
+  onLinePayOneTimeKeyChange,
 }: CompositePayFieldsProps) {
   const { toast } = useToast();
   const [voucherScanOpen, setVoucherScanOpen] = useState(false);
+  const [linePayScanOpen, setLinePayScanOpen] = useState(false);
   const lastVoucherScan = useRef('');
+  const lastLinePayScan = useRef('');
+  const showLinePayKey = selected.includes('LINEPAY') && Boolean(onLinePayOneTimeKeyChange);
 
-  const sum = roundMoney(selected.reduce((s, m) => s + (Number(amounts[m]) || 0), 0));
+  const sum = roundMoney(
+    selected
+      .filter((m) => !(allowYipayPayuniRecurring && m === 'CARD'))
+      .reduce((s, m) => s + (Number(amounts[m]) || 0), 0),
+  );
   const remaining = roundMoney(totalAmount - sum);
   const balanced = Math.abs(remaining) < 0.009 && selected.length > 0;
-  const showCardOpts = selected.includes('CARD') && Boolean(onCardOptionsChange);
+  const showCardOpts =
+    (selected.includes('CARD') ||
+      (allowYipayPayuniRecurring && selected.includes('YIPAY'))) &&
+    Boolean(onCardOptionsChange);
 
   useEffect(() => {
     if (selected.length === 1) {
@@ -132,6 +160,44 @@ export default function CompositePayFields({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selected.join(','), totalAmount]);
+
+  // 月卡定期定額：CARD 僅約定標記，金額固定 0；首期全放乙禾
+  useEffect(() => {
+    if (!allowYipayPayuniRecurring) return;
+    if (!selected.includes('CARD') && !selected.includes('YIPAY')) return;
+    const next = { ...amounts };
+    let changed = false;
+    if (selected.includes('CARD') && roundMoney(next.CARD || 0) !== 0) {
+      next.CARD = 0;
+      changed = true;
+    }
+    if (
+      selected.includes('YIPAY') &&
+      selected.includes('CARD') &&
+      selected.filter((m) => m !== 'CARD').length === 1
+    ) {
+      if (roundMoney(next.YIPAY || 0) !== roundMoney(totalAmount)) {
+        next.YIPAY = roundMoney(totalAmount);
+        changed = true;
+      }
+    }
+    if (changed) onAmountsChange(next);
+    if (cardOptions.cardMode !== 'RECURRING' && allowCardRecurring) {
+      onCardOptionsChange?.({
+        ...DEFAULT_CARD_PAY_OPTIONS,
+        cardMode: 'RECURRING',
+        periodType: 'M',
+        periodTimes: defaultPeriodTimes ?? 12,
+        recurringAmount: defaultRecurringAmount ?? null,
+      });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    allowYipayPayuniRecurring,
+    selected.join(','),
+    totalAmount,
+    allowCardRecurring,
+  ]);
 
   useEffect(() => {
     if (!showCardOpts) return;
@@ -152,12 +218,74 @@ export default function CompositePayFields({
       onAmountsChange(nextAmounts);
       if (method === 'VOUCHER') onVoucherCodeChange('');
       if (method === 'CARD') onCardOptionsChange?.(DEFAULT_CARD_PAY_OPTIONS);
+      if (method === 'LINEPAY') onLinePayOneTimeKeyChange?.('');
     } else {
-      onSelectedChange([...selected, method]);
+      let next = [...selected, method];
+      const nextAmounts = { ...amounts };
+      // PayUNi／乙禾／LinePay 互斥（月卡定期定額除外：允許 YIPAY＋CARD 約定）
+      const drop = (m: PayMethodCode) => {
+        next = next.filter((x) => x !== m);
+        delete nextAmounts[m];
+      };
+      if (method === 'LINEPAY') {
+        if (next.includes('CARD')) {
+          drop('CARD');
+          onCardOptionsChange?.(DEFAULT_CARD_PAY_OPTIONS);
+        }
+        if (next.includes('YIPAY')) drop('YIPAY');
+      }
+      if (method === 'CARD') {
+        if (next.includes('LINEPAY')) {
+          drop('LINEPAY');
+          onLinePayOneTimeKeyChange?.('');
+        }
+        if (next.includes('YIPAY') && !allowYipayPayuniRecurring) drop('YIPAY');
+        if (allowYipayPayuniRecurring) {
+          nextAmounts.CARD = 0;
+          if (!next.includes('YIPAY')) {
+            next.push('YIPAY');
+            nextAmounts.YIPAY = roundMoney(totalAmount);
+          }
+        }
+        // 臨櫃 PayUNi 僅定期定額時自動帶入
+        if (payuniCardModes?.length === 1 && payuniCardModes[0] === 'RECURRING') {
+          onCardOptionsChange?.({
+            ...DEFAULT_CARD_PAY_OPTIONS,
+            cardMode: 'RECURRING',
+            periodType: 'M',
+            periodTimes: defaultPeriodTimes ?? 12,
+            recurringAmount: defaultRecurringAmount ?? null,
+          });
+        }
+      }
+      if (method === 'YIPAY') {
+        if (next.includes('CARD') && !allowYipayPayuniRecurring) {
+          drop('CARD');
+          onCardOptionsChange?.(DEFAULT_CARD_PAY_OPTIONS);
+        }
+        if (next.includes('LINEPAY')) {
+          drop('LINEPAY');
+          onLinePayOneTimeKeyChange?.('');
+        }
+        if (allowYipayPayuniRecurring && allowCardRecurring) {
+          if (!next.includes('CARD')) next.push('CARD');
+          nextAmounts.CARD = 0;
+          onCardOptionsChange?.({
+            ...DEFAULT_CARD_PAY_OPTIONS,
+            cardMode: 'RECURRING',
+            periodType: 'M',
+            periodTimes: defaultPeriodTimes ?? 12,
+            recurringAmount: defaultRecurringAmount ?? null,
+          });
+        }
+      }
+      onSelectedChange(next);
+      onAmountsChange(nextAmounts);
     }
   }
 
   function setAmount(method: PayMethodCode, raw: string) {
+    if (allowYipayPayuniRecurring && method === 'CARD') return;
     const n = parseFloat(raw);
     onAmountsChange({
       ...amounts,
@@ -166,8 +294,11 @@ export default function CompositePayFields({
   }
 
   function fillRemaining(method: PayMethodCode) {
+    if (allowYipayPayuniRecurring && method === 'CARD') return;
     const others = roundMoney(
-      selected.filter((m) => m !== method).reduce((s, m) => s + (Number(amounts[m]) || 0), 0),
+      selected
+        .filter((m) => m !== method && !(allowYipayPayuniRecurring && m === 'CARD'))
+        .reduce((s, m) => s + (Number(amounts[m]) || 0), 0),
     );
     onAmountsChange({ ...amounts, [method]: roundMoney(Math.max(0, totalAmount - others)) });
   }
@@ -180,6 +311,16 @@ export default function CompositePayFields({
     onVoucherCodeChange(code);
     setVoucherScanOpen(false);
     toast(`已讀取抵用券 ${code}`, 'success');
+  }
+
+  function applyLinePayScan(raw: string) {
+    const key = raw.trim();
+    if (!key || key.length < 8) return;
+    if (lastLinePayScan.current === key) return;
+    lastLinePayScan.current = key;
+    onLinePayOneTimeKeyChange?.(key);
+    setLinePayScanOpen(false);
+    toast('已讀取 LinePay 付款碼', 'success');
   }
 
   function setCardMode(mode: CardPayMode) {
@@ -231,9 +372,11 @@ export default function CompositePayFields({
     onCardOptionsChange?.(DEFAULT_CARD_PAY_OPTIONS);
   }
 
-  const cardModes: CardPayMode[] = allowCardRecurring
-    ? ['LUMP', 'INSTALLMENT', 'RECURRING']
-    : ['LUMP', 'INSTALLMENT'];
+  const cardModeChoices: CardPayMode[] = payuniCardModes?.length
+    ? payuniCardModes
+    : allowCardRecurring
+      ? (['LUMP', 'INSTALLMENT', 'RECURRING'] as CardPayMode[])
+      : (['LUMP', 'INSTALLMENT'] as CardPayMode[]);
 
   return (
     <div className="checkout-flow">
@@ -265,35 +408,57 @@ export default function CompositePayFields({
 
         {selected.length === 0 && <Alert tone="warning">請至少選擇一種付款方式</Alert>}
 
+        {allowYipayPayuniRecurring && (
+          <Alert tone="info">
+            月卡／課程定期定額：首期以「現場刷卡（乙禾）」收款；確認後開 PayUNi
+            續期頁（$1 驗證授權後取消、不請款；第 2 期起原價）。
+          </Alert>
+        )}
+
         {selected.length > 1 && (
           <div className="pay-split-list">
-            {selected.map((m) => (
-              <div key={m} className="pay-split-row">
-                <span className="pay-split-row__label">{METHOD_LABELS[m]}</span>
-                <Input
-                  type="number"
-                  min={0}
-                  step="1"
-                  value={amounts[m] ?? ''}
-                  onChange={(e) => setAmount(m, e.target.value)}
-                  aria-label={`${METHOD_LABELS[m]}金額`}
-                />
-                <Button type="button" size="sm" variant="ghost" onClick={() => fillRemaining(m)}>
-                  補足
-                </Button>
-              </div>
-            ))}
+            {selected.map((m) => {
+              const bindOnly = allowYipayPayuniRecurring && m === 'CARD';
+              return (
+                <div key={m} className="pay-split-row">
+                  <span className="pay-split-row__label">
+                    {METHOD_LABELS[m]}
+                    {bindOnly ? '（續期約定）' : ''}
+                  </span>
+                  <Input
+                    type="number"
+                    min={0}
+                    step="1"
+                    value={bindOnly ? 0 : (amounts[m] ?? '')}
+                    onChange={(e) => setAmount(m, e.target.value)}
+                    aria-label={`${METHOD_LABELS[m]}金額`}
+                    disabled={bindOnly}
+                  />
+                  {!bindOnly && (
+                    <Button type="button" size="sm" variant="ghost" onClick={() => fillRemaining(m)}>
+                      補足
+                    </Button>
+                  )}
+                </div>
+              );
+            })}
           </div>
         )}
 
         {showCardOpts && (
           <div className="card-pay-opts">
             <header className="checkout-flow__head">
-              <h3>刷卡方式</h3>
-              <p>一次付清、銀行分期，或方案允許時的定期定額</p>
+              <h3>PayUNi 定期定額</h3>
+              <p>
+                {allowYipayPayuniRecurring
+                  ? '乙禾收首期後，另開 PayUNi 續期頁（FAmt＝$1 驗證授權→取消；PeriodAmt 自第 2 期）'
+                  : cardModeChoices.length === 1 && cardModeChoices[0] === 'RECURRING'
+                    ? '臨櫃定期定額走統一金流續期收款；一次現場刷卡請改選「現場刷卡（乙禾）」'
+                    : '一次付清、銀行分期，或方案允許時的定期定額'}
+              </p>
             </header>
-            <div className="pay-method-grid pay-method-grid--card" role="group" aria-label="刷卡方式">
-              {cardModes.map((mode) => {
+            <div className="pay-method-grid pay-method-grid--card" role="group" aria-label="PayUNi 刷卡方式">
+              {cardModeChoices.map((mode) => {
                 const on = cardOptions.cardMode === mode;
                 return (
                   <button
@@ -456,6 +621,34 @@ export default function CompositePayFields({
           </Field>
         )}
 
+        {showLinePayKey && (
+          <Field
+            label="LinePay 付款碼（My Code）"
+            hint="請會員開啟 LINE Pay「付款碼」，以掃碼槍或鏡頭掃入；沙盒請用官方測試頁產生碼"
+          >
+            <div className="bind-row">
+              <Input
+                value={linePayOneTimeKey}
+                onChange={(e) => onLinePayOneTimeKeyChange?.(e.target.value.trim())}
+                placeholder="掃描或輸入付款碼"
+                className="mono"
+                autoComplete="off"
+              />
+              <Button
+                type="button"
+                size="sm"
+                variant="secondary"
+                onClick={() => {
+                  lastLinePayScan.current = '';
+                  setLinePayScanOpen(true);
+                }}
+              >
+                掃碼
+              </Button>
+            </div>
+          </Field>
+        )}
+
         {selected.length > 0 && (
           <div className={`pay-balance${balanced ? ' is-ok' : ' is-warn'}`}>
             <span>應付 ${roundMoney(totalAmount)}</span>
@@ -500,6 +693,29 @@ export default function CompositePayFields({
           <p className="text-muted text-sm">將抵用券條碼對準鏡頭，或使用掃碼槍掃入上方輸入框。</p>
         </div>
       </Modal>
+
+      <Modal
+        open={linePayScanOpen}
+        title="掃描 LinePay 付款碼"
+        onClose={() => setLinePayScanOpen(false)}
+      >
+        <div className="form-stack">
+          <div className="scanner-wrap scanner-wrap--compact">
+            <Scanner
+              onScan={(detected) => {
+                const text = detected?.[0]?.rawValue;
+                if (text) applyLinePayScan(text);
+              }}
+              formats={['code_39', 'code_128', 'qr_code', 'codabar', 'ean_13']}
+              constraints={{ facingMode: 'environment' }}
+              styles={{ container: { width: '100%' } }}
+            />
+          </div>
+          <p className="text-muted text-sm">
+            請掃會員 LINE Pay「付款碼／My Code」（非會員身分 QR）。
+          </p>
+        </div>
+      </Modal>
     </div>
   );
 }
@@ -508,23 +724,31 @@ export function buildPaymentsPayload(
   selected: PayMethodCode[],
   amounts: Partial<Record<PayMethodCode, number>>,
   voucherCode: string,
+  opts?: { omitZeroCard?: boolean },
 ): PaymentLine[] {
-  return selected.map((method) => ({
-    method,
-    amount: roundMoney(amounts[method] || 0),
-    ...(method === 'VOUCHER' ? { voucherCode: voucherCode.trim() } : {}),
-  }));
+  return selected
+    .filter((method) => !(opts?.omitZeroCard && method === 'CARD' && !(Number(amounts.CARD) > 0)))
+    .map((method) => ({
+      method,
+      amount: roundMoney(amounts[method] || 0),
+      ...(method === 'VOUCHER' ? { voucherCode: voucherCode.trim() } : {}),
+    }));
 }
 
-export function buildCardPayPayload(opts: CardPayOptions, hasCard: boolean) {
-  if (!hasCard) return {};
-  if (opts.cardMode === 'INSTALLMENT') {
+/** hasCard：選了 CARD，或乙禾＋定期定額（僅送 cardMode，首期走 YIPAY） */
+export function buildCardPayPayload(
+  opts: CardPayOptions,
+  hasCard: boolean,
+  forceRecurring?: boolean,
+) {
+  if (!hasCard && !forceRecurring) return {};
+  if (opts.cardMode === 'INSTALLMENT' && !forceRecurring) {
     return {
       cardMode: 'INSTALLMENT' as const,
       cardInst: opts.cardInst || 3,
     };
   }
-  if (opts.cardMode === 'RECURRING') {
+  if (opts.cardMode === 'RECURRING' || forceRecurring) {
     return {
       cardMode: 'RECURRING' as const,
       periodType: opts.periodType || 'M',
@@ -541,9 +765,14 @@ export function isPaymentsBalanced(
   selected: PayMethodCode[],
   amounts: Partial<Record<PayMethodCode, number>>,
   totalAmount: number,
+  opts?: { ignoreCardAmount?: boolean },
 ) {
   if (selected.length === 0) return false;
-  const sum = roundMoney(selected.reduce((s, m) => s + (Number(amounts[m]) || 0), 0));
+  const sum = roundMoney(
+    selected
+      .filter((m) => !(opts?.ignoreCardAmount && m === 'CARD'))
+      .reduce((s, m) => s + (Number(amounts[m]) || 0), 0),
+  );
   return Math.abs(sum - roundMoney(totalAmount)) < 0.009;
 }
 

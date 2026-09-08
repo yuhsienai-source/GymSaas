@@ -4,6 +4,7 @@ import GateLayout from '../../components/layout/GateLayout';
 import { Alert, Button, Card, EmptyState, Field, Input } from '../../components/ui';
 import {
   fetchGateFaceStatus,
+  fetchGateSyncTime,
   gateCheckIn,
   gateCheckInFace,
   gateCheckOut,
@@ -294,6 +295,33 @@ export default function GateScannerPage() {
     };
   }, [pair, pairPhase]);
 
+  // 時鐘校準：每 5 分鐘對齊伺服器時間（本機 skew 供診斷；驗票仍以後端為準）
+  useEffect(() => {
+    if (pairPhase !== 'ready') return;
+    let cancelled = false;
+    let timer: number | undefined;
+    const sync = async () => {
+      try {
+        const res = await fetchGateSyncTime();
+        if (cancelled) return;
+        const skew = Math.abs(res.offsetMs || 0);
+        if (skew > 5000) {
+          addLog(`🟠 本機時鐘偏差約 ${Math.round(skew / 1000)} 秒，已與伺服器校準`, true);
+        }
+      } catch {
+        if (!cancelled) addLog('🟠 網路通訊重試中：時間校準失敗', true);
+      }
+    };
+    void sync();
+    timer = window.setInterval(() => void sync(), 5 * 60 * 1000);
+    return () => {
+      cancelled = true;
+      if (timer) window.clearInterval(timer);
+    };
+    // addLog 穩定於閉包；刻意不列入 deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pairPhase]);
+
   /** 優先前鏡頭（刷臉）；失敗再退後鏡頭／任意鏡頭（仍同路解 QR） */
   const openGateStream = useCallback(async (): Promise<MediaStream> => {
     const attempts: MediaStreamConstraints[] = [
@@ -482,6 +510,7 @@ export default function GateScannerPage() {
     gateAccessNo?: unknown;
     checkInAt?: unknown;
     feeDetails?: unknown;
+    gateOpen?: unknown;
   }) {
     if (result.status !== 'success') return;
     const name = result.memberName as string;
@@ -492,31 +521,64 @@ export default function GateScannerPage() {
         result.gateLogId != null ? String(result.gateLogId) : null,
       );
     const idTag = accessNo && accessNo !== '—' ? ` · 單號 ${accessNo}` : '';
+    const gateOpen = result.gateOpen !== false;
     let msg: string;
     if (mode === 'check-in') {
       msg = `歡迎 ${name} 進場${idTag}`;
       addLog(`🟢 ${result.message}（${name}${idTag}）`);
-    } else {
-      const fee = result.feeDetails as { totalFee?: number } | undefined;
-      msg =
-        fee?.totalFee != null
-          ? `${name} 出場 · $${fee.totalFee}${idTag}`
-          : `${name} 出場成功${idTag}`;
-      addLog(`🟢 ${result.message}（${name}${idTag}）`);
+      setLastResult({ ok: true, message: msg });
+      toast(msg, 'success');
+      return;
     }
+    const fee = result.feeDetails as
+      | { totalFee?: number; shortfall?: number }
+      | undefined;
+    if (!gateOpen || (fee?.shortfall != null && fee.shortfall > 0)) {
+      msg = `${name} 已結算但餘額不足待補扣 · 閘機不開門${idTag}`;
+      addLog(`🟠 ${result.message || msg}（${name}${idTag}）`, true);
+      setLastResult({ ok: false, message: msg, renewable: true });
+      toast(msg, 'error');
+      return;
+    }
+    msg =
+      fee?.totalFee != null
+        ? `${name} 出場 · $${fee.totalFee}${idTag}`
+        : `${name} 出場成功${idTag}`;
+    addLog(`🟢 ${result.message}（${name}${idTag}）`);
     setLastResult({ ok: true, message: msg });
     toast(msg, 'success');
   }
 
   function applyGateError(err: unknown, fallback: string) {
     const details = getApiErrorDetails(err);
-    const msg = details.message || getErrorMessage(err, fallback);
+    const isTimeout =
+      (typeof err === 'object' &&
+        err &&
+        'code' in err &&
+        (err as { code?: string }).code === 'ECONNABORTED') ||
+      /timeout/i.test(String(details.message || fallback));
+    const isNetwork =
+      isTimeout ||
+      (typeof err === 'object' &&
+        err &&
+        'message' in err &&
+        /network/i.test(String((err as { message?: string }).message)));
+    const msg = isNetwork
+      ? '網路通訊重試中：請確認外網後再刷一次（閘機配對仍保留）'
+      : details.message || getErrorMessage(err, fallback);
     const renewable =
       details.code === 'EXPIRED_BALANCE' || details.code === 'BALANCE_INSUFFICIENT';
+    const noCheckIn = details.code === 'NO_ACTIVE_CHECKIN';
+    const contractRequired =
+      details.code === 'CONTRACT_REQUIRED' || details.code === 'CONTRACT_UNSIGNED';
     addLog(`🔴 ${msg}`, true);
     setLastResult({
       ok: false,
-      message: msg,
+      message: noCheckIn
+        ? `異常滯留：${msg}`
+        : contractRequired
+          ? `契約未簽：${msg}`
+          : msg,
       memberId: details.memberId,
       code: details.code,
       renewable: Boolean(renewable && details.memberId),
@@ -532,7 +594,16 @@ export default function GateScannerPage() {
                 );
               },
             }
-          : undefined,
+          : noCheckIn && details.memberId
+            ? {
+                label: '櫃檯進場列表',
+                onClick: () => {
+                  window.location.assign(
+                    `/staff/ops?tab=checkins&memberId=${details.memberId}`,
+                  );
+                },
+              }
+            : undefined,
     });
   }
 

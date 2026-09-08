@@ -15,6 +15,9 @@ const MemberDashboardPage = lazy(() => import('./pages/member/MemberDashboardPag
 const MemberLoginPage = lazy(() => import('./pages/member/MemberLoginPage'));
 const MemberProfilePage = lazy(() => import('./pages/member/MemberProfilePage'));
 const MemberBookingPage = lazy(() => import('./pages/member/MemberBookingPage'));
+const MemberExplorePage = lazy(() => import('./pages/member/MemberExplorePage'));
+const MemberRecordsPage = lazy(() => import('./pages/member/MemberRecordsPage'));
+const MemberMembershipPage = lazy(() => import('./pages/member/MemberMembershipPage'));
 const PayReturnPage = lazy(() => import('./pages/member/PayReturnPage'));
 const PortalPage = lazy(() => import('./pages/PortalPage'));
 const HqDashboardPage = lazy(() => import('./pages/staff/HqDashboardPage'));
@@ -24,6 +27,7 @@ const StaffLoginPage = lazy(() => import('./pages/staff/StaffLoginPage'));
 const TrainerDashboardPage = lazy(() => import('./pages/staff/TrainerDashboardPage'));
 const TxDashboardPage = lazy(() => import('./pages/staff/TxDashboardPage'));
 const InventoryOpsPage = lazy(() => import('./pages/staff/InventoryOpsPage'));
+const CustomerDisplayPage = lazy(() => import('./pages/staff/CustomerDisplayPage'));
 
 function RouteFallback() {
   return (
@@ -147,6 +151,36 @@ function AppRoutes() {
           </ProtectedRoute>
         }
       />
+      <Route
+        path="/member/explore"
+        element={
+          <ProtectedRoute isAllowed={isMemberAuth} redirectTo="/">
+            <LazyPage>
+              <MemberExplorePage />
+            </LazyPage>
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/member/records"
+        element={
+          <ProtectedRoute isAllowed={isMemberAuth} redirectTo="/">
+            <LazyPage>
+              <MemberRecordsPage />
+            </LazyPage>
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/member/membership"
+        element={
+          <ProtectedRoute isAllowed={isMemberAuth} redirectTo="/">
+            <LazyPage>
+              <MemberMembershipPage />
+            </LazyPage>
+          </ProtectedRoute>
+        }
+      />
 
       <Route
         path="/gate"
@@ -162,6 +196,15 @@ function AppRoutes() {
         element={
           <LazyPage>
             <BoardPage />
+          </LazyPage>
+        }
+      />
+      {/* 客顯副螢幕：免登入（與閘機／看板相同），靠 pos_display_bus 與主機通訊 */}
+      <Route
+        path="/staff/customer-display"
+        element={
+          <LazyPage>
+            <CustomerDisplayPage />
           </LazyPage>
         }
       />

@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Link, Outlet, useLocation } from 'react-router-dom';
+import BrandMark from '../BrandMark';
 import { Button } from '../ui';
 import { useStaffAuth } from '../../contexts/StaffAuthContext';
 import type { StaffPermission } from '../../lib/storage';
@@ -103,7 +104,7 @@ export default function StaffShell() {
       >
         <div className="staff-sidebar__head">
           <Link to="/portal" className="brand brand--compact" title="體育客員工後台">
-            <span className="brand__mark">體</span>
+            <BrandMark />
             <span className="brand__text">
               體育客
               <small>員工後台</small>

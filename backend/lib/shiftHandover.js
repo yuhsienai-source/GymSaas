@@ -24,7 +24,9 @@ const SLOT_KEYS = new Set(SHIFT_SLOTS.map((s) => s.key));
 /** 支付方式顯示順序與中文標籤（分欄固定，金額 0 也列出） */
 export const PAY_METHOD_COLUMNS = [
   { key: 'CASH', label: '現金' },
-  { key: 'CARD', label: '信用卡／刷卡' },
+  { key: 'YIPAY', label: '乙禾現場刷卡' },
+  { key: 'CARD', label: 'PayUNi 刷卡／定期' },
+  { key: 'LINEPAY', label: 'LinePay' },
   { key: 'WALLET_CASH', label: '零錢包' },
   { key: 'VOUCHER', label: '抵用券' },
 ];
@@ -275,7 +277,9 @@ export async function buildShiftSummary({ branchId, from, to } = {}) {
   }
 
   const cashIn = roundMoney(payMix.CASH || 0);
+  const yipayIn = roundMoney(payMix.YIPAY || 0);
   const cardIn = roundMoney(payMix.CARD || 0);
+  const linePayIn = roundMoney(payMix.LINEPAY || 0);
   const voucherIn = roundMoney(payMix.VOUCHER || 0);
   const walletIn = roundMoney(payMix.WALLET_CASH || 0);
 
@@ -285,12 +289,14 @@ export async function buildShiftSummary({ branchId, from, to } = {}) {
 
   const payMixFull = {
     CASH: cashIn,
+    YIPAY: yipayIn,
     CARD: cardIn,
+    LINEPAY: linePayIn,
     VOUCHER: voucherIn,
     WALLET_CASH: walletIn,
     ...Object.fromEntries(
       Object.entries(payMix).filter(
-        ([k]) => !['CASH', 'CARD', 'VOUCHER', 'WALLET_CASH'].includes(k),
+        ([k]) => !['CASH', 'YIPAY', 'CARD', 'LINEPAY', 'VOUCHER', 'WALLET_CASH'].includes(k),
       ),
     ),
   };

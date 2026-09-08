@@ -50,6 +50,9 @@ export default function HqPromotionsTab({
   const [promoPeriodCount, setPromoPeriodCount] = useState('1');
   const [promoRequiresContract, setPromoRequiresContract] = useState(false);
   const [promoCardRecurring, setPromoCardRecurring] = useState(false);
+  const [promoRecurringAmount, setPromoRecurringAmount] = useState('');
+  const [promoPayuniPeriodHash, setPromoPayuniPeriodHash] = useState('');
+  const [promoPayuniPeriodHashOnline, setPromoPayuniPeriodHashOnline] = useState('');
   const [promoContractIds, setPromoContractIds] = useState<number[]>([]);
   const [filterBranchId, setFilterBranchId] = useState<number | ''>('');
   const [activeContracts, setActiveContracts] = useState<MembershipContract[]>([]);
@@ -66,6 +69,9 @@ export default function HqPromotionsTab({
   const [editPeriodCount, setEditPeriodCount] = useState('');
   const [editRequiresContract, setEditRequiresContract] = useState(false);
   const [editCardRecurring, setEditCardRecurring] = useState(false);
+  const [editRecurringAmount, setEditRecurringAmount] = useState('');
+  const [editPayuniPeriodHash, setEditPayuniPeriodHash] = useState('');
+  const [editPayuniPeriodHashOnline, setEditPayuniPeriodHashOnline] = useState('');
   const [editContractIds, setEditContractIds] = useState<number[]>([]);
   const [editActive, setEditActive] = useState(true);
   const [busyId, setBusyId] = useState<number | null>(null);
@@ -159,6 +165,11 @@ export default function HqPromotionsTab({
         toast('啟用定期定額時必須設定有效期期數', 'error');
         return;
       }
+      const ra = parseFloat(promoRecurringAmount);
+      if (!Number.isFinite(ra) || ra <= 0) {
+        toast('請填寫定期定額扣款金額（正數；可與首期方案費用不同）', 'error');
+        return;
+      }
     }
     if (isCompensation) {
       if (parseFloat(promoBonus) <= 0) {
@@ -181,7 +192,14 @@ export default function HqPromotionsTab({
         periodCount: isUnlimited ? parseInt(promoPeriodCount, 10) : null,
         requiresMemberContract: isCompensation ? false : promoRequiresContract,
         enableCardRecurring: isCompensation ? false : promoCardRecurring,
-        recurringAmount: !isCompensation && promoCardRecurring ? parseFloat(promoPrice) || null : null,
+        recurringAmount:
+          !isCompensation && promoCardRecurring ? parseFloat(promoRecurringAmount) : null,
+        payuniPeriodHash:
+          !isCompensation && promoCardRecurring ? promoPayuniPeriodHash.trim() || null : null,
+        payuniPeriodHashOnline:
+          !isCompensation && promoCardRecurring
+            ? promoPayuniPeriodHashOnline.trim() || null
+            : null,
         contractIds: !isCompensation && promoRequiresContract ? promoContractIds : [],
       });
       toast(result.message || '方案上架成功', 'success');
@@ -194,6 +212,9 @@ export default function HqPromotionsTab({
       setPromoContractIds([]);
       setPromoRequiresContract(false);
       setPromoCardRecurring(false);
+      setPromoRecurringAmount('');
+      setPromoPayuniPeriodHash('');
+      setPromoPayuniPeriodHashOnline('');
       await onReload();
     } catch (err) {
       toast(getErrorMessage(err, '建立方案失敗'), 'error');
@@ -221,6 +242,17 @@ export default function HqPromotionsTab({
     }
     setEditRequiresContract(Boolean(p.requiresMemberContract));
     setEditCardRecurring(Boolean(p.enableCardRecurring));
+    setEditRecurringAmount(
+      p.recurringAmount != null && Number(p.recurringAmount) > 0
+        ? String(p.recurringAmount)
+        : p.enableCardRecurring
+          ? String(p.price)
+          : '',
+    );
+    setEditPayuniPeriodHash(p.payuniPeriodHash ? String(p.payuniPeriodHash) : '');
+    setEditPayuniPeriodHashOnline(
+      p.payuniPeriodHashOnline ? String(p.payuniPeriodHashOnline) : '',
+    );
     setEditContractIds((p.contracts || []).map((c) => c.id));
     setEditActive(p.isActive !== false);
   }
@@ -255,6 +287,11 @@ export default function HqPromotionsTab({
         toast('啟用定期定額時必須設定有效期期數', 'error');
         return;
       }
+      const ra = parseFloat(editRecurringAmount);
+      if (!Number.isFinite(ra) || ra <= 0) {
+        toast('請填寫定期定額扣款金額（正數；可與首期方案費用不同）', 'error');
+        return;
+      }
     }
     try {
       const result = await updateHqPromotion(editingPromo.id, {
@@ -269,7 +306,11 @@ export default function HqPromotionsTab({
         periodCount: editIsUnlimited ? parseInt(editPeriodCount, 10) : null,
         requiresMemberContract: editRequiresContract,
         enableCardRecurring: editCardRecurring,
-        recurringAmount: editCardRecurring ? parseFloat(editPrice) || null : null,
+        recurringAmount: editCardRecurring ? parseFloat(editRecurringAmount) : null,
+        payuniPeriodHash: editCardRecurring ? editPayuniPeriodHash.trim() || null : null,
+        payuniPeriodHashOnline: editCardRecurring
+          ? editPayuniPeriodHashOnline.trim() || null
+          : null,
         isActive: editActive,
         contractIds: editRequiresContract ? editContractIds : [],
       });
@@ -443,8 +484,14 @@ export default function HqPromotionsTab({
               </Field>
             ) : null}
             <Field
-              label={isCompensation ? '售價（固定 $0）' : isUnlimited ? '方案費用' : '現金本金'}
-              hint={isCompensation ? '禁止自填補償現金；額度請設於下方 SC' : undefined}
+              label={isCompensation ? '售價（固定 $0）' : isUnlimited ? '方案費用（首期）' : '現金本金'}
+              hint={
+                isCompensation
+                  ? '禁止自填補償現金；額度請設於下方 SC'
+                  : isUnlimited
+                    ? '首期刷卡／收款金額；若啟用定期定額，第 2 期起請另填扣款金額'
+                    : undefined
+              }
             >
               <Input
                 type="number"
@@ -507,19 +554,61 @@ export default function HqPromotionsTab({
               <input
                 type="checkbox"
                 checked={promoCardRecurring}
-                onChange={(e) => setPromoCardRecurring(e.target.checked)}
+                onChange={(e) => {
+                  const on = e.target.checked;
+                  setPromoCardRecurring(on);
+                  if (on && !promoRecurringAmount && promoPrice) {
+                    setPromoRecurringAmount(promoPrice);
+                  }
+                }}
               />
               啟用信用卡定期定額
             </label>
             )}
             {!isCompensation && promoCardRecurring && (
-              <p className="text-muted text-sm">
-                每期扣款＝方案費用
-                {promoPrice ? ` $${Number(promoPrice).toLocaleString('zh-TW')}` : ''}
-                ；總期數＝有效期期數
-                {promoPeriodCount ? ` ${promoPeriodCount} 期` : '（請先設定期數）'}
-                。僅限無限使用方案。
-              </p>
+              <>
+                <Field
+                  label="定期定額扣款金額"
+                  hint={`首期收方案費用${promoPrice ? ` $${Number(promoPrice).toLocaleString('zh-TW')}` : ''}；此欄為第 2 期起每期扣款（可與首期不同）`}
+                >
+                  <Input
+                    type="number"
+                    min={1}
+                    step="1"
+                    value={promoRecurringAmount}
+                    onChange={(e) => setPromoRecurringAmount(e.target.value)}
+                    required
+                    style={{ maxWidth: 160 }}
+                  />
+                </Field>
+                <Field
+                  label="PayUNi 續期 Hash（臨櫃）"
+                  hint="臨櫃乙禾後約定頁；PayUNi 串接資訊 Hash。空則用 PAYUNI_PERIOD_HASH"
+                >
+                  <Input
+                    value={promoPayuniPeriodHash}
+                    onChange={(e) => setPromoPayuniPeriodHash(e.target.value)}
+                    placeholder="例：臨櫃Hash"
+                    style={{ maxWidth: 280 }}
+                  />
+                </Field>
+                <Field
+                  label="PayUNi 續期 Hash（會員線上）"
+                  hint="會員線上購買定期定額頁；須與臨櫃不同。空則用 PAYUNI_PERIOD_HASH_ONLINE"
+                >
+                  <Input
+                    value={promoPayuniPeriodHashOnline}
+                    onChange={(e) => setPromoPayuniPeriodHashOnline(e.target.value)}
+                    placeholder="例：線上Hash"
+                    style={{ maxWidth: 280 }}
+                  />
+                </Field>
+                <p className="text-muted text-sm">
+                  總期數＝有效期期數
+                  {promoPeriodCount ? ` ${promoPeriodCount} 期` : '（請先設定期數）'}
+                  。僅限無限使用（月卡）方案。
+                </p>
+              </>
             )}
             <Button type="submit" disabled={promoBranchIds.length === 0}>
               建立方案{promoBranchIds.length > 1 ? `（${promoBranchIds.length} 間分店）` : ''}
@@ -593,7 +682,11 @@ export default function HqPromotionsTab({
                         </td>
                         <td className="text-sm">
                           {p.enableCardRecurring
-                            ? `是 · 每期 $${Number(p.price).toLocaleString('zh-TW')}${
+                            ? `是 · 首期 $${Number(p.price).toLocaleString('zh-TW')} · 續期 $${Number(
+                                p.recurringAmount != null && Number(p.recurringAmount) > 0
+                                  ? p.recurringAmount
+                                  : p.price,
+                              ).toLocaleString('zh-TW')}${
                                 p.periodCount ? ` · ${p.periodCount} 期` : ''
                               }`
                             : '否'}
@@ -716,7 +809,14 @@ export default function HqPromotionsTab({
               </div>
             </Field>
           )}
-          <Field label={editIsUnlimited ? '方案費用' : '現金本金'}>
+          <Field
+            label={editIsUnlimited ? '方案費用（首期）' : '現金本金'}
+            hint={
+              editIsUnlimited
+                ? '首期刷卡／收款金額；若啟用定期定額，第 2 期起請另填扣款金額'
+                : undefined
+            }
+          >
             <Input type="number" value={editPrice} onChange={(e) => setEditPrice(e.target.value)} required />
           </Field>
           {!editIsUnlimited && (
@@ -761,18 +861,60 @@ export default function HqPromotionsTab({
             <input
               type="checkbox"
               checked={editCardRecurring}
-              onChange={(e) => setEditCardRecurring(e.target.checked)}
+              onChange={(e) => {
+                const on = e.target.checked;
+                setEditCardRecurring(on);
+                if (on && !editRecurringAmount && editPrice) {
+                  setEditRecurringAmount(editPrice);
+                }
+              }}
             />
             啟用信用卡定期定額
           </label>
           {editCardRecurring && (
-            <p className="text-muted text-sm">
-              每期扣款＝方案費用
-              {editPrice ? ` $${Number(editPrice).toLocaleString('zh-TW')}` : ''}
-              ；總期數＝有效期期數
-              {editPeriodCount ? ` ${editPeriodCount} 期` : '（請先設定期數）'}
-              。僅限無限使用方案。
-            </p>
+            <>
+              <Field
+                label="定期定額扣款金額"
+                hint={`首期收方案費用${editPrice ? ` $${Number(editPrice).toLocaleString('zh-TW')}` : ''}；此欄為第 2 期起每期扣款（可與首期不同）`}
+              >
+                <Input
+                  type="number"
+                  min={1}
+                  step="1"
+                  value={editRecurringAmount}
+                  onChange={(e) => setEditRecurringAmount(e.target.value)}
+                  required
+                  style={{ maxWidth: 160 }}
+                />
+              </Field>
+              <Field
+                label="PayUNi 續期 Hash（臨櫃）"
+                hint="臨櫃乙禾後約定頁；空則用 PAYUNI_PERIOD_HASH"
+              >
+                <Input
+                  value={editPayuniPeriodHash}
+                  onChange={(e) => setEditPayuniPeriodHash(e.target.value)}
+                  placeholder="例：臨櫃Hash"
+                  style={{ maxWidth: 280 }}
+                />
+              </Field>
+              <Field
+                label="PayUNi 續期 Hash（會員線上）"
+                hint="會員線上購買；須與臨櫃不同。空則用 PAYUNI_PERIOD_HASH_ONLINE"
+              >
+                <Input
+                  value={editPayuniPeriodHashOnline}
+                  onChange={(e) => setEditPayuniPeriodHashOnline(e.target.value)}
+                  placeholder="例：線上Hash"
+                  style={{ maxWidth: 280 }}
+                />
+              </Field>
+              <p className="text-muted text-sm">
+                總期數＝有效期期數
+                {editPeriodCount ? ` ${editPeriodCount} 期` : '（請先設定期數）'}
+                。僅限無限使用（月卡）方案。
+              </p>
+            </>
           )}
           {editPlanMode === 'CAMPAIGN' && (
             <label className="checkbox-item">

@@ -348,7 +348,7 @@ export async function assertMemberSignedNewMemberContract(memberId, db = prisma)
     );
     err.statusCode = 403;
     err.memberId = memberId;
-    err.code = 'CONTRACT_UNSIGNED';
+    err.code = 'CONTRACT_REQUIRED';
     throw err;
   }
   return contract;

@@ -10,7 +10,11 @@ import {
 export const verifyMember = (req, res, next) => {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ status: "error", message: "⛔ 拒絕存取：缺少或無效的登入憑證" });
+    return res.status(401).json({
+      status: 'error',
+      code: 'AUTH_REQUIRED',
+      message: '⛔ 拒絕存取：缺少或無效的登入憑證',
+    });
   }
   const token = authHeader.split(' ')[1];
 
@@ -20,22 +24,28 @@ export const verifyMember = (req, res, next) => {
     // 🚨 拒絕員工 JWT 混入會員 API；舊 token 若無 type 亦擋下，強制重新 LINE 登入
     if (decoded.type !== 'member') {
       return res.status(403).json({
-        status: "error",
-        message: "⛔ 權限不足：非會員憑證，請重新以 LINE 登入",
+        status: 'error',
+        code: 'AUTH_EXPIRED',
+        message: '⛔ 權限不足：非會員憑證，請重新以 LINE 登入',
       });
     }
 
     if (!decoded.memberId) {
       return res.status(403).json({
-        status: "error",
-        message: "⛔ 憑證異常：缺少 memberId",
+        status: 'error',
+        code: 'AUTH_EXPIRED',
+        message: '⛔ 憑證異常：缺少 memberId',
       });
     }
 
     req.user = decoded;
     next();
   } catch (_error) {
-    return res.status(403).json({ status: "error", message: "⛔ 登入憑證已過期或遭竄改" });
+    return res.status(403).json({
+      status: 'error',
+      code: 'AUTH_EXPIRED',
+      message: '⛔ 登入憑證已過期或遭竄改',
+    });
   }
 };
 
@@ -96,17 +106,25 @@ export async function verifyMemberDevice(req, res, next) {
 export const verifyStaff = (req, res, next) => {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ status: "error", message: "⛔ 拒絕存取：系統缺少員工憑證" });
+    return res.status(401).json({
+      status: 'error',
+      code: 'AUTH_REQUIRED',
+      message: '⛔ 拒絕存取：系統缺少員工憑證',
+    });
   }
   const token = authHeader.split(' ')[1];
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    
+
     // 🚨 第一道鎖：嚴格檢查憑證種類，拒絕一般會員的 JWT
     if (decoded.type !== 'staff') {
-      return res.status(403).json({ status: "error", message: "⛔ 權限不足：非員工憑證，禁止存取後台" });
+      return res.status(403).json({
+        status: 'error',
+        code: 'AUTH_EXPIRED',
+        message: '⛔ 權限不足：非員工憑證，禁止存取後台',
+      });
     }
-    
+
     // 🚨 第二道鎖：檢查角色（含 DUTY 值星）
     if (
       decoded.role !== 'STAFF' &&
@@ -114,13 +132,21 @@ export const verifyStaff = (req, res, next) => {
       decoded.role !== 'MANAGER' &&
       decoded.role !== 'ADMIN'
     ) {
-      return res.status(403).json({ status: "error", message: "⛔ 權限異常：未知的員工角色" });
+      return res.status(403).json({
+        status: 'error',
+        code: 'AUTH_EXPIRED',
+        message: '⛔ 權限異常：未知的員工角色',
+      });
     }
-    
+
     req.user = decoded; // 統一掛載為 req.user
-    next(); 
+    next();
   } catch (_error) {
-    return res.status(403).json({ status: "error", message: "⛔ 員工憑證已過期或遭竄改" });
+    return res.status(403).json({
+      status: 'error',
+      code: 'AUTH_EXPIRED',
+      message: '⛔ 員工憑證已過期或遭竄改',
+    });
   }
 };
 

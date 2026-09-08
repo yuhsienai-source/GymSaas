@@ -2,7 +2,7 @@
 import express from 'express';
 import prisma from '../lib/prisma.js';
 import { identifyFace, getSimilarityThreshold, isMockMode } from '../lib/papago.js';
-import { verifyGateQrToken, QR_TTL_MS } from '../lib/qrToken.js';
+import { verifyGateQrToken, QR_TTL_MS, QR_SKEW_MS } from '../lib/qrToken.js';
 import { broadcastOccupancy } from '../lib/occupancy.js';
 import { memberHasSignedBiometricsConsent, assertMemberSignedNewMemberContract } from '../lib/memberContract.js';
 import { assertMemberNotOnLeave } from '../lib/memberLeave.js';
@@ -14,15 +14,17 @@ import {
   checkOutSuccessPayload,
 } from '../lib/gateCheckout.js';
 import { formatGateAccessNo } from '../lib/gateAccessNo.js';
+import { lockMemberRow, antiPassbackFromUnique } from '../lib/dbLocks.js';
 
 const router = express.Router();
-const MIN_BALANCE_FOR_TIMED = 10;
+const MIN_BALANCE_FOR_TIMED = 50;
 
 function httpError(message, statusCode, extra = {}) {
   const err = new Error(message);
   err.statusCode = statusCode;
   if (extra.memberId != null) err.memberId = extra.memberId;
   if (extra.code) err.code = extra.code;
+  if (extra.activeLogId != null) err.activeLogId = extra.activeLogId;
   return err;
 }
 
@@ -35,6 +37,7 @@ function sendGateError(res, error, fallbackMessage) {
   };
   if (error.memberId != null) body.memberId = error.memberId;
   if (error.code) body.code = error.code;
+  if (error.activeLogId != null) body.activeLogId = error.activeLogId;
   return res.status(statusCode).json(body);
 }
 
@@ -123,7 +126,7 @@ async function processCheckIn(memberId, entryMethod, branchId, gateDeviceId = nu
   } catch (err) {
     if (err && typeof err === 'object') {
       err.memberId = err.memberId ?? memberId;
-      err.code = err.code || 'CONTRACT_UNSIGNED';
+      err.code = err.code || 'CONTRACT_REQUIRED';
     }
     throw err;
   }
@@ -137,94 +140,110 @@ async function processCheckIn(memberId, entryMethod, branchId, gateDeviceId = nu
     }
   }
 
-  return prisma.$transaction(async (tx) => {
-    const member = await tx.member.findUnique({ where: { id: memberId } });
-    if (!member) throw httpError('無此會員', 404);
+  try {
+    return await prisma.$transaction(async (tx) => {
+      // 悲觀鎖：同會員進出場序列化，堵住 find→create 競態
+      const locked = await lockMemberRow(tx, memberId);
+      if (!locked) throw httpError('無此會員', 404);
 
-    if (member.isAlert && entryMethod === 'QR') {
-      throw httpError(
-        '🚨 警示帳號：動態 QR Code 已失效！強制要求人工查驗或限用實名生物辨識進場。',
-        403,
-        { memberId, code: 'ALERT_BLOCK' },
-      );
-    }
+      const member = await tx.member.findUnique({ where: { id: memberId } });
+      if (!member) throw httpError('無此會員', 404);
 
-    if (entryMethod === 'FACE' && !member.papagoFaceId) {
-      throw httpError('⛔ 此會員尚未完成 PAPAGO 人臉註冊，請至櫃檯辦理綁定。', 403, {
-        memberId,
-        code: 'FACE_UNBOUND',
-      });
-    }
-
-    const unfinishedLog = await tx.checkInLog.findFirst({
-      where: { memberId, checkOutAt: null, status: 'ACTIVE' },
-    });
-    if (unfinishedLog) {
-      throw httpError('⛔ 防卡單：會員已在場內，請先完成出場結算。', 400, {
-        memberId,
-        code: 'ALREADY_IN',
-      });
-    }
-
-    // 請假中不可用無限／月費通行；期滿自動清 leaveUntil
-    let memberForGate;
-    try {
-      memberForGate = await assertMemberNotOnLeave(member, { now, tx });
-    } catch (leaveErr) {
-      if (leaveErr && typeof leaveErr === 'object') {
-        leaveErr.memberId = memberId;
-        leaveErr.code = leaveErr.code || 'ON_LEAVE';
-      }
-      throw leaveErr;
-    }
-
-    let currentPlan = memberForGate.plan;
-    let downgraded = false;
-    if (memberForGate.expireDate && now > memberForGate.expireDate) {
-      await tx.member.update({
-        where: { id: memberId },
-        data: { plan: '計時會員', expireDate: null },
-      });
-      currentPlan = '計時會員';
-      downgraded = true;
-    }
-
-    let appliedBillingMode = '計時扣款';
-    if (currentPlan === '月費會員' || currentPlan === '無限會員') {
-      appliedBillingMode = '月費通行';
-    }
-
-    if (appliedBillingMode === '計時扣款') {
-      const totalAvailable = memberForGate.cashWallet + memberForGate.bonusWallet;
-      if (totalAvailable < MIN_BALANCE_FOR_TIMED) {
+      if (member.isAlert && entryMethod === 'QR') {
         throw httpError(
-          `方案已過期或為計時制，餘額不足無法進場！(總額: ${totalAvailable})`,
+          '🚨 警示帳號：動態 QR Code 已失效！強制要求人工查驗或限用實名生物辨識進場。',
+          403,
+          { memberId, code: 'ALERT_BLOCK' },
+        );
+      }
+
+      if (entryMethod === 'FACE' && !member.papagoFaceId) {
+        throw httpError('⛔ 此會員尚未完成 PAPAGO 人臉註冊，請至櫃檯辦理綁定。', 403, {
+          memberId,
+          code: 'FACE_UNBOUND',
+        });
+      }
+
+      const unfinishedLog = await tx.checkInLog.findFirst({
+        where: { memberId, checkOutAt: null, status: 'ACTIVE' },
+      });
+      if (unfinishedLog) {
+        // Anti-passback：未出場結算前禁止再次進場（防條碼遞欄杆／尾隨後再刷）
+        throw httpError(
+          '⛔ 防潛回：此帳號已在場內且尚未出場結算，進場閘禁止再次刷開。請先於出場閘刷卡／刷臉結算。',
           403,
           {
             memberId,
-            code: downgraded ? 'EXPIRED_BALANCE' : 'BALANCE_INSUFFICIENT',
+            code: 'ANTI_PASSBACK',
+            activeLogId: unfinishedLog.id,
           },
         );
       }
-    }
 
-    // 進出場：必須為會員綁定場館（含 AC↔HP 共享）
-    if (!branchId) {
-      throw httpError('閘機未設定分店，無法進場', 400);
-    }
-    await assertMemberBoundGateAccess(memberId, branchId, tx);
+      // 請假中不可用無限／月費通行；期滿自動清 leaveUntil
+      let memberForGate;
+      try {
+        memberForGate = await assertMemberNotOnLeave(member, { now, tx });
+      } catch (leaveErr) {
+        if (leaveErr && typeof leaveErr === 'object') {
+          leaveErr.memberId = memberId;
+          leaveErr.code = leaveErr.code || 'ON_LEAVE';
+        }
+        throw leaveErr;
+      }
 
-    const log = await tx.checkInLog.create({
-      data: {
-        memberId,
-        billingMode: appliedBillingMode,
-        branchId,
-        ...(gateDeviceId ? { gateDeviceId } : {}),
-      },
+      let currentPlan = memberForGate.plan;
+      let downgraded = false;
+      if (memberForGate.expireDate && now > memberForGate.expireDate) {
+        await tx.member.update({
+          where: { id: memberId },
+          data: { plan: '計時會員', expireDate: null },
+        });
+        currentPlan = '計時會員';
+        downgraded = true;
+      }
+
+      let appliedBillingMode = '計時扣款';
+      if (currentPlan === '月費會員' || currentPlan === '無限會員') {
+        appliedBillingMode = '月費通行';
+      }
+
+      if (appliedBillingMode === '計時扣款') {
+        const totalAvailable = memberForGate.cashWallet + memberForGate.bonusWallet;
+        if (totalAvailable < MIN_BALANCE_FOR_TIMED) {
+          throw httpError(
+            `方案已過期或為計時制，餘額不足無法進場！(總額: ${totalAvailable})`,
+            403,
+            {
+              memberId,
+              code: downgraded ? 'EXPIRED_BALANCE' : 'BALANCE_INSUFFICIENT',
+            },
+          );
+        }
+      }
+
+      // 進出場：必須為會員綁定場館（含 AC↔HP 共享）
+      if (!branchId) {
+        throw httpError('閘機未設定分店，無法進場', 400);
+      }
+      await assertMemberBoundGateAccess(memberId, branchId, tx);
+
+      const log = await tx.checkInLog.create({
+        data: {
+          memberId,
+          billingMode: appliedBillingMode,
+          branchId,
+          ...(gateDeviceId ? { gateDeviceId } : {}),
+        },
+      });
+
+      return { member: memberForGate, log, appliedBillingMode, downgraded, entryMethod };
     });
-
-    return { member: memberForGate, log, appliedBillingMode, downgraded, entryMethod };
-  });
+  } catch (err) {
+    const mapped = antiPassbackFromUnique(err, memberId);
+    if (mapped) throw mapped;
+    throw err;
+  }
 }
 
 function sendCheckInSuccess(res, result) {
@@ -405,6 +424,21 @@ router.get('/face/status', (req, res) => {
       mockMode: isMockMode(),
       similarityThreshold: getSimilarityThreshold(),
       qrTtlMs: QR_TTL_MS,
+      qrSkewMs: QR_SKEW_MS,
+    },
+  });
+});
+
+/** 閘機時鐘校準：回傳伺服器 epoch ms（前端算 offset） */
+router.get('/sync-time', (req, res) => {
+  const serverNow = Date.now();
+  res.json({
+    status: 'success',
+    data: {
+      serverNow,
+      iso: new Date(serverNow).toISOString(),
+      qrTtlMs: QR_TTL_MS,
+      qrSkewMs: QR_SKEW_MS,
     },
   });
 });

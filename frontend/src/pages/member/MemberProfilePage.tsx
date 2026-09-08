@@ -1,6 +1,7 @@
 import { type FormEvent, useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import MemberLayout from '../../components/layout/MemberLayout';
+import IdPhotoUploadModal from '../../components/member/IdPhotoUploadModal';
 import {
   Alert,
   Badge,
@@ -14,11 +15,16 @@ import {
 import { useMemberAuth } from '../../contexts/MemberAuthContext';
 import { useToast } from '../../contexts/ToastContext';
 import {
+  cancelMemberIdPhotoDeleteRequest,
+  fetchMemberIdPhotoMeta,
   fetchMemberProfile,
   fetchMemberSignedContracts,
   getErrorMessage,
+  memberIdPhotoPath,
   updateMemberProfile,
+  type IdPhotoSide,
 } from '../../lib/api';
+import { getMemberToken } from '../../lib/storage';
 import type { MemberContractListItem, MemberProfile } from '../../types/api';
 
 function purposeLabel(purpose?: string | null) {
@@ -70,6 +76,21 @@ function itemKey(item: MemberContractListItem) {
   return item.signatureId ?? `c-${item.contractId}-v-${item.versionId ?? 0}`;
 }
 
+const SIDE_LABEL: Record<IdPhotoSide, string> = {
+  front: '證件正面',
+  back: '證件反面',
+};
+
+async function fetchIdPhotoBlobUrl(side: IdPhotoSide): Promise<string | null> {
+  const token = getMemberToken();
+  const res = await fetch(memberIdPhotoPath(side), {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  });
+  if (!res.ok) return null;
+  const blob = await res.blob();
+  return URL.createObjectURL(blob);
+}
+
 export default function MemberProfilePage() {
   const { logout } = useMemberAuth();
   const { toast } = useToast();
@@ -82,6 +103,57 @@ export default function MemberProfilePage() {
   const [emergencyContactPhone, setEmergencyContactPhone] = useState('');
   const [error, setError] = useState('');
   const [expandedKey, setExpandedKey] = useState<string | number | null>(null);
+  const [frontPreview, setFrontPreview] = useState<string | null>(null);
+  const [backPreview, setBackPreview] = useState<string | null>(null);
+  const [idPhotoModalOpen, setIdPhotoModalOpen] = useState(false);
+  const [idPhotoModalSide, setIdPhotoModalSide] = useState<IdPhotoSide | null>(null);
+  const [pendingDeletes, setPendingDeletes] = useState<
+    { id: string; side: string; status: string; reason?: string | null; requestedAt: string }[]
+  >([]);
+
+  function setPreview(side: IdPhotoSide, url: string | null) {
+    if (side === 'front') {
+      setFrontPreview((prev) => {
+        if (prev?.startsWith('blob:')) URL.revokeObjectURL(prev);
+        return url;
+      });
+    } else {
+      setBackPreview((prev) => {
+        if (prev?.startsWith('blob:')) URL.revokeObjectURL(prev);
+        return url;
+      });
+    }
+  }
+
+  async function refreshIdPhotoMetaAndPreviews(opts?: {
+    frontUrl?: string | null;
+    backUrl?: string | null;
+  }) {
+    const loadSide = async (side: IdPhotoSide, hasUrl?: string | null) => {
+      if (!hasUrl) {
+        setPreview(side, null);
+        return;
+      }
+      try {
+        const url = await fetchIdPhotoBlobUrl(side);
+        if (url) setPreview(side, url);
+      } catch {
+        /* ignore */
+      }
+    };
+    await Promise.all([
+      loadSide('front', opts?.frontUrl ?? profile?.idPhotoUrl),
+      loadSide('back', opts?.backUrl ?? profile?.idPhotoBackUrl),
+    ]);
+    try {
+      const meta = await fetchMemberIdPhotoMeta();
+      if (meta.status === 'success' && meta.data?.pendingDeletes) {
+        setPendingDeletes(meta.data.pendingDeletes);
+      }
+    } catch {
+      /* ignore */
+    }
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -97,6 +169,27 @@ export default function MemberProfilePage() {
           setName(profileRes.data.name || '');
           setEmergencyContact(profileRes.data.emergencyContact || '');
           setEmergencyContactPhone(profileRes.data.emergencyContactPhone || '');
+          const loadSide = async (side: IdPhotoSide, hasUrl?: string | null) => {
+            if (!hasUrl) return;
+            try {
+              const url = await fetchIdPhotoBlobUrl(side);
+              if (!cancelled && url) setPreview(side, url);
+            } catch {
+              /* ignore preview */
+            }
+          };
+          await Promise.all([
+            loadSide('front', profileRes.data.idPhotoUrl),
+            loadSide('back', profileRes.data.idPhotoBackUrl),
+          ]);
+          try {
+            const meta = await fetchMemberIdPhotoMeta();
+            if (!cancelled && meta.status === 'success' && meta.data?.pendingDeletes) {
+              setPendingDeletes(meta.data.pendingDeletes);
+            }
+          } catch {
+            /* ignore */
+          }
         }
         if (contractsRes.status === 'success' && Array.isArray(contractsRes.data)) {
           setContracts(contractsRes.data);
@@ -112,6 +205,16 @@ export default function MemberProfilePage() {
       cancelled = true;
     };
   }, [toast]);
+
+  async function handleCancelDeleteRequest(requestId: string) {
+    try {
+      await cancelMemberIdPhotoDeleteRequest(requestId);
+      toast('已取消清除申請', 'info');
+      setPendingDeletes((rows) => rows.filter((r) => r.id !== requestId));
+    } catch (err) {
+      toast(getErrorMessage(err, '取消失敗'), 'error');
+    }
+  }
 
   async function handleSave(e: FormEvent) {
     e.preventDefault();
@@ -154,6 +257,33 @@ export default function MemberProfilePage() {
     .filter(Boolean)
     .join(' · ');
 
+  function renderIdSide(side: IdPhotoSide) {
+    const preview = side === 'front' ? frontPreview : backPreview;
+    return (
+      <div className="id-photo-side" key={side}>
+        <p className="id-photo-side__title">{SIDE_LABEL[side]}</p>
+        {preview ? (
+          <img src={preview} alt={`${SIDE_LABEL[side]}預覽`} className="id-photo-side__preview" />
+        ) : (
+          <div className="id-photo-side__placeholder">尚未上傳</div>
+        )}
+        <div className="id-photo-side__actions">
+          <Button
+            type="button"
+            variant="secondary"
+            className="id-photo-touch-btn"
+            onClick={() => {
+              setIdPhotoModalSide(side);
+              setIdPhotoModalOpen(true);
+            }}
+          >
+            上傳／更新
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <MemberLayout
       name={profile?.name || (loading ? '載入中…' : '會員')}
@@ -189,7 +319,12 @@ export default function MemberProfilePage() {
               </Field>
               <div className="profile-badges">
                 <Badge tone={profile?.hasLineBound ? 'success' : 'neutral'}>
-                  LINE／裝置 {profile?.hasLineBound && profile?.hasDeviceBound ? '已綁定' : profile?.hasLineBound ? 'LINE 已綁（待補裝置）' : '未綁定'}
+                  LINE／裝置{' '}
+                  {profile?.hasLineBound && profile?.hasDeviceBound
+                    ? '已綁定'
+                    : profile?.hasLineBound
+                      ? 'LINE 已綁（待補裝置）'
+                      : '未綁定'}
                 </Badge>
                 <Badge tone={profile?.hasFaceBound ? 'success' : 'neutral'}>
                   人臉 {profile?.hasFaceBound ? '已綁定' : '未綁定'}
@@ -227,12 +362,84 @@ export default function MemberProfilePage() {
               </Field>
             </div>
 
+            <div className="profile-section">
+              <p className="profile-section__label">證件照片</p>
+              <Alert tone="info">
+                僅供會籍身分核對。保存至會籍結束後 3 年；重傳後舊圖保留 1 年。清除須櫃檯核准。影像經登入憑證讀取，不上公開目錄。
+              </Alert>
+              <div className="id-photo-grid">
+                {renderIdSide('front')}
+                {renderIdSide('back')}
+              </div>
+              <Button
+                type="button"
+                className="id-photo-touch-btn"
+                style={{ width: '100%', marginTop: '0.65rem', background: '#083D4F' }}
+                onClick={() => {
+                  setIdPhotoModalSide(null);
+                  setIdPhotoModalOpen(true);
+                }}
+              >
+                開啟證件上傳（鏡頭／選檔／申請清除）
+              </Button>
+              {pendingDeletes.length > 0 && (
+                <div className="id-photo-pending">
+                  <p className="id-photo-side__title">待核准清除申請</p>
+                  <ul>
+                    {pendingDeletes.map((p) => (
+                      <li key={p.id}>
+                        {p.side === 'both'
+                          ? '正＋反面'
+                          : SIDE_LABEL[p.side as IdPhotoSide] || p.side}
+                        {' · '}
+                        {new Date(p.requestedAt).toLocaleString('zh-TW')}
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          className="id-photo-touch-btn"
+                          onClick={() => void handleCancelDeleteRequest(p.id)}
+                        >
+                          取消申請
+                        </Button>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+
             <Button type="submit" size="lg" loading={saving} className="w-full" style={{ width: '100%' }}>
               儲存變更
             </Button>
           </form>
         )}
       </Card>
+
+      <IdPhotoUploadModal
+        open={idPhotoModalOpen}
+        initialSide={idPhotoModalSide}
+        onClose={() => setIdPhotoModalOpen(false)}
+        onUploaded={(side) => {
+          setProfile((p) => {
+            if (!p) return p;
+            if (side === 'back') {
+              return { ...p, idPhotoBackUrl: p.idPhotoBackUrl || 'uploaded' };
+            }
+            return { ...p, idPhotoUrl: p.idPhotoUrl || 'uploaded' };
+          });
+          void (async () => {
+            try {
+              const url = await fetchIdPhotoBlobUrl(side);
+              if (url) setPreview(side, url);
+            } catch {
+              /* ignore */
+            }
+          })();
+        }}
+        onDeleteRequested={() => {
+          void refreshIdPhotoMetaAndPreviews();
+        }}
+      />
 
       <Card
         title="契約簽署狀態"

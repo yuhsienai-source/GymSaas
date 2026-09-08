@@ -28,9 +28,11 @@ import {
   fetchOpsCheckoutStatus,
   opsBindFace,
   opsCheckout,
+  opsConfirmYipay,
   openPayuniCheckoutInNewTab,
   redirectToCheckOut,
   resignMemberContract,
+  resetOpsMemberDevice,
   signMemberContract,
   unbindOpsMemberDevice,
   unbindOpsMemberLine,
@@ -38,10 +40,17 @@ import {
 } from '../../lib/api';
 import BranchScopeBar from '../../components/staff/BranchScopeBar';
 import MemberIdentifyPanel from '../../components/staff/MemberIdentifyPanel';
+import OpsMemberAdminPanel from '../../components/staff/OpsMemberAdminPanel';
 import OpsActiveCheckInsTab from '../../components/staff/OpsActiveCheckInsTab';
 import OpsShiftHandoverTab from '../../components/staff/OpsShiftHandoverTab';
+import OpsInvoiceFailBanner from '../../components/staff/OpsInvoiceFailBanner';
 import SignaturePad from '../../components/staff/SignaturePad';
 import { staffBranchLabel } from '../../lib/branchLabel';
+import {
+  summarizePosDisplayCart,
+  type PosDisplayCartPayload,
+} from '../../lib/posDisplayBus';
+import { usePosDisplayHost } from '../../lib/usePosDisplayHost';
 import OrdersQueryPage from './OrdersQueryPage';
 import { validateInvoiceOptions } from '../../components/staff/InvoiceCarrierField';
 import CompositePayFields, {
@@ -80,6 +89,8 @@ function contractToneLabel(item: MemberContractBoardItem) {
 type MemberFormState = {
   name: string;
   phone: string;
+  email: string;
+  idNumber: string;
   isAlert: boolean;
   faceEnabled: boolean;
   emergencyContact: string;
@@ -90,6 +101,8 @@ type MemberFormState = {
 const EMPTY_FORM: MemberFormState = {
   name: '',
   phone: '',
+  email: '',
+  idNumber: '',
   isAlert: false,
   faceEnabled: false,
   emergencyContact: '',
@@ -101,7 +114,9 @@ function toDateInputValue(value?: string | null) {
   if (!value) return '';
   const d = new Date(value);
   if (Number.isNaN(d.getTime())) return '';
-  return d.toISOString().slice(0, 10);
+  // 用本地日曆日，避免 toISOString（UTC）在台灣造成效期少顯示一天
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 
 /** 未購方案＝分鐘計費；購案後顯示系統寫入的方案名 */
@@ -171,6 +186,45 @@ type CartCourseLine = {
 
 type CartLine = CartProductLine | CartPromoLine | CartCourseLine;
 
+function buildOpsPosDisplayCart(
+  cart: CartLine[],
+  promotions: Promotion[],
+  opts: { payableTotal: number; memberName?: string | null },
+): PosDisplayCartPayload {
+  const lines = cart.map((c) => {
+    let lineTotal: number;
+    let bonusSc = 0;
+    let qty = c.qty;
+    if (c.kind === 'PROMO') {
+      const unlimited = c.usageType === 'UNLIMITED';
+      lineTotal = unlimited ? c.price : c.price * c.qty;
+      qty = unlimited ? 1 : c.qty;
+      const p = promotions.find((x) => x.id === c.promotionId);
+      bonusSc = (p?.bonusGiven || 0) * (unlimited ? 1 : c.qty);
+    } else {
+      lineTotal = c.price * c.qty;
+    }
+    return {
+      kind: c.kind,
+      name: c.name,
+      qty,
+      unitPrice: c.price,
+      lineTotal,
+      ...(bonusSc > 0 ? { bonusSc } : {}),
+    };
+  });
+  const summary = summarizePosDisplayCart({
+    lines,
+    payableTotal: opts.payableTotal,
+    memberName: opts.memberName || undefined,
+  });
+  return {
+    ...summary,
+    currency: 'TWD',
+    memberName: opts.memberName || undefined,
+  };
+}
+
 const OPS_TABS: { key: OpsTab; label: string }[] = [
   { key: 'checkout', label: '臨櫃結帳' },
   { key: 'members', label: '會員管理' },
@@ -182,6 +236,7 @@ const OPS_TABS: { key: OpsTab; label: string }[] = [
 export default function OpsDashboardPage() {
   const { toast } = useToast();
   const { staff, isAdmin } = useStaffAuth();
+  const posDisplay = usePosDisplayHost();
   const branchLocked = !isAdmin && Boolean(staff?.branchId);
   const [tab, setTab] = useState<OpsTab>(() => {
     const params = new URLSearchParams(window.location.search);
@@ -216,6 +271,7 @@ export default function OpsDashboardPage() {
   });
   const [cardOptions, setCardOptions] = useState<CardPayOptions>(DEFAULT_CARD_PAY_OPTIONS);
   const [voucherCode, setVoucherCode] = useState('');
+  const [linePayOneTimeKey, setLinePayOneTimeKey] = useState('');
   const [carrier, setCarrier] = useState('');
   const [buyerUbn, setBuyerUbn] = useState('');
   const [loveCode, setLoveCode] = useState('');
@@ -226,9 +282,22 @@ export default function OpsDashboardPage() {
   const [pendingPeriodPay, setPendingPeriodPay] = useState<{
     ref: string;
     label: string;
+    /** 乙禾已入帳後的 PayUNi 僅約定：等 hasCreditHash，而非 PAID */
+    bindOnly?: boolean;
   } | null>(null);
   const [pendingPeriodStatus, setPendingPeriodStatus] = useState<string>('PENDING');
   const [pendingPeriodChecking, setPendingPeriodChecking] = useState(false);
+  /** 乙禾現場刷卡：PENDING 後待櫃檯確認端末成功 */
+  const [pendingYipay, setPendingYipay] = useState<{
+    checkoutId: string;
+    amount: number;
+    hint?: string;
+    needsPeriodBind?: boolean;
+    recurringAmount?: number | null;
+    periodTimes?: number | null;
+  } | null>(null);
+  const [yipayTerminalRef, setYipayTerminalRef] = useState('');
+  const [yipayConfirmBusy, setYipayConfirmBusy] = useState(false);
   const [search, setSearch] = useState('');
   const [debouncedSearch, setDebouncedSearch] = useState('');
   const [promotionId, setPromotionId] = useState<number | ''>('');
@@ -459,13 +528,19 @@ export default function OpsDashboardPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- 僅處理一次刷卡回流
   }, []);
 
-  async function finalizeAfterPeriodPaid(ref: string, invoiceNumber?: string | null) {
+  async function finalizeAfterPeriodPaid(
+    ref: string,
+    invoiceNumber?: string | null,
+    opts?: { bindOnly?: boolean },
+  ) {
     toast(
-      `續期收款入帳完成 · ${ref}${invoiceNumber ? ` · 發票 ${invoiceNumber}` : ''}`,
+      opts?.bindOnly
+        ? `定期定額約定完成 · ${ref}${invoiceNumber ? ` · 發票 ${invoiceNumber}` : ''}`
+        : `續期收款入帳完成 · ${ref}${invoiceNumber ? ` · 發票 ${invoiceNumber}` : ''}`,
       'success',
     );
     setPendingPeriodPay(null);
-    setPendingPeriodStatus('PAID');
+    setPendingPeriodStatus(opts?.bindOnly ? 'BOUND' : 'PAID');
     clearCart();
     setTopupQty(1);
     resetSharedCheckoutPay();
@@ -488,15 +563,27 @@ export default function OpsDashboardPage() {
         const res = await fetchOpsCheckoutStatus(pendingPeriodPay.ref);
         if (res.status !== 'success' || !res.data) return;
         const st = String(res.data.payStatus || '').toUpperCase();
-        setPendingPeriodStatus(st || 'PENDING');
-        if (st === 'PAID' && !pendingPeriodSettled.current) {
+        const bindOnly = Boolean(pendingPeriodPay.bindOnly);
+        const done = bindOnly
+          ? Boolean(res.data.hasCreditHash)
+          : st === 'PAID';
+        setPendingPeriodStatus(
+          done ? (bindOnly ? 'BOUND' : 'PAID') : bindOnly ? 'WAITING_BIND' : st || 'PENDING',
+        );
+        if (done && !pendingPeriodSettled.current) {
           pendingPeriodSettled.current = true;
           await finalizeAfterPeriodPaid(
             pendingPeriodPay.ref,
             res.data.invoiceNumber || null,
+            { bindOnly },
           );
-        } else if (opts?.manual && st !== 'PAID') {
-          toast('尚未收到金流 Notify 入帳，請稍候再試（或確認 ngrok／NotifyURL）', 'info');
+        } else if (opts?.manual && !done) {
+          toast(
+            bindOnly
+              ? '尚未收到 PayUNi 約定回報，請於續期頁完成卡號輸入後稍候再試（約定成功後會自動關閉）'
+              : '尚未收到金流 Notify 入帳，請稍候再試（或確認 ngrok／NotifyURL）',
+            'info',
+          );
         }
       } catch (err) {
         if (opts?.manual) toast(getErrorMessage(err, '查詢付款狀態失敗'), 'error');
@@ -504,9 +591,8 @@ export default function OpsDashboardPage() {
         if (opts?.manual) setPendingPeriodChecking(false);
       }
     },
-    // finalize uses stable setters + loadMembers; keep deps minimal
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- poll only keyed by pending ref
-    [pendingPeriodPay?.ref],
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- poll keyed by pending ref + mode
+    [pendingPeriodPay?.ref, pendingPeriodPay?.bindOnly],
   );
 
   useEffect(() => {
@@ -552,6 +638,8 @@ export default function OpsDashboardPage() {
     setForm({
       name: member.name,
       phone: member.phone,
+      email: member.email || '',
+      idNumber: member.idNumber || '',
       isAlert: Boolean(member.isAlert),
       faceEnabled: Boolean(member.faceEnabled),
       emergencyContact: member.emergencyContact || '',
@@ -656,8 +744,8 @@ export default function OpsDashboardPage() {
   }
 
   async function handleCreateMember() {
-    if (!form.name.trim() || !form.phone.trim()) {
-      toast('姓名與電話為必填', 'error');
+    if (!form.name.trim() || !form.phone.trim() || !form.idNumber.trim()) {
+      toast('姓名、手機號碼與證件號為必填', 'error');
       return;
     }
     if (form.branchIds.length === 0) {
@@ -670,6 +758,8 @@ export default function OpsDashboardPage() {
       const result = await createOpsMember({
         name: form.name.trim(),
         phone: form.phone.trim(),
+        email: form.email.trim() || undefined,
+        idNumber: form.idNumber.trim(),
         branchIds: form.branchIds,
         faceEnabled: wantFace,
       });
@@ -709,8 +799,8 @@ export default function OpsDashboardPage() {
 
   async function handleUpdateMember() {
     if (!editingMember) return;
-    if (!form.name.trim() || !form.phone.trim()) {
-      toast('姓名與電話為必填', 'error');
+    if (!form.name.trim() || !form.phone.trim() || !form.idNumber.trim()) {
+      toast('姓名、手機號碼與證件號為必填', 'error');
       return;
     }
     if (form.branchIds.length === 0) {
@@ -722,7 +812,10 @@ export default function OpsDashboardPage() {
       const result = await updateOpsMember(editingMember.id, {
         name: form.name.trim(),
         phone: form.phone.trim(),
-        isAlert: form.isAlert,
+        email: form.email.trim() || null,
+        idNumber: form.idNumber.trim(),
+        // 櫃檯只能「標示」警示；解除須走總部合規補償。勿傳 false（後端會拒）
+        ...(form.isAlert ? { isAlert: true } : {}),
         faceEnabled: form.faceEnabled,
         emergencyContact: form.emergencyContact.trim() || null,
         emergencyContactPhone: form.emergencyContactPhone.trim() || null,
@@ -819,6 +912,32 @@ export default function OpsDashboardPage() {
       }
     } catch (err) {
       toast(getErrorMessage(err, '解除裝置失敗'), 'error');
+    } finally {
+      setBinding(false);
+    }
+  }
+
+  async function handleResetDevice() {
+    if (!editingMember) return;
+    if (
+      !window.confirm(
+        `臨櫃核身重置：解除會員 [${editingMember.name}] 裝置綁定，並使舊機登入立即失效？`,
+      )
+    ) {
+      return;
+    }
+    setBinding(true);
+    try {
+      const result = await resetOpsMemberDevice(editingMember.id);
+      toast(result.message || '已重置裝置', 'success');
+      if (result.data) {
+        setEditingMember(result.data);
+        patchMember(result.data);
+      } else {
+        void loadMembers({ skip: 0 });
+      }
+    } catch (err) {
+      toast(getErrorMessage(err, '重置裝置失敗'), 'error');
     } finally {
       setBinding(false);
     }
@@ -940,7 +1059,9 @@ export default function OpsDashboardPage() {
   };
 
   const defaultRecurringAmount = cartPromoLine?.enableCardRecurring
-    ? cartPromoLine.price
+    ? (cartPromoLine.recurringAmount != null && cartPromoLine.recurringAmount > 0
+        ? cartPromoLine.recurringAmount
+        : cartPromoLine.price)
     : resolveCourseRecurringAmount(cardOptions.periodTimes) ??
       (recurringCourseLine
         ? cartCourseLines.reduce(
@@ -955,6 +1076,9 @@ export default function OpsDashboardPage() {
     cartPromoLine.periodCount > 0
       ? [cartPromoLine.periodCount]
       : undefined;
+
+  /** 月卡／課程定期定額臨櫃：乙禾首期＋PayUNi 約定 */
+  const yipayPayuniRecurring = allowCardRecurring;
 
   /** 選定期定額時，課程首期只收第1期；其餘列維持原價 */
   const payableTotal = useMemo(() => {
@@ -977,11 +1101,83 @@ export default function OpsDashboardPage() {
     return Math.round((withoutRecurringCourse + first * recurringCourseLine.qty) * 100) / 100;
   }, [cart, cartTotal, cardOptions.cardMode, cardOptions.periodTimes, recurringCourseLine, cartPromoLine]);
 
+  /** 選定期定額時自動帶入乙禾＋PayUNi 標記與期付選項 */
+  useEffect(() => {
+    if (!yipayPayuniRecurring) return;
+    const periodAmt =
+      cartPromoLine?.enableCardRecurring
+        ? cartPromoLine.recurringAmount != null && cartPromoLine.recurringAmount > 0
+          ? cartPromoLine.recurringAmount
+          : cartPromoLine.price
+        : resolveCourseRecurringAmount(cardOptions.periodTimes) ?? defaultRecurringAmount;
+    const times =
+      cartPromoLine?.periodCount ??
+      courseDefaultPeriodTimes ??
+      cardOptions.periodTimes ??
+      12;
+    setCardOptions((prev) => ({
+      ...prev,
+      cardMode: 'RECURRING',
+      periodType: 'M',
+      periodTimes: times,
+      recurringAmount: periodAmt != null && periodAmt > 0 ? periodAmt : prev.recurringAmount,
+    }));
+    setPaySelected((prev) => {
+      const next = new Set(prev.filter((m) => m !== 'LINEPAY'));
+      next.add('YIPAY');
+      next.add('CARD');
+      next.delete('CASH');
+      return Array.from(next);
+    });
+    setPayAmounts((prev) => ({
+      ...prev,
+      YIPAY: payableTotal,
+      CARD: 0,
+    }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [yipayPayuniRecurring, cartPromoLine?.promotionId, recurringCourseLine?.coursePlanId, payableTotal]);
+
+  // 客顯鏡像購物車（CONSENT 進行中不覆寫）
+  useEffect(() => {
+    if (tab !== 'checkout') return;
+    if (posDisplay.pendingConsentId) return;
+    if (!cart.length) {
+      posDisplay.postIdle();
+      return;
+    }
+    posDisplay.postCart(
+      buildOpsPosDisplayCart(cart, promotions, {
+        payableTotal,
+        memberName: selectedMember?.name,
+      }),
+    );
+  }, [
+    tab,
+    cart,
+    promotions,
+    payableTotal,
+    selectedMember?.name,
+    posDisplay.pendingConsentId,
+    posDisplay.postCart,
+    posDisplay.postIdle,
+  ]);
+
+  // 契約：客顯 SIGNATURE_COMPLETED → 填入本機 SignaturePad 狀態
+  useEffect(() => {
+    const sig = posDisplay.lastSignature;
+    if (!sig || sig.purpose !== 'CONTRACT') return;
+    if (!signDetail || signDetail.status === 'SIGNED') return;
+    setSignatureData(sig.signatureDataUrl);
+    toast('客顯契約簽名已回傳，請確認後存檔', 'success');
+    posDisplay.clearSignature();
+  }, [posDisplay.lastSignature, signDetail, toast, posDisplay.clearSignature]);
+
   function resetSharedCheckoutPay() {
     setCarrier('');
     setBuyerUbn('');
     setLoveCode('');
     setVoucherCode('');
+    setLinePayOneTimeKey('');
     setPaySelected(['CASH']);
     setPayAmounts({ CASH: 0 });
     setCardOptions(DEFAULT_CARD_PAY_OPTIONS);
@@ -1151,6 +1347,21 @@ export default function OpsDashboardPage() {
     );
   }
 
+  function updateCartPromoQty(promotionId: number, raw: string) {
+    const n = parseInt(raw, 10);
+    if (!Number.isInteger(n) || n <= 0) {
+      setCart((prev) => prev.filter((c) => !(c.kind === 'PROMO' && c.promotionId === promotionId)));
+      return;
+    }
+    setCart((prev) =>
+      prev.map((c) => {
+        if (c.kind !== 'PROMO' || c.promotionId !== promotionId) return c;
+        if (c.usageType === 'UNLIMITED') return c;
+        return { ...c, qty: n };
+      }),
+    );
+  }
+
   function updateCartProductQty(productId: number, raw: string) {
     const product = posProducts.find((p) => p.id === productId);
     const service = String(product?.productKind || 'PHYSICAL').toUpperCase() === 'SERVICE';
@@ -1194,6 +1405,31 @@ export default function OpsDashboardPage() {
 
   function clearCart() {
     setCart([]);
+    if (!posDisplay.pendingConsentId) posDisplay.postIdle();
+  }
+
+  function sendContractConsentToDisplay() {
+    if (!signMember || !signDetail?.body) {
+      toast('契約內容不完整，無法派送客顯', 'error');
+      return;
+    }
+    const branch =
+      posBranchId !== ''
+        ? staffBranchLabel(branches.find((b) => b.id === posBranchId)) || String(posBranchId)
+        : staff?.branchName || '—';
+    posDisplay.openDisplayWindow();
+    posDisplay.requestConsent({
+      purpose: 'CONTRACT',
+      title:
+        signDetail.contractDisplayName ||
+        signDetail.contractShortName ||
+        signDetail.contractTitle ||
+        '定型化契約',
+      body: signDetail.body,
+      memberName: signMember.name,
+      branchLabel: branch,
+    });
+    toast('已派送客顯契約簽署', 'info');
   }
 
   async function handleUnifiedCheckout() {
@@ -1222,7 +1458,9 @@ export default function OpsDashboardPage() {
       toast('零錢包付款必須選擇會員', 'error');
       return;
     }
-    if (!isPaymentsBalanced(paySelected, payAmounts, payableTotal)) {
+    if (!isPaymentsBalanced(paySelected, payAmounts, payableTotal, {
+      ignoreCardAmount: yipayPayuniRecurring,
+    })) {
       toast('請至少選一種付款方式，且分攤合計須等於應付金額', 'error');
       return;
     }
@@ -1230,8 +1468,16 @@ export default function OpsDashboardPage() {
       toast('請掃描或輸入抵用券條碼', 'error');
       return;
     }
+    if (paySelected.includes('LINEPAY') && !linePayOneTimeKey.trim()) {
+      toast('請掃描會員 LinePay 付款碼（My Code）', 'error');
+      return;
+    }
+    if (yipayPayuniRecurring && !paySelected.includes('YIPAY')) {
+      toast('月卡／課程定期定額：首期請使用乙禾現場刷卡', 'error');
+      return;
+    }
     if (
-      paySelected.includes('CARD') &&
+      (paySelected.includes('CARD') || yipayPayuniRecurring) &&
       cardOptions.cardMode === 'RECURRING' &&
       (cardOptions.recurringAmount == null || cardOptions.recurringAmount <= 0)
     ) {
@@ -1278,8 +1524,17 @@ export default function OpsDashboardPage() {
               trainerId: Number(trainerId),
             }
           : {}),
-        payments: buildPaymentsPayload(paySelected, payAmounts, voucherCode),
-        ...buildCardPayPayload(cardOptions, paySelected.includes('CARD')),
+        payments: buildPaymentsPayload(paySelected, payAmounts, voucherCode, {
+          omitZeroCard: yipayPayuniRecurring,
+        }),
+        ...buildCardPayPayload(
+          cardOptions,
+          paySelected.includes('CARD') && !yipayPayuniRecurring,
+          yipayPayuniRecurring && paySelected.includes('YIPAY'),
+        ),
+        ...(paySelected.includes('LINEPAY')
+          ? { linePayOneTimeKey: linePayOneTimeKey.trim() }
+          : {}),
         carrierNum: carrier.trim() || undefined,
         buyerUbn: buyerUbn.trim() || undefined,
         loveCode: loveCode.trim() || undefined,
@@ -1310,13 +1565,26 @@ export default function OpsDashboardPage() {
         redirectToCheckOut(result.data.actionUrl, result.data.payload);
         return;
       }
+      if (result.data?.channel === 'YIPAY' && result.data.checkoutId) {
+        setYipayTerminalRef('');
+        setPendingYipay({
+          checkoutId: result.data.checkoutId,
+          amount: Number(result.data.yipayAmount || result.data.amount || 0),
+          hint: result.data.terminalHint,
+          needsPeriodBind: Boolean(result.data.needsPeriodBind),
+          recurringAmount: result.data.recurringAmount ?? null,
+          periodTimes: result.data.periodTimes ?? null,
+        });
+        toast(result.message || '請至乙禾刷卡機收款後確認', 'info');
+        return;
+      }
       toast(
         `${result.message || '結帳成功'}${result.data?.checkoutId ? ` · ${result.data.checkoutId}` : ''}${
-          Array.isArray(result.data?.invoices) && result.data.invoices.length
+          Array.isArray(result.data?.invoices) && result.data.invoices.some((i) => i.invoiceNumber)
             ? ` · 發票 ${result.data.invoices
                 .filter((i) => i.invoiceNumber)
                 .map((i) => i.invoiceNumber)
-                .join('、') || result.data.invoiceNumber || ''}`
+                .join('、')}`
             : result.data?.invoiceNumber
               ? ` · 發票 ${result.data.invoiceNumber}`
               : ''
@@ -1336,6 +1604,80 @@ export default function OpsDashboardPage() {
     } finally {
       checkoutInFlight.current = false;
       setCheckoutBusy(false);
+    }
+  }
+
+  async function handleConfirmYipay() {
+    if (!pendingYipay?.checkoutId || yipayConfirmBusy) return;
+    setYipayConfirmBusy(true);
+    try {
+      const result = await opsConfirmYipay({
+        checkoutId: pendingYipay.checkoutId,
+        terminalRef: yipayTerminalRef.trim() || undefined,
+      });
+      if (result.status !== 'success') {
+        toast(result.message || '乙禾確認入帳失敗', 'error');
+        return;
+      }
+      const inv =
+        Array.isArray(result.data?.invoices) && result.data.invoices.some((i) => i.invoiceNumber)
+          ? result.data.invoices
+              .filter((i) => i.invoiceNumber)
+              .map((i) => i.invoiceNumber)
+              .join('、')
+          : result.data?.invoiceNumber || null;
+      const payRef = result.data?.checkoutId || pendingYipay.checkoutId;
+      setPendingYipay(null);
+      setYipayTerminalRef('');
+
+      if (result.data?.actionUrl && result.data?.payload) {
+        toast(
+          `${result.message || '乙禾首期已入帳'}${inv ? ` · 發票 ${inv}` : ''} · 請於 PayUNi 頁輸入卡號（$1 驗證授權，隨後取消不請款）`,
+          'success',
+        );
+        openPayuniCheckoutInNewTab(result.data.actionUrl, result.data.payload);
+        pendingPeriodSettled.current = false;
+        setPendingPeriodStatus('PENDING');
+        setPendingPeriodPay({
+          ref: payRef,
+          label: `合併結帳 ${payRef}（定期定額約定）`,
+          bindOnly: true,
+        });
+        // 購物車暫不清空，等約定／Notify；仍可手動清空
+        clearCart();
+        setTopupQty(1);
+        resetSharedCheckoutPay();
+        void loadMembers({ skip: 0 });
+        if (posBranchId) {
+          const prodRes = await fetchOpsProducts(Number(posBranchId));
+          if (prodRes.status === 'success' && prodRes.data) setPosProducts(prodRes.data);
+        }
+        return;
+      }
+
+      if (result.data?.bindError) {
+        toast(
+          `乙禾已入帳${inv ? ` · 發票 ${inv}` : ''}，但 PayUNi 約定頁建立失敗：${result.data.bindError}`,
+          'error',
+        );
+      } else {
+        toast(
+          `${result.message || '乙禾刷卡已入帳'}${inv ? ` · 發票 ${inv}` : ''}`,
+          'success',
+        );
+      }
+      clearCart();
+      setTopupQty(1);
+      resetSharedCheckoutPay();
+      void loadMembers({ skip: 0 });
+      if (posBranchId) {
+        const prodRes = await fetchOpsProducts(Number(posBranchId));
+        if (prodRes.status === 'success' && prodRes.data) setPosProducts(prodRes.data);
+      }
+    } catch (err) {
+      toast(getErrorMessage(err, '乙禾確認入帳失敗'), 'error');
+    } finally {
+      setYipayConfirmBusy(false);
     }
   }
 
@@ -1405,7 +1747,7 @@ export default function OpsDashboardPage() {
           autoComplete="name"
         />
       </Field>
-      <Field label="電話">
+      <Field label="手機號碼" hint="必填">
         <Input
           value={form.phone}
           onChange={(e) => setForm((f) => ({ ...f, phone: e.target.value }))}
@@ -1413,6 +1755,27 @@ export default function OpsDashboardPage() {
           inputMode="tel"
           placeholder="0912345678"
           autoComplete="tel"
+        />
+      </Field>
+      <Field label="Email" hint="換機 Email OTP 必填；請填可收信信箱">
+        <Input
+          type="email"
+          value={form.email}
+          onChange={(e) => setForm((f) => ({ ...f, email: e.target.value }))}
+          autoComplete="email"
+          placeholder="member@example.com"
+        />
+      </Field>
+      <Field
+        label="身分證／居留證／護照"
+        hint="必填；身分證／居留證／護照號碼"
+      >
+        <Input
+          value={form.idNumber}
+          onChange={(e) => setForm((f) => ({ ...f, idNumber: e.target.value.toUpperCase() }))}
+          autoComplete="off"
+          placeholder="A123456789 或護照號"
+          required
         />
       </Field>
 
@@ -1607,6 +1970,14 @@ export default function OpsDashboardPage() {
             >
               解除
             </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => void handleResetDevice()}
+              disabled={!editingMember.deviceId || binding}
+            >
+              臨櫃重置
+            </Button>
           </div>
         </>
       )}
@@ -1671,23 +2042,46 @@ export default function OpsDashboardPage() {
     </div>
   );
 
+  const showMemberPicker = tab !== 'shift' && tab !== 'orders' && tab !== 'checkins';
+
   return (
     <div className="hq-dashboard">
-      <BranchScopeBar
-        branches={branches}
-        branchId={posBranchId}
-        locked={branchLocked}
-        lockedLabel={staff?.branchName || (staff?.branchId ? `分店 #${staff.branchId}` : undefined)}
-        hint="臨櫃結帳商品／購案／私教皆以此分店為準"
-        onChange={(id) => {
-          setPosBranchId(id);
-          setCart((prev) => prev.filter((c) => c.kind !== 'PRODUCT' && c.kind !== 'COURSE'));
-          setAddQtyByProduct({});
-          setCoursePlanId('');
-        }}
-      />
+      <div className="ops-context-sticky">
+        <BranchScopeBar
+          branches={branches}
+          branchId={posBranchId}
+          locked={branchLocked}
+          lockedLabel={staff?.branchName || (staff?.branchId ? `分店 #${staff.branchId}` : undefined)}
+          hint="臨櫃結帳商品／購案／私教皆以此分店為準"
+          onChange={(id) => {
+            setPosBranchId(id);
+            setCart((prev) => prev.filter((c) => c.kind !== 'PRODUCT' && c.kind !== 'COURSE'));
+            setAddQtyByProduct({});
+            setCoursePlanId('');
+          }}
+        />
+        {showMemberPicker && selectedMember ? (
+          <div className="ops-context-sticky__member" aria-live="polite">
+            <div className="ops-context-sticky__member-info">
+              <span className="ops-context-sticky__member-label">已選會員</span>
+              <strong>
+                {selectedMember.memberNo || `#${selectedMember.id}`} {selectedMember.name}
+              </strong>
+              <span className="text-muted text-sm">{selectedMember.phone}</span>
+              <span className="text-muted text-sm">
+                零錢包 ${selectedMember.cashWallet} · 運動金 ${selectedMember.bonusWallet}
+              </span>
+            </div>
+            <Button size="sm" variant="ghost" onClick={() => setSelectedMember(null)}>
+              清除
+            </Button>
+          </div>
+        ) : null}
+      </div>
 
-      {tab !== 'shift' && tab !== 'orders' && tab !== 'checkins' && (
+      <OpsInvoiceFailBanner />
+
+      {showMemberPicker && (
       <Card title="選擇會員" subtitle="全櫃檯共用 · 電話／QR／人臉辨識後，臨櫃結帳與會員管理皆沿用此會員">
         <MemberIdentifyPanel
           selectedMember={selectedMember}
@@ -1732,6 +2126,25 @@ export default function OpsDashboardPage() {
       <PageSection
         title="臨櫃結帳"
         desc="商品／購案／私教課程加入同一購物車 · 一次付款／一張發票 · 金額以後端查價為準"
+        action={
+          <Button
+            size="sm"
+            variant="secondary"
+            onClick={() => {
+              posDisplay.openDisplayWindow();
+              if (cart.length) {
+                posDisplay.postCart(
+                  buildOpsPosDisplayCart(cart, promotions, {
+                    payableTotal,
+                    memberName: selectedMember?.name,
+                  }),
+                );
+              }
+            }}
+          >
+            開啟客顯{posDisplay.displayLinked ? ' · 已連線' : ''}
+          </Button>
+        }
       >
         <div className="staff-grid">
           <div className="form-stack">
@@ -1845,11 +2258,26 @@ export default function OpsDashboardPage() {
                 )}
                 {selectedPromotion?.usageType === 'UNLIMITED' && (
                   <Alert tone="info">
-                    無限使用：方案費 ${selectedPromotion.price} 不入錢包，購買後延長{' '}
-                    {selectedPromotion.unitDays && selectedPromotion.periodCount
-                      ? `${selectedPromotion.unitDays} 天 × ${selectedPromotion.periodCount} 期＝${selectedPromotion.durationDays} 天`
-                      : `${selectedPromotion.durationDays} 天`}{' '}
-                    有效期限。
+                    {selectedPromotion.enableCardRecurring ? (
+                      <>
+                        無限使用（定期定額）：每次入帳延長{' '}
+                        <strong>{selectedPromotion.unitDays || selectedPromotion.durationDays} 天</strong>
+                        （首期＝購案當下；續期於每次扣款成功後再展延）。方案共{' '}
+                        {selectedPromotion.periodCount || '—'} 期
+                        {selectedPromotion.unitDays && selectedPromotion.periodCount
+                          ? `（合計參考 ${selectedPromotion.durationDays} 天）`
+                          : ''}
+                        。
+                      </>
+                    ) : (
+                      <>
+                        無限使用：方案費 ${selectedPromotion.price} 不入錢包，購買後延長{' '}
+                        {selectedPromotion.unitDays && selectedPromotion.periodCount
+                          ? `${selectedPromotion.unitDays} 天 × ${selectedPromotion.periodCount} 期＝${selectedPromotion.durationDays} 天`
+                          : `${selectedPromotion.durationDays} 天`}{' '}
+                        有效期限（起始日算第 1 天）。
+                      </>
+                    )}
                   </Alert>
                 )}
                 {selectedPromotion?.requiresMemberContract && (
@@ -1863,7 +2291,15 @@ export default function OpsDashboardPage() {
                 )}
                 {selectedPromotion?.enableCardRecurring && (
                   <Alert tone="info">
-                    此方案已啟用定期定額：每期 ${selectedPromotion.price.toLocaleString('zh-TW')}
+                    此方案已啟用定期定額：首期 $
+                    {selectedPromotion.price.toLocaleString('zh-TW')}
+                    · 續期 $
+                    {(
+                      selectedPromotion.recurringAmount != null &&
+                      selectedPromotion.recurringAmount > 0
+                        ? selectedPromotion.recurringAmount
+                        : selectedPromotion.price
+                    ).toLocaleString('zh-TW')}
                     {selectedPromotion.periodCount
                       ? ` · 共 ${selectedPromotion.periodCount} 期（同有效期期數）`
                       : ''}
@@ -2081,6 +2517,15 @@ export default function OpsDashboardPage() {
                           onChange={(e) => updateCartCourseQty(c.coursePlanId, e.target.value)}
                           aria-label={`${c.name} 結帳數量`}
                         />
+                      ) : c.kind === 'PROMO' && c.usageType !== 'UNLIMITED' ? (
+                        <Input
+                          className="cart-line__qty"
+                          type="number"
+                          min={1}
+                          value={c.qty}
+                          onChange={(e) => updateCartPromoQty(c.promotionId, e.target.value)}
+                          aria-label={`${c.name} 結帳數量`}
+                        />
                       ) : (
                         <span className="cart-line__qty-fixed" aria-label={`${c.name} 數量`}>
                           × {c.qty}
@@ -2115,13 +2560,19 @@ export default function OpsDashboardPage() {
 
               <CompositePayFields
                 totalAmount={payableTotal}
-                allowedMethods={['CASH', 'CARD', 'WALLET_CASH', 'VOUCHER']}
+                allowedMethods={
+                  allowCardRecurring
+                    ? ['CASH', 'YIPAY', 'CARD', 'LINEPAY', 'WALLET_CASH', 'VOUCHER']
+                    : ['CASH', 'YIPAY', 'LINEPAY', 'WALLET_CASH', 'VOUCHER']
+                }
                 selected={paySelected}
                 onSelectedChange={setPaySelected}
                 amounts={payAmounts}
                 onAmountsChange={setPayAmounts}
                 voucherCode={voucherCode}
                 onVoucherCodeChange={setVoucherCode}
+                linePayOneTimeKey={linePayOneTimeKey}
+                onLinePayOneTimeKeyChange={setLinePayOneTimeKey}
                 carrierValue={carrier}
                 onCarrierChange={setCarrier}
                 buyerUbn={buyerUbn}
@@ -2131,10 +2582,14 @@ export default function OpsDashboardPage() {
                 cardOptions={cardOptions}
                 onCardOptionsChange={(opts) => {
                   if (opts.cardMode === 'RECURRING' && cartPromoLine?.enableCardRecurring) {
+                    const periodAmt =
+                      cartPromoLine.recurringAmount != null && cartPromoLine.recurringAmount > 0
+                        ? cartPromoLine.recurringAmount
+                        : cartPromoLine.price;
                     setCardOptions({
                       ...opts,
                       periodTimes: cartPromoLine.periodCount || opts.periodTimes,
-                      recurringAmount: cartPromoLine.price,
+                      recurringAmount: periodAmt,
                     });
                     return;
                   }
@@ -2152,6 +2607,8 @@ export default function OpsDashboardPage() {
                   setCardOptions(opts);
                 }}
                 allowCardRecurring={allowCardRecurring}
+                allowYipayPayuniRecurring={yipayPayuniRecurring}
+                payuniCardModes={['RECURRING']}
                 allowedPeriodTimes={promoAllowedPeriodTimes ?? courseAllowedPeriodTimes}
                 defaultPeriodTimes={
                   cartPromoLine?.periodCount ?? courseDefaultPeriodTimes ?? undefined
@@ -2163,8 +2620,12 @@ export default function OpsDashboardPage() {
                 }
                 hint={
                   selectedMember
-                    ? `會員 ${selectedMember.memberNo || `#${selectedMember.id}`} ${selectedMember.name} · 零錢包 $${selectedMember.cashWallet}`
-                    : '可複合付款；零錢包只扣本金（禁運動金）'
+                    ? yipayPayuniRecurring
+                      ? `會員 ${selectedMember.memberNo || `#${selectedMember.id}`} ${selectedMember.name} · 定期定額＝乙禾首期＋PayUNi 約定`
+                      : `會員 ${selectedMember.memberNo || `#${selectedMember.id}`} ${selectedMember.name} · 零錢包 $${selectedMember.cashWallet} · 現場刷卡＝乙禾；定期定額＝PayUNi`
+                    : yipayPayuniRecurring
+                      ? '定期定額：乙禾收首期，確認後開 PayUNi 約定續期'
+                      : '現場刷卡＝乙禾固定式；PayUNi 僅定期定額；零錢包只扣本金'
                 }
               />
 
@@ -2177,15 +2638,27 @@ export default function OpsDashboardPage() {
                   loading={checkoutBusy}
                   disabled={
                     checkoutBusy ||
+                    Boolean(pendingYipay) ||
                     !cart.length ||
                     (cartProductLines.length > 0 && !posBranchId) ||
                     (Boolean(cartPromoLine) && !selectedMember) ||
                     (cartCourseLines.length > 0 && (!selectedMember || !trainerId)) ||
                     (paySelected.includes('WALLET_CASH') && !selectedMember) ||
-                    !isPaymentsBalanced(paySelected, payAmounts, payableTotal)
+                    (paySelected.includes('LINEPAY') && !linePayOneTimeKey.trim()) ||
+                    !isPaymentsBalanced(paySelected, payAmounts, payableTotal, {
+                      ignoreCardAmount: yipayPayuniRecurring,
+                    })
                   }
                 >
-                  {paySelected.includes('CARD') ? '確認並刷卡' : '確認結帳'}
+                  {yipayPayuniRecurring && paySelected.includes('YIPAY')
+                    ? '確認：乙禾首期 → PayUNi 約定'
+                    : paySelected.includes('YIPAY')
+                      ? '確認並現場刷卡'
+                      : paySelected.includes('CARD')
+                        ? '確認並開 PayUNi 定期'
+                        : paySelected.includes('LINEPAY')
+                          ? '確認並 LinePay POS'
+                          : '確認結帳'}
                 </Button>
               </div>
             </div>
@@ -2223,6 +2696,20 @@ export default function OpsDashboardPage() {
         ) : (
           <Alert tone="warning">請先於上方以電話／QR／人臉選擇會員，或從下方列表點「編輯」</Alert>
         )}
+        <OpsMemberAdminPanel
+          member={selectedMember}
+          onMemberUpdated={(updated) => patchMember(updated)}
+          posDisplay={posDisplay}
+          staffId={staff?.id ?? null}
+          branchCode={
+            posBranchId !== ''
+              ? String(
+                  staffBranchLabel(branches.find((b) => b.id === posBranchId)) ||
+                    posBranchId,
+                )
+              : staff?.branchName || String(staff?.branchId || '—')
+          }
+        />
         <div className="table-toolbar">
           <Input
             value={search}
@@ -2389,14 +2876,19 @@ export default function OpsDashboardPage() {
 
       <Modal
         open={pendingPeriodPay !== null}
-        title="等待續期收款入帳"
+        title={pendingPeriodPay?.bindOnly ? '等待定期定額約定' : '等待續期收款入帳'}
         onClose={() => {
-          if (pendingPeriodStatus === 'PAID') {
+          if (pendingPeriodStatus === 'PAID' || pendingPeriodStatus === 'BOUND') {
             setPendingPeriodPay(null);
             return;
           }
           setPendingPeriodPay(null);
-          toast('已關閉等待視窗；若稍後 Notify 入帳，可至訂單查詢確認', 'info');
+          toast(
+            pendingPeriodPay?.bindOnly
+              ? '已關閉等待視窗；若稍後 Notify 回寫約定，可至定期定額一覽確認'
+              : '已關閉等待視窗；若稍後 Notify 入帳，可至訂單查詢確認',
+            'info',
+          );
         }}
         footer={
           <>
@@ -2411,24 +2903,91 @@ export default function OpsDashboardPage() {
               loading={pendingPeriodChecking}
               onClick={() => void pollPendingPeriodPay({ manual: true })}
             >
-              我已完成付款
+              {pendingPeriodPay?.bindOnly ? '我已完成約定' : '我已完成付款'}
             </Button>
           </>
         }
       >
         <Alert tone="info">
-          PayUNi「續期收款」成功頁<strong>不會</strong>回流本系統（僅有買家專區連結）。請保持此櫃檯頁開啟；金流會以
-          Notify 背景通知入帳，本頁每 2.5 秒自動查詢狀態。
+          {pendingPeriodPay?.bindOnly ? (
+            <>
+              PayUNi「續期收款」頁將做<strong>$1 驗證授權</strong>確認卡片（乙禾已收方案首期）；授權隨後取消、<strong>不實際扣款</strong>；第 2 期起依 PeriodAmt 原價。成功頁<strong>不會</strong>
+              回流本系統。請保持此櫃檯頁開啟；約定完成後金流以 Notify 回寫（CreditHash 或 PeriodTradeNo），本頁每 2.5 秒自動查詢。
+            </>
+          ) : (
+            <>
+              PayUNi「續期收款」成功頁<strong>不會</strong>回流本系統（僅有買家專區連結）。請保持此櫃檯頁開啟；金流會以
+              Notify 背景通知入帳，本頁每 2.5 秒自動查詢狀態。
+            </>
+          )}
         </Alert>
         <p style={{ marginTop: '0.75rem' }}>
           單號：<strong>{pendingPeriodPay?.label || pendingPeriodPay?.ref}</strong>
         </p>
         <p>
           狀態：{' '}
-          <Badge tone={pendingPeriodStatus === 'PAID' ? 'success' : 'warning'}>
-            {pendingPeriodStatus === 'PAID' ? '已入帳' : '等待 Notify…'}
+          <Badge
+            tone={
+              pendingPeriodStatus === 'PAID' || pendingPeriodStatus === 'BOUND'
+                ? 'success'
+                : 'warning'
+            }
+          >
+            {pendingPeriodStatus === 'BOUND'
+              ? '已約定'
+              : pendingPeriodStatus === 'PAID'
+                ? '已入帳'
+                : pendingPeriodStatus === 'WAITING_BIND'
+                  ? '等待約定 Notify…'
+                  : '等待 Notify…'}
           </Badge>
         </p>
+      </Modal>
+
+      <Modal
+        open={pendingYipay !== null}
+        title="乙禾現場刷卡確認"
+        onClose={() => {
+          if (yipayConfirmBusy) return;
+          setPendingYipay(null);
+          toast('已取消確認；結帳單仍為待付款，可稍後以單號補確認或作廢', 'info');
+        }}
+        footer={
+          <>
+            <Button
+              variant="ghost"
+              onClick={() => setPendingYipay(null)}
+              disabled={yipayConfirmBusy}
+            >
+              稍後處理
+            </Button>
+            <Button loading={yipayConfirmBusy} onClick={() => void handleConfirmYipay()}>
+              確認刷卡成功
+            </Button>
+          </>
+        }
+      >
+        <Alert tone="info">
+          請於{pendingYipay?.hint || '乙禾／凱基固定式刷卡機'}完成首期收款後，再按「確認刷卡成功」。系統將履約並開立
+          ezPay 發票；開票失敗＝整筆取消。
+          {pendingYipay?.needsPeriodBind
+            ? ` 確認後將另開 PayUNi 續期頁（$1 驗證授權後取消、不請款；第 2 期起 PeriodAmt $${Math.round(pendingYipay.recurringAmount || 0).toLocaleString('zh-TW')} × ${pendingYipay.periodTimes || '?'} 期）。`
+            : ''}
+        </Alert>
+        <p style={{ marginTop: '0.75rem' }}>
+          結帳單：<strong>{pendingYipay?.checkoutId}</strong>
+        </p>
+        <p>
+          刷卡金額：<strong>${Math.round(pendingYipay?.amount || 0).toLocaleString('zh-TW')}</strong>
+        </p>
+        <Field label="端末序號／授權碼（選填）">
+          <Input
+            value={yipayTerminalRef}
+            onChange={(e) => setYipayTerminalRef(e.target.value)}
+            placeholder="可留空"
+            disabled={yipayConfirmBusy}
+          />
+        </Field>
       </Modal>
 
       <Modal
@@ -2519,16 +3078,25 @@ export default function OpsDashboardPage() {
               </Button>
             )}
             {signDetail?.status !== 'SIGNED' && historyPreviewId == null && (
-              <Button
-                loading={signBusy}
-                disabled={!signatureData || signBusy || !signMember || !signDetail}
-                onClick={() => {
-                  if (!signMember || !signDetail) return;
-                  void handleSignContract(signMember.id, signDetail.id);
-                }}
-              >
-                完成簽署並存檔
-              </Button>
+              <>
+                <Button
+                  variant="secondary"
+                  disabled={signBusy || !signDetail?.body}
+                  onClick={sendContractConsentToDisplay}
+                >
+                  派送客顯簽署
+                </Button>
+                <Button
+                  loading={signBusy}
+                  disabled={!signatureData || signBusy || !signMember || !signDetail}
+                  onClick={() => {
+                    if (!signMember || !signDetail) return;
+                    void handleSignContract(signMember.id, signDetail.id);
+                  }}
+                >
+                  完成簽署並存檔
+                </Button>
+              </>
             )}
           </>
         }
@@ -2601,7 +3169,10 @@ export default function OpsDashboardPage() {
                 </div>
               ) : canSignNow ? (
                 <div className="field">
-                  <span className="field__label">會員電子簽名</span>
+                  <span className="field__label">會員電子簽名（本機或客顯回傳）</span>
+                  {posDisplay.pendingConsentId && (
+                    <Alert tone="warning">等待客顯簽署中…</Alert>
+                  )}
                   <SignaturePad key={signDetail.id} onChange={setSignatureData} />
                 </div>
               ) : (

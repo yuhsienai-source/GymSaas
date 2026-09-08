@@ -5,7 +5,8 @@ import jwt from 'jsonwebtoken';
 import { verifyStaff, requireAdmin } from '../middleware/jwtAuth.js';
 import { toJwtPayload, toStaffAuthPayload } from '../lib/staffAccess.js';
 import { createRateLimiter } from '../middleware/rateLimit.js';
-import { deviceBindUpdateData } from '../lib/memberDevice.js';
+import { opsResetMemberDevice } from '../lib/deviceReset.js';
+import { clientIp, clientUserAgent } from '../lib/memberDeviceAudit.js';
 
 const router = express.Router();
 const loginLimiter = createRateLimiter({
@@ -209,25 +210,24 @@ router.post('/members/:memberId/reset-device', verifyStaff, requireAdmin, async 
   }
 
   try {
-    // 這裡改用 numericId 去查詢
-    const member = await prisma.member.findUnique({ where: { id: numericId } });
-    if (!member) {
-      return res.status(404).json({ status: 'error', message: '找不到此會員' });
-    }
-
-    // 更新時也是用 numericId
-    await prisma.member.update({
-      where: { id: numericId },
-      data: deviceBindUpdateData({ deviceId: null }),
+    const result = await opsResetMemberDevice({
+      memberId: numericId,
+      operatorId: req.user?.id ?? null,
+      reason: 'ADMIN 重置裝置綁定',
+      ip: clientIp(req),
+      userAgent: clientUserAgent(req),
+      action: 'ADMIN_RESET',
     });
 
-    res.json({ 
-      status: 'success', 
-      message: `已成功解除會員 ${member.name || numericId} 的裝置綁定，舊登入已失效；請於會員 App 重新登入並完成裝置綁定。` 
+    res.json({
+      status: 'success',
+      message: result.message,
     });
-
   } catch (error) {
-    console.error("重置裝置綁定失敗:", error);
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({ status: 'error', message: error.message });
+    }
+    console.error('重置裝置綁定失敗:', error);
     res.status(500).json({ status: 'error', message: '系統錯誤，無法重置裝置' });
   }
 });

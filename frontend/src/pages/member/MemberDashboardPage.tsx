@@ -14,10 +14,13 @@ import {
 import { useMemberAuth } from '../../contexts/MemberAuthContext';
 import { useToast } from '../../contexts/ToastContext';
 import {
+  fetchBoardOccupancy,
+  fetchBoardOccupancySettings,
   fetchMemberProfile,
   fetchMemberQrCode,
   fetchMemberWallet,
   fetchPtContracts,
+  getApiErrorDetails,
   getErrorMessage,
 } from '../../lib/api';
 import { getOrCreateDeviceId } from '../../lib/storage';
@@ -45,7 +48,11 @@ export default function MemberDashboardPage() {
   const [ttl, setTtl] = useState(30);
   const [timeLeft, setTimeLeft] = useState(30);
   const [qrError, setQrError] = useState('');
+  const [contractLocked, setContractLocked] = useState(false);
   const [reloadKey, setReloadKey] = useState(0);
+  const [occupancyVisible, setOccupancyVisible] = useState(false);
+  const [occupancyCount, setOccupancyCount] = useState<number | null>(null);
+  const [occupancyUpdatedAt, setOccupancyUpdatedAt] = useState<string | null>(null);
   const timerRef = useRef<number | null>(null);
   const isAlert = Boolean(profile?.isAlert);
   const gateOpen = qrPanel === 'gate';
@@ -61,12 +68,21 @@ export default function MemberDashboardPage() {
         setTtl(seconds);
         setTimeLeft(seconds);
         setQrError('');
+        setContractLocked(false);
       } else {
         setQrError(result.message || '無法產生門禁碼');
         setQrToken('');
       }
     } catch (err) {
-      setQrError(getErrorMessage(err, '條碼產生失敗'));
+      const details = getApiErrorDetails(err);
+      const locked =
+        details.code === 'CONTRACT_REQUIRED' || details.code === 'CONTRACT_UNSIGNED';
+      setContractLocked(locked);
+      setQrError(
+        locked
+          ? details.message || '請先完成入會契約簽署，始可產生門禁碼'
+          : getErrorMessage(err, '條碼產生失敗'),
+      );
       setQrToken('');
     }
   }, [isAlert]);
@@ -100,6 +116,44 @@ export default function MemberDashboardPage() {
     };
   }, [toast, reloadKey]);
 
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const branchId = profile?.branches?.[0]?.branchId;
+        const settings = await fetchBoardOccupancySettings(
+          branchId != null ? { branchId } : undefined,
+        );
+        const show = settings.status === 'success' && settings.data?.isDisplay === true;
+        if (cancelled) return;
+        if (!show) {
+          setOccupancyVisible(false);
+          setOccupancyCount(null);
+          setOccupancyUpdatedAt(null);
+          return;
+        }
+        setOccupancyVisible(true);
+        const occ = await fetchBoardOccupancy();
+        if (cancelled) return;
+        if (occ.status === 'success' && occ.data) {
+          setOccupancyCount(occ.data.presentCount);
+          setOccupancyUpdatedAt(occ.data.updatedAt || null);
+        } else {
+          setOccupancyVisible(false);
+          setOccupancyCount(null);
+        }
+      } catch {
+        if (!cancelled) {
+          setOccupancyVisible(false);
+          setOccupancyCount(null);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [reloadKey, profile?.branches]);
+
   // 僅在展開「門禁」時才取／刷新動態門禁碼
   useEffect(() => {
     if (!gateOpen || !profile || profile.isAlert) return;
@@ -115,13 +169,22 @@ export default function MemberDashboardPage() {
           setTtl(seconds);
           setTimeLeft(seconds);
           setQrError('');
+          setContractLocked(false);
         } else {
           setQrError(result.message || '無法產生門禁碼');
           setQrToken('');
         }
       } catch (err) {
         if (cancelled) return;
-        setQrError(getErrorMessage(err, '條碼產生失敗'));
+        const details = getApiErrorDetails(err);
+        const locked =
+          details.code === 'CONTRACT_REQUIRED' || details.code === 'CONTRACT_UNSIGNED';
+        setContractLocked(locked);
+        setQrError(
+          locked
+            ? details.message || '請先完成入會契約簽署，始可產生門禁碼'
+            : getErrorMessage(err, '條碼產生失敗'),
+        );
         setQrToken('');
       }
     }
@@ -133,7 +196,7 @@ export default function MemberDashboardPage() {
   }, [gateOpen, profile, reloadKey]);
 
   useEffect(() => {
-    if (!gateOpen || isAlert) return;
+    if (!gateOpen || isAlert || contractLocked) return;
 
     timerRef.current = window.setInterval(() => {
       setTimeLeft((prev) => {
@@ -148,7 +211,7 @@ export default function MemberDashboardPage() {
     return () => {
       if (timerRef.current) clearInterval(timerRef.current);
     };
-  }, [gateOpen, refreshQr, ttl, isAlert]);
+  }, [gateOpen, refreshQr, ttl, isAlert, contractLocked]);
 
   function togglePanel(panel: Exclude<QrPanel, null>) {
     setQrPanel((cur) => (cur === panel ? null : panel));
@@ -179,6 +242,11 @@ export default function MemberDashboardPage() {
       {profile?.isAlert && (
         <Alert tone="warning">
           🚨 警示帳號：動態門禁 QR 已停用。請洽櫃檯或使用人臉辨識進出場。
+        </Alert>
+      )}
+      {contractLocked && (
+        <Alert tone="error">
+          ⚖️ 入會契約未簽署：門禁碼已鎖定。請至個人資料／櫃檯完成定型化契約簽署後再試。
         </Alert>
       )}
 
@@ -223,11 +291,13 @@ export default function MemberDashboardPage() {
 
           {profile?.isAlert ? (
             <EmptyState icon="🚫" title="門禁 QR 已停用" desc="此帳號需人工查驗或使用人臉" />
+          ) : contractLocked ? (
+            <EmptyState icon="📝" title="契約未簽署" desc={qrError || '請先完成入會契約'} />
           ) : qrToken ? (
             <div className="qr-hero__ring-wrap">
               <ProgressRing value={timeLeft} max={ttl} />
               <div className="qr-hero__frame">
-                <QRCodeSVG value={qrToken} size={200} level="H" />
+                <QRCodeSVG value={qrToken} size={220} level="H" className="qr-hero__svg" />
               </div>
             </div>
           ) : (
@@ -251,7 +321,7 @@ export default function MemberDashboardPage() {
           {identityQr ? (
             <>
               <div className="qr-hero__frame" style={{ margin: '0 auto' }}>
-                <QRCodeSVG value={identityQr} size={180} level="M" />
+                <QRCodeSVG value={identityQr} size={200} level="M" className="qr-hero__svg" />
               </div>
               <p className="qr-hero__countdown" style={{ marginTop: '0.75rem' }}>
                 會員編號 <strong className="mono">{profile?.memberNo}</strong>
@@ -276,6 +346,23 @@ export default function MemberDashboardPage() {
           </>
         )}
       </div>
+
+      {occupancyVisible && occupancyCount != null && (
+        <Card
+          title="場館即時人數"
+          subtitle={
+            occupancyUpdatedAt
+              ? `更新於 ${new Date(occupancyUpdatedAt).toLocaleTimeString('zh-TW')}`
+              : '依看板即時資料'
+          }
+          padding="md"
+        >
+          <div className="member-occupancy">
+            <strong className="member-occupancy__count">{occupancyCount}</strong>
+            <span className="member-occupancy__unit">人在館</span>
+          </div>
+        </Card>
+      )}
 
       <Card padding="md">
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', alignItems: 'center' }}>

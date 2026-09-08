@@ -10,6 +10,7 @@ import {
 import { cancelCardSubscription } from './cardSubscription.js';
 import {
   appendInvoiceReverseNote,
+  assertRealInvoiceForAllowance,
   executeInvoiceReverse,
   resolveOrderInvoiceReverse,
   syncCheckoutInvoiceAfterReverse,
@@ -180,7 +181,7 @@ export function computeUnusedAllowanceAmount(opts) {
  */
 export async function settleCancelSubscription(
   subscriptionId,
-  { reason, expirePolicy = 'KEEP', doAllowance, now = new Date() } = {},
+  { reason, expirePolicy = 'KEEP', doAllowance, now = new Date(), forceLocalOnly = false } = {},
 ) {
   const policy = String(expirePolicy || 'KEEP').toUpperCase();
   if (!EXPIRE_POLICIES.includes(policy)) {
@@ -196,7 +197,29 @@ export async function settleCancelSubscription(
   });
   if (!sub) throw httpError('找不到訂閱', 404);
 
-  if (sub.status === 'CANCELLED') {
+  // 訂閱已停（例如報表先按「取消沖回 KEEP」）但訂單仍 PAID：允許接續截斷效期／退費折讓
+  if (sub.status === 'CANCELLED' || sub.status === 'COMPLETED') {
+    if (policy === 'KEEP') {
+      return {
+        subscription: sub,
+        member: sub.member,
+        expirePolicy: policy,
+        unusedDays: remainingExpireDays(sub.member?.expireDate, now),
+        allowance: null,
+        invoice: { action: 'none' },
+        alreadyCancelled: true,
+      };
+    }
+    if (sub.originOrderId) {
+      return settleCancelUnlimitedOrder(sub.originOrderId, {
+        reason: reason || `訂閱已停後結算（${policy}）`,
+        expirePolicy: policy,
+        doAllowance,
+        now,
+        // 避免再轉回本函式造成迴圈
+        skipLinkedSubRedirect: true,
+      });
+    }
     return {
       subscription: sub,
       member: sub.member,
@@ -249,6 +272,7 @@ export async function settleCancelSubscription(
     };
 
     if (allowanceAmt > 0 && latest.order.invoiceNumber) {
+      assertRealInvoiceForAllowance(latest.order.invoiceNumber, '取消訂閱退費折讓');
       // 強制走折讓（部分金額），不用作廢整張
       const ctx = await resolveOrderInvoiceReverse(latest.order, {
         refundCash: allowanceAmt,
@@ -273,13 +297,18 @@ export async function settleCancelSubscription(
         throw err;
       }
     } else if (allowanceAmt > 0 && !latest.order.invoiceNumber) {
-      allowanceMeta.note = `${refundDetail.note}；最近一期訂單無發票，略過 ezPay；請人工退款`;
+      const err = new Error(
+        '取消訂閱退費折讓須在開票成功後才能辦理（最近一期訂單尚無發票號碼）',
+      );
+      err.statusCode = 400;
+      throw err;
     }
   }
 
-  // 先取消訂閱（停續扣）
-  const cancelled = await cancelCardSubscription(sub.id, {
+  // 先取消訂閱（停本機續扣＋驗證／終止 PayUNi 續期排程；失敗則整筆中止）
+  const { subscription: cancelled, payuniStop } = await cancelCardSubscription(sub.id, {
     reason: reason || `取消訂閱（${policy}）`,
+    forceLocalOnly,
   });
 
   let updatedMember = sub.member;
@@ -318,6 +347,15 @@ export async function settleCancelSubscription(
       }
       return m;
     });
+  } else if (policy === 'KEEP' && latest.order) {
+    // 停續扣但保留效期：訂單維持 PAID，註記方便報表辨識
+    const note = '｜定期定額已停續扣（效期保留）';
+    if (!String(latest.order.itemDesc || '').includes('定期定額已停續扣')) {
+      await prisma.order.update({
+        where: { id: latest.order.id },
+        data: { itemDesc: `${latest.order.itemDesc || ''}${note}` },
+      });
+    }
   } else if (invoiceReverse.action !== 'none' && latest.order) {
     // KEEP 不應走到折讓；防禦
     await prisma.order.update({
@@ -336,6 +374,7 @@ export async function settleCancelSubscription(
     periodDays,
     allowance: allowanceMeta,
     invoice: invoiceReverse,
+    payuniStop: payuniStop || null,
     alreadyCancelled: false,
   };
 }
@@ -451,7 +490,7 @@ export async function previewCancelUnlimitedOrder(orderId, { now = new Date() } 
  */
 export async function settleCancelUnlimitedOrder(
   orderId,
-  { reason, expirePolicy = 'KEEP', doAllowance, now = new Date() } = {},
+  { reason, expirePolicy = 'KEEP', doAllowance, now = new Date(), skipLinkedSubRedirect = false } = {},
 ) {
   const policy = String(expirePolicy || 'KEEP').toUpperCase();
   if (!EXPIRE_POLICIES.includes(policy)) {
@@ -482,17 +521,23 @@ export async function settleCancelUnlimitedOrder(
     throw httpError(`訂單狀態為 [${order.status}]，僅已付款可取消結算`);
   }
 
-  // 若其實已有訂閱，應走訂閱結算
-  const linkedSub = await prisma.cardSubscription.findFirst({
-    where: { originOrderId: order.id },
-  });
-  if (linkedSub) {
-    return settleCancelSubscription(linkedSub.id, {
-      reason,
-      expirePolicy: policy,
-      doAllowance,
-      now,
+  // 若其實已有「進行中」訂閱，應走訂閱結算；已停訂閱則繼續本函式做效期／折讓
+  if (!skipLinkedSubRedirect) {
+    const linkedSub = await prisma.cardSubscription.findFirst({
+      where: { originOrderId: order.id },
     });
+    if (
+      linkedSub &&
+      linkedSub.status !== 'CANCELLED' &&
+      linkedSub.status !== 'COMPLETED'
+    ) {
+      return settleCancelSubscription(linkedSub.id, {
+        reason,
+        expirePolicy: policy,
+        doAllowance,
+        now,
+      });
+    }
   }
 
   const { periodDays, contractDays } = await resolveUnlimitedOrderPeriodDays(order);
@@ -527,6 +572,7 @@ export async function settleCancelUnlimitedOrder(
     };
 
     if (allowanceAmt > 0 && order.invoiceNumber) {
+      assertRealInvoiceForAllowance(order.invoiceNumber, '取消月卡退費折讓');
       const ctx = await resolveOrderInvoiceReverse(order, { refundCash: allowanceAmt });
       const forceCtx = {
         ...ctx,
@@ -549,7 +595,11 @@ export async function settleCancelUnlimitedOrder(
         throw err;
       }
     } else if (allowanceAmt > 0 && !order.invoiceNumber) {
-      allowanceMeta.note = `${refundDetail.note}；訂單無發票，略過 ezPay；請人工退款`;
+      const err = new Error(
+        '取消月卡退費折讓須在開票成功後才能辦理（訂單尚無發票號碼）',
+      );
+      err.statusCode = 400;
+      throw err;
     }
   } else if (policy === 'CUT_NO_ALLOWANCE' || policy === 'KEEP') {
     // 取消沖回：有整張發票且無合併存活子單時嘗試作廢

@@ -1,4 +1,4 @@
-// lib/onboardingAuth.js — 會員自助註冊／登入暫用 JWT
+// lib/onboardingAuth.js — 會員自助註冊／登入暫用 JWT（Email OTP 核身後）
 import jwt from 'jsonwebtoken';
 
 const JWT_SECRET = () => {
@@ -11,12 +11,24 @@ const JWT_SECRET = () => {
   return s;
 };
 
-/** @returns {string} */
-export function issueOnboardingToken({ phone, memberId, purpose }) {
+/**
+ * @param {{ email: string, phone?: string|null, memberId?: number|null, purpose: 'LOGIN'|'REGISTER' }} opts
+ * @returns {string}
+ */
+export function issueOnboardingToken({ email, phone, memberId, purpose }) {
+  const em = String(email || '')
+    .trim()
+    .toLowerCase();
+  if (!em) {
+    const err = new Error('缺少已驗證 Email');
+    err.statusCode = 500;
+    throw err;
+  }
   return jwt.sign(
     {
       type: 'onboarding',
-      phone,
+      email: em,
+      phone: phone ? String(phone) : null,
       memberId: memberId ?? null,
       purpose: purpose === 'LOGIN' ? 'LOGIN' : 'REGISTER',
     },
@@ -28,7 +40,7 @@ export function issueOnboardingToken({ phone, memberId, purpose }) {
 export function verifyOnboardingToken(token) {
   try {
     const decoded = jwt.verify(token, JWT_SECRET());
-    if (decoded.type !== 'onboarding' || !decoded.phone) {
+    if (decoded.type !== 'onboarding' || !decoded.email) {
       const err = new Error('無效的註冊／登入憑證');
       err.statusCode = 403;
       throw err;
@@ -36,7 +48,7 @@ export function verifyOnboardingToken(token) {
     return decoded;
   } catch (error) {
     if (error.statusCode) throw error;
-    const err = new Error('註冊／登入憑證已過期，請重新驗證手機');
+    const err = new Error('註冊／登入憑證已過期，請重新驗證 Email');
     err.statusCode = 403;
     throw err;
   }
@@ -52,9 +64,9 @@ export function issueMemberToken(memberId, { deviceId, deviceAuthVersion } = {})
 }
 
 /** LINE 綁定用 state（放在 OAuth state） */
-export function issueLineBindState({ memberId, phone }) {
+export function issueLineBindState({ memberId, phone, email }) {
   return jwt.sign(
-    { type: 'line_bind', memberId, phone },
+    { type: 'line_bind', memberId, phone: phone || null, email: email || null },
     JWT_SECRET(),
     { expiresIn: '15m' },
   );

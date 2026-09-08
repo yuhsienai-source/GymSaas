@@ -3,14 +3,14 @@ import express from 'express';
 import prisma from '../lib/prisma.js';
 import { verifyStaff, requirePermission } from '../middleware/jwtAuth.js';
 import { assertBranchAccess, branchListWhere } from '../lib/staffAccess.js';
-import { buildCardCheckoutRequest, parseCardPayOptions } from '../lib/payuni.js';
-import { normalizeInvoiceOptions } from '../lib/ezpay.js';
 import { coercePaymentsFromBody, POS_PAY_METHODS } from '../lib/compositePay.js';
+import { normalizeInvoiceOptions } from '../lib/ezpay.js';
 import {
   buildPosLines,
   deductSaleStock,
   generateSaleId,
   tryIssueSaleInvoice,
+  abortPaidSaleAfterInvoiceFailure,
 } from '../lib/inventory.js';
 import { staffBranchLabel } from '../lib/branchLabel.js';
 
@@ -228,16 +228,12 @@ router.post('/pos/checkout', async (req, res) => {
       return res.status(error.statusCode || 400).json({ status: 'error', message: error.message });
     }
 
-    let cardOpts = { cardMode: 'LUMP', cardInst: null, periodType: null, periodTimes: null };
     if (pay.needsCard) {
-      try {
-        cardOpts = parseCardPayOptions(
-          { cardMode, cardInst },
-          { allowRecurring: false },
-        );
-      } catch (error) {
-        return res.status(error.statusCode || 400).json({ status: 'error', message: error.message });
-      }
+      return res.status(400).json({
+        status: 'error',
+        message:
+          '臨櫃商品結帳請使用「乙禾現場刷卡」（YIPAY）；PayUNi（CARD）僅用於合併結帳之定期定額',
+      });
     }
 
     if (pay.walletAmount > 0 && (memberId === undefined || memberId === null || memberId === '')) {
@@ -286,7 +282,7 @@ router.post('/pos/checkout', async (req, res) => {
         });
       }
 
-      const status = pay.needsCard ? 'PENDING' : 'PAID';
+      const status = pay.needsOnlinePay ? 'PENDING' : 'PAID';
       const saleId = generateSaleId();
       const sale = await tx.saleOrder.create({
         data: {
@@ -296,9 +292,9 @@ router.post('/pos/checkout', async (req, res) => {
           payMethod: pay.payMethodLabel,
           payBreakdown: pay.breakdown,
           voucherCode: pay.voucherCode,
-          cardAmount: pay.cardAmount,
-          cardMode: pay.needsCard ? cardOpts.cardMode : 'LUMP',
-          cardInst: pay.needsCard ? cardOpts.cardInst : null,
+          cardAmount: pay.yipayAmount || pay.cardAmount || 0,
+          cardMode: 'LUMP',
+          cardInst: null,
           periodType: null,
           periodTimes: null,
           status,
@@ -324,45 +320,50 @@ router.post('/pos/checkout', async (req, res) => {
         },
       });
 
-      // 含刷卡時庫存等 Webhook；純現金／錢包／抵用券當場扣庫
-      if (!pay.needsCard) {
+      // 含乙禾／線上待付時庫存等確認；純現金／錢包／抵用券當場扣庫
+      if (!pay.needsOnlinePay) {
         await deductSaleStock(tx, sale, staffId);
       }
 
       return sale;
     });
 
-    if (pay.needsCard) {
-      const { actionUrl, payload: payuniPayload } = buildCardCheckoutRequest({
-        id: result.id,
-        amount: pay.cardAmount,
-        itemDesc: result.itemDesc,
-        cardMode: cardOpts.cardMode,
-        cardInst: cardOpts.cardInst,
-      });
-
+    if (pay.needsYipay) {
       return res.json({
         status: 'success',
-        message: `銷貨單已建立（${pay.payMethodLabel}），請完成刷卡 $${pay.cardAmount}`,
+        message: `請於乙禾／凱基固定式刷卡機完成收款 $${pay.yipayAmount}，完成後按「確認刷卡成功」`,
         data: {
           saleId: result.id,
           amount: result.amount,
+          yipayAmount: pay.yipayAmount,
           payMethod: pay.payMethodLabel,
           payBreakdown: pay.breakdown,
-          cardAmount: pay.cardAmount,
-          cardMode: cardOpts.cardMode,
-          cardInst: cardOpts.cardInst,
           voucherCode: pay.voucherCode,
           carrierNum: invoiceOpts.carrierNum,
           buyerUbn: invoiceOpts.buyerUbn,
           loveCode: invoiceOpts.loveCode,
-          actionUrl,
-          payload: payuniPayload,
+          channel: 'YIPAY',
+          terminalHint: '乙禾凱基固定式刷卡機',
+          member: result.member,
+          items: result.items,
         },
       });
     }
 
-    const invoiceNumber = await tryIssueSaleInvoice(result, result.member?.name);
+    if (pay.needsLinePay) {
+      return res.status(400).json({
+        status: 'error',
+        message: '獨立 POS 結帳暫不支援 LinePay；請改用合併結帳（/ops/checkout）',
+      });
+    }
+
+    let invoiceNumber = null;
+    try {
+      invoiceNumber = await tryIssueSaleInvoice(result, result.member?.name);
+    } catch (invErr) {
+      await abortPaidSaleAfterInvoiceFailure(result.id, staffId, invErr.message);
+      throw invErr;
+    }
 
     res.json({
       status: 'success',

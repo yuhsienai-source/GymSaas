@@ -6,6 +6,7 @@ import {
   closeOpsShift,
   fetchOpsShiftCurrent,
   fetchOpsShiftHistory,
+  fetchOpsYipayReconcile,
   getErrorMessage,
   openOpsShift,
 } from '../../lib/api';
@@ -102,7 +103,9 @@ type OpenPreview = {
 
 const FALLBACK_PAY_COLUMNS: { key: string; label: string }[] = [
   { key: 'CASH', label: '現金' },
-  { key: 'CARD', label: '信用卡／刷卡' },
+  { key: 'YIPAY', label: '乙禾現場刷卡' },
+  { key: 'CARD', label: 'PayUNi 刷卡／定期' },
+  { key: 'LINEPAY', label: 'LinePay' },
   { key: 'WALLET_CASH', label: '零錢包' },
   { key: 'VOUCHER', label: '抵用券' },
 ];
@@ -232,6 +235,31 @@ export default function OpsShiftHandoverTab({ branchId, branchName }: Props) {
   const [denomCounts, setDenomCounts] = useState<DenomCounts>(emptyDenomCounts);
   const [checklist, setChecklist] = useState<ChecklistState>(emptyChecklist);
   const [closeNote, setCloseNote] = useState('');
+  const [edcCount, setEdcCount] = useState('');
+  const [edcAmount, setEdcAmount] = useState('');
+  const [yipayBusy, setYipayBusy] = useState(false);
+  const [yipayReport, setYipayReport] = useState<{
+    day: string;
+    system: { count: number; amount: number };
+    captures: {
+      confirmedCount: number;
+      confirmedAmount: number;
+      pendingCount: number;
+      pendingAmount: number;
+      orphanCount: number;
+      pending?: Array<{ id: string; targetId: string; amount: number; rrn?: string | null }>;
+      orphans?: Array<{ id: string; targetId: string; amount: number; rrn?: string | null }>;
+    };
+    edcCompare: {
+      matched: boolean;
+      countDiff: number;
+      amountDiff: number;
+      edcCount: number;
+      edcAmount: number;
+    } | null;
+    hints: string[];
+    needsAttention: boolean;
+  } | null>(null);
 
   const resetCloseFlow = useCallback(() => {
     setCloseStep('summary');
@@ -240,7 +268,44 @@ export default function OpsShiftHandoverTab({ branchId, branchName }: Props) {
     setDenomCounts(emptyDenomCounts());
     setChecklist(emptyChecklist());
     setCloseNote('');
+    setEdcCount('');
+    setEdcAmount('');
+    setYipayReport(null);
   }, []);
+
+  const runYipayReconcile = useCallback(async () => {
+    if (branchId === '' || branchId == null) return;
+    setYipayBusy(true);
+    try {
+      const res = await fetchOpsYipayReconcile({
+        branchId: Number(branchId),
+        edcCount: edcCount.trim() || undefined,
+        edcAmount: edcAmount.trim() || undefined,
+      });
+      const data = res.data;
+      if (!data) throw new Error(res.message || '無日結資料');
+      setYipayReport({
+        day: data.day,
+        system: data.system,
+        captures: data.captures,
+        edcCompare: data.edcCompare,
+        hints: data.hints || [],
+        needsAttention: data.needsAttention,
+      });
+      if (data.needsAttention) {
+        toast('乙禾日結有異常，請依提示補登或請主管處理', 'error');
+      } else if (data.edcCompare?.matched) {
+        toast('乙禾日結相符', 'success');
+        setChecklist((prev) => ({ ...prev, cardSettled: true }));
+      } else {
+        toast('已載入系統乙禾認列；請輸入刷卡機結算單比對', 'info');
+      }
+    } catch (err) {
+      toast(getErrorMessage(err, '乙禾日結失敗'), 'error');
+    } finally {
+      setYipayBusy(false);
+    }
+  }, [branchId, edcCount, edcAmount, toast]);
 
   const load = useCallback(async (opts?: { resetFlow?: boolean }) => {
     if (branchId === '' || branchId == null) return;
@@ -369,6 +434,14 @@ export default function OpsShiftHandoverTab({ branchId, branchName }: Props) {
     if (!shift?.id) return;
     if (!checklistOk) {
       toast('請完成交班檢核清單全部項目', 'error');
+      return;
+    }
+    if (!yipayReport) {
+      toast('請先完成「刷卡機日結核對」再交班', 'error');
+      return;
+    }
+    if (yipayReport.needsAttention) {
+      toast('乙禾日結仍有異常（未認列／ORPHAN／EDC 單邊帳），請先補登或請主管處理', 'error');
       return;
     }
 
@@ -689,6 +762,7 @@ export default function OpsShiftHandoverTab({ branchId, branchName }: Props) {
                     onClick={() => {
                       setCloseStep('reconcile');
                       if (blindMode) setRevealed(true);
+                      void runYipayReconcile();
                     }}
                     disabled={busy}
                   >
@@ -700,6 +774,129 @@ export default function OpsShiftHandoverTab({ branchId, branchName }: Props) {
 
             {closeStep === 'reconcile' && (
               <div className="form-stack">
+                <Card
+                  title="刷卡機日結核對（乙禾 YIPAY）"
+                  subtitle={`${yipayReport?.day || '今日'} · 系統認列 vs EDC 結算單`}
+                >
+                  <div className="form-stack">
+                    <div
+                      style={{
+                        display: 'grid',
+                        gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))',
+                        gap: '0.75rem',
+                      }}
+                    >
+                      <StatCard
+                        label="系統已認列"
+                        value={
+                          yipayReport
+                            ? `${yipayReport.system.count} 筆 / ${money(yipayReport.system.amount)}`
+                            : '—'
+                        }
+                        tone="cash"
+                      />
+                      <StatCard
+                        label="端末暫存未認列"
+                        value={
+                          yipayReport
+                            ? `${yipayReport.captures.pendingCount} 筆 / ${money(yipayReport.captures.pendingAmount)}`
+                            : '—'
+                        }
+                      />
+                      <StatCard
+                        label="ORPHAN"
+                        value={String(yipayReport?.captures.orphanCount ?? '—')}
+                      />
+                    </div>
+                    <div
+                      style={{
+                        display: 'grid',
+                        gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))',
+                        gap: '0.75rem',
+                      }}
+                    >
+                      <Field label="刷卡機結算單：總筆數">
+                        <Input
+                          inputMode="numeric"
+                          value={edcCount}
+                          onChange={(e) => setEdcCount(e.target.value)}
+                          placeholder="例：12"
+                        />
+                      </Field>
+                      <Field label="刷卡機結算單：總金額">
+                        <Input
+                          inputMode="decimal"
+                          value={edcAmount}
+                          onChange={(e) => setEdcAmount(e.target.value)}
+                          placeholder="例：24600"
+                        />
+                      </Field>
+                    </div>
+                    <div className="btn-row">
+                      <Button loading={yipayBusy} onClick={() => void runYipayReconcile()}>
+                        比對日結
+                      </Button>
+                    </div>
+                    {yipayReport?.edcCompare ? (
+                      <Alert tone={yipayReport.edcCompare.matched ? 'success' : 'warning'}>
+                        {yipayReport.edcCompare.matched
+                          ? 'EDC 結算單與系統認列相符'
+                          : `單邊差異：筆數差 ${yipayReport.edcCompare.countDiff}、金額差 ${money(yipayReport.edcCompare.amountDiff)}（正＝刷卡機多於系統，請主管補登）`}
+                      </Alert>
+                    ) : null}
+                    {yipayReport?.hints?.length ? (
+                      <Alert tone="warning">
+                        <ul style={{ margin: 0, paddingLeft: '1.1rem' }}>
+                          {yipayReport.hints.map((h) => (
+                            <li key={h}>{h}</li>
+                          ))}
+                        </ul>
+                      </Alert>
+                    ) : null}
+                    {(yipayReport?.captures.pending?.length ||
+                      yipayReport?.captures.orphans?.length) ? (
+                      <div className="table-wrap">
+                        <table className="data-table">
+                          <thead>
+                            <tr>
+                              <th>狀態</th>
+                              <th>單號</th>
+                              <th>金額</th>
+                              <th>RRN</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {(yipayReport.captures.pending || []).map((p) => (
+                              <tr key={p.id}>
+                                <td>
+                                  <Badge tone="warning">未認列</Badge>
+                                </td>
+                                <td>
+                                  <code>{p.targetId}</code>
+                                </td>
+                                <td>{money(p.amount)}</td>
+                                <td>{p.rrn || '—'}</td>
+                              </tr>
+                            ))}
+                            {(yipayReport.captures.orphans || []).map((p) => (
+                              <tr key={p.id}>
+                                <td>
+                                  <Badge tone="danger">ORPHAN</Badge>
+                                </td>
+                                <td>
+                                  <code>{p.targetId}</code>
+                                </td>
+                                <td>{money(p.amount)}</td>
+                                <td>{p.rrn || '—'}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    ) : null}
+                  </div>
+                </Card>
+
                 <Alert
                   tone={
                     liveVariance == null ? 'info' : liveVariance === 0 ? 'success' : 'warning'

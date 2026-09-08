@@ -548,6 +548,8 @@ router.post('/promotions', async (req, res) => {
     requiresMemberContract,
     enableCardRecurring,
     recurringAmount,
+    payuniPeriodHash,
+    payuniPeriodHashOnline,
     contractIds,
   } = req.body;
 
@@ -598,6 +600,8 @@ router.post('/promotions', async (req, res) => {
         requiresMemberContract,
         enableCardRecurring,
         recurringAmount,
+        payuniPeriodHash,
+        payuniPeriodHashOnline,
       },
       { partial: false },
     );
@@ -620,6 +624,8 @@ router.post('/promotions', async (req, res) => {
             requiresMemberContract: fields.requiresMemberContract,
             enableCardRecurring: fields.enableCardRecurring,
             recurringAmount: fields.recurringAmount,
+            payuniPeriodHash: fields.payuniPeriodHash,
+            payuniPeriodHashOnline: fields.payuniPeriodHashOnline,
             price: fields.price,
             bonusGiven: fields.bonusGiven,
             isActive: true,
@@ -710,6 +716,8 @@ router.patch('/promotions/:id', async (req, res) => {
     requiresMemberContract,
     enableCardRecurring,
     recurringAmount,
+    payuniPeriodHash,
+    payuniPeriodHashOnline,
     contractIds,
   } = req.body || {};
   const data = {};
@@ -740,7 +748,9 @@ router.patch('/promotions/:id', async (req, res) => {
       periodCount !== undefined ||
       requiresMemberContract !== undefined ||
       enableCardRecurring !== undefined ||
-      recurringAmount !== undefined;
+      recurringAmount !== undefined ||
+      payuniPeriodHash !== undefined ||
+      payuniPeriodHashOnline !== undefined;
 
     if (hasFieldUpdates) {
       const fields = resolvePromotionFields(
@@ -760,6 +770,12 @@ router.patch('/promotions/:id', async (req, res) => {
             enableCardRecurring !== undefined ? enableCardRecurring : current.enableCardRecurring,
           recurringAmount:
             recurringAmount !== undefined ? recurringAmount : current.recurringAmount,
+          payuniPeriodHash:
+            payuniPeriodHash !== undefined ? payuniPeriodHash : current.payuniPeriodHash,
+          payuniPeriodHashOnline:
+            payuniPeriodHashOnline !== undefined
+              ? payuniPeriodHashOnline
+              : current.payuniPeriodHashOnline,
         },
         { partial: true, current },
       );
@@ -773,6 +789,8 @@ router.patch('/promotions/:id', async (req, res) => {
       data.requiresMemberContract = fields.requiresMemberContract;
       data.enableCardRecurring = fields.enableCardRecurring;
       data.recurringAmount = fields.recurringAmount;
+      data.payuniPeriodHash = fields.payuniPeriodHash;
+      data.payuniPeriodHashOnline = fields.payuniPeriodHashOnline;
     } else if (usageType !== undefined) {
       data.usageType = normalizeUsageType(usageType);
     }
@@ -974,6 +992,8 @@ router.post('/course-plans', async (req, res) => {
     recurringAmount,
     recurringAmount4,
     recurringAmountFinal,
+    payuniPeriodHash,
+    payuniPeriodHashOnline,
     requiresMemberContract,
     enableSecondPerson,
     giftLabel,
@@ -1027,6 +1047,8 @@ router.post('/course-plans', async (req, res) => {
         recurringAmount,
         recurringAmount4,
         recurringAmountFinal,
+        payuniPeriodHash,
+        payuniPeriodHashOnline,
         requiresMemberContract,
         enableSecondPerson,
         giftLabel,
@@ -1060,6 +1082,8 @@ router.post('/course-plans', async (req, res) => {
             recurringAmount: fields.recurringAmount,
             recurringAmount4: fields.recurringAmount4,
             recurringAmountFinal: fields.recurringAmountFinal,
+            payuniPeriodHash: fields.payuniPeriodHash,
+            payuniPeriodHashOnline: fields.payuniPeriodHashOnline,
             requiresMemberContract: fields.requiresMemberContract,
             enableSecondPerson: fields.enableSecondPerson,
             giftLabel: fields.giftLabel,
@@ -1143,6 +1167,8 @@ router.patch('/course-plans/:id', async (req, res) => {
     recurringAmount,
     recurringAmount4,
     recurringAmountFinal,
+    payuniPeriodHash,
+    payuniPeriodHashOnline,
     requiresMemberContract,
     enableSecondPerson,
     giftLabel,
@@ -1183,6 +1209,8 @@ router.patch('/course-plans/:id', async (req, res) => {
       recurringAmount !== undefined ||
       recurringAmount4 !== undefined ||
       recurringAmountFinal !== undefined ||
+      payuniPeriodHash !== undefined ||
+      payuniPeriodHashOnline !== undefined ||
       requiresMemberContract !== undefined ||
       enableSecondPerson !== undefined ||
       giftLabel !== undefined ||
@@ -1217,6 +1245,14 @@ router.patch('/course-plans/:id', async (req, res) => {
             recurringAmountFinal !== undefined
               ? recurringAmountFinal
               : current.recurringAmountFinal,
+          payuniPeriodHash:
+            payuniPeriodHash !== undefined
+              ? payuniPeriodHash
+              : current.payuniPeriodHash,
+          payuniPeriodHashOnline:
+            payuniPeriodHashOnline !== undefined
+              ? payuniPeriodHashOnline
+              : current.payuniPeriodHashOnline,
           requiresMemberContract:
             requiresMemberContract !== undefined
               ? requiresMemberContract
@@ -1241,6 +1277,8 @@ router.patch('/course-plans/:id', async (req, res) => {
       data.recurringAmount = fields.recurringAmount;
       data.recurringAmount4 = fields.recurringAmount4;
       data.recurringAmountFinal = fields.recurringAmountFinal;
+      data.payuniPeriodHash = fields.payuniPeriodHash;
+      data.payuniPeriodHashOnline = fields.payuniPeriodHashOnline;
       data.requiresMemberContract = fields.requiresMemberContract;
       data.enableSecondPerson = fields.enableSecondPerson;
       data.giftLabel = fields.giftLabel;

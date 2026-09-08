@@ -3,6 +3,8 @@ import crypto from 'crypto';
 
 const QR_SECRET_KEY = process.env.QR_SECRET_KEY || process.env.JWT_SECRET || 'GymSaaS_Super_Secret_Key_2026';
 export const QR_TTL_MS = 30_000; // 30 秒防截圖時效
+/** 閘機／手機時鐘漂移容許（±秒） */
+export const QR_SKEW_MS = Number(process.env.QR_SKEW_MS) || 5_000;
 
 /**
  * 產生動態進場 QR Token
@@ -78,14 +80,14 @@ export function verifyGateQrToken(qrToken) {
     throw err;
   }
 
-  if (Date.now() - timestamp > QR_TTL_MS) {
+  if (Date.now() - timestamp > QR_TTL_MS + QR_SKEW_MS) {
     const err = new Error('⛔ 條碼已過期 (超過30秒)，請重新整理畫面產生新條碼 (防截圖機制)');
     err.code = 'QR_EXPIRED';
     throw err;
   }
 
-  // 拒絕未來時間戳（防時鐘竄改）
-  if (timestamp > Date.now() + 5_000) {
+  // 拒絕未來時間戳（防時鐘竄改；允許 ± skew）
+  if (timestamp > Date.now() + QR_SKEW_MS) {
     const err = new Error('閘門拒絕：無效或偽造的 QR Code');
     err.code = 'QR_INVALID';
     throw err;

@@ -299,8 +299,18 @@ async function postEzpay(apiName, postData) {
     }
   } catch (error) {
     if (error.statusCode) throw error;
+    const cause = error?.cause;
+    const hint =
+      cause?.code === 'ENOTFOUND' || cause?.code === 'EAI_AGAIN'
+        ? `（無法解析 ${cause.hostname || 'ezPay 主機'}，請檢查網路／DNS，或確認 EZPAY_INVOICE_URL 為 cinv 測試或 inv 正式）`
+        : cause?.code === 'ECONNREFUSED' || cause?.code === 'ETIMEDOUT'
+          ? '（連線 ezPay 失敗，請檢查網路或防火牆）'
+          : '';
     console.error(`ezPay ${apiName} 呼叫失敗:`, error);
-    throw error;
+    const err = new Error(`ezPay 連線失敗${hint || ''}: ${error.message}`);
+    err.statusCode = 502;
+    err.cause = cause;
+    throw err;
   }
 }
 
@@ -341,9 +351,13 @@ export async function issueInvoice(orderData) {
     isB2B,
   );
 
+  // B2C：ItemPrice／ItemAmt 為含稅；B2B：須為未稅（手冊 Category 規則）
+  const itemUnitPrice = isB2B ? amt : totalAmt;
+  const itemLineAmt = isB2B ? amt : totalAmt;
+
   const postData = {
     RespondType: 'JSON',
-    Version: '1.4',
+    Version: '1.5',
     TimeStamp: Math.floor(Date.now() / 1000).toString(),
     MerchantOrderNo: merchantOrderNo,
     BuyerName: buyerName || buyerUbn || '體育客會員',
@@ -351,7 +365,7 @@ export async function issueInvoice(orderData) {
     BuyerEmail: orderData.buyerEmail || '',
     Category: isB2B ? 'B2B' : 'B2C',
     TaxType: '1',
-    TaxRate: 5,
+    TaxRate: '5',
     Amt: amt.toString(),
     TaxAmt: taxAmt.toString(),
     TotalAmt: totalAmt.toString(),
@@ -359,8 +373,8 @@ export async function issueInvoice(orderData) {
     ItemName: itemName,
     ItemCount: '1',
     ItemUnit: '式',
-    ItemPrice: totalAmt.toString(),
-    ItemAmt: totalAmt.toString(),
+    ItemPrice: itemUnitPrice.toString(),
+    ItemAmt: itemLineAmt.toString(),
     Status: '1',
   };
 

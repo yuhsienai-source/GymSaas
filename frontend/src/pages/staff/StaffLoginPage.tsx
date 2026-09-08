@@ -1,5 +1,5 @@
 import { type FormEvent, useEffect, useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import LandingLayout from '../../components/layout/LandingLayout';
 import { Alert, Button, Card, Field, Input, PasswordInput } from '../../components/ui';
 import { useStaffAuth } from '../../contexts/StaffAuthContext';
@@ -9,13 +9,29 @@ import { getDefaultStaffPath } from '../../lib/staffPermissions';
 
 export default function StaffLoginPage() {
   const navigate = useNavigate();
+  const [searchParams, setSearchParams] = useSearchParams();
   const { isAuthenticated, staff, login } = useStaffAuth();
   const { toast } = useToast();
   const [account, setAccount] = useState('');
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
+  const [error, setError] = useState(() => {
+    const raw = searchParams.get('login_error');
+    if (!raw) return '';
+    try {
+      return decodeURIComponent(raw);
+    } catch {
+      return raw;
+    }
+  });
   const [apiOk, setApiOk] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    if (!searchParams.get('login_error')) return;
+    const next = new URLSearchParams(searchParams);
+    next.delete('login_error');
+    setSearchParams(next, { replace: true });
+  }, [searchParams, setSearchParams]);
 
   useEffect(() => {
     if (!isAuthenticated || !staff) return;

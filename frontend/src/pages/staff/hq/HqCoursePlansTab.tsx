@@ -159,6 +159,8 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
   const [recurring2SecondStr, setRecurring2SecondStr] = useState('');
   const [recurring4BaseStr, setRecurring4BaseStr] = useState('');
   const [recurring4FinalStr, setRecurring4FinalStr] = useState('');
+  const [payuniPeriodHash, setPayuniPeriodHash] = useState('');
+  const [payuniPeriodHashOnline, setPayuniPeriodHashOnline] = useState('');
   const [requiresContract, setRequiresContract] = useState(false);
   const [contractIds, setContractIds] = useState<number[]>([]);
   const [enableSecondPerson, setEnableSecondPerson] = useState(false);
@@ -184,6 +186,8 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
   const [editRecurring2SecondStr, setEditRecurring2SecondStr] = useState('');
   const [editRecurring4BaseStr, setEditRecurring4BaseStr] = useState('');
   const [editRecurring4FinalStr, setEditRecurring4FinalStr] = useState('');
+  const [editPayuniPeriodHash, setEditPayuniPeriodHash] = useState('');
+  const [editPayuniPeriodHashOnline, setEditPayuniPeriodHashOnline] = useState('');
   const [editRequiresContract, setEditRequiresContract] = useState(false);
   const [editContractIds, setEditContractIds] = useState<number[]>([]);
   const [editEnableSecondPerson, setEditEnableSecondPerson] = useState(false);
@@ -345,6 +349,10 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
           !isCompensation && cardRecurring && allowRecurring4
             ? parseFloat(recurring4FinalStr)
             : null,
+        payuniPeriodHash:
+          !isCompensation && cardRecurring ? payuniPeriodHash.trim() || null : null,
+        payuniPeriodHashOnline:
+          !isCompensation && cardRecurring ? payuniPeriodHashOnline.trim() || null : null,
         requiresMemberContract: isCompensation ? false : requiresContract,
         enableSecondPerson: isCompensation ? false : enableSecondPerson,
         giftLabel: isCompensation ? null : effectiveGiftLabel || null,
@@ -361,6 +369,8 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
       setSessions('10');
       setDescription('');
       setCardRecurring(false);
+      setPayuniPeriodHash('');
+      setPayuniPeriodHashOnline('');
       setRequiresContract(false);
       setContractIds([]);
       setEnableSecondPerson(false);
@@ -398,6 +408,10 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
     setEditRecurring4BaseStr(allow4 && amount4Base != null ? String(amount4Base) : '');
     setEditRecurring4FinalStr(
       allow4 && p.recurringAmountFinal != null ? String(p.recurringAmountFinal) : '',
+    );
+    setEditPayuniPeriodHash(p.payuniPeriodHash ? String(p.payuniPeriodHash) : '');
+    setEditPayuniPeriodHashOnline(
+      p.payuniPeriodHashOnline ? String(p.payuniPeriodHashOnline) : '',
     );
     setEditRequiresContract(Boolean(p.requiresMemberContract));
     setEditContractIds((p.contracts || []).map((c) => c.id));
@@ -505,6 +519,10 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
           editCardRecurring && editAllowRecurring4
             ? parseFloat(editRecurring4FinalStr)
             : null,
+        payuniPeriodHash: editCardRecurring ? editPayuniPeriodHash.trim() || null : null,
+        payuniPeriodHashOnline: editCardRecurring
+          ? editPayuniPeriodHashOnline.trim() || null
+          : null,
         requiresMemberContract: editRequiresContract,
         enableSecondPerson: editEnableSecondPerson,
         giftLabel: editGiftLabel.trim() || null,
@@ -866,6 +884,28 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
                     </Field>
                   </>
                 )}
+                <Field
+                  label="PayUNi 續期 Hash（臨櫃）"
+                  hint="臨櫃乙禾後約定頁；空則用 PAYUNI_PERIOD_HASH"
+                >
+                  <Input
+                    value={payuniPeriodHash}
+                    onChange={(e) => setPayuniPeriodHash(e.target.value)}
+                    placeholder="例：臨櫃Hash"
+                    style={{ maxWidth: 280 }}
+                  />
+                </Field>
+                <Field
+                  label="PayUNi 續期 Hash（會員線上）"
+                  hint="會員線上購買；須與臨櫃不同。空則用 PAYUNI_PERIOD_HASH_ONLINE"
+                >
+                  <Input
+                    value={payuniPeriodHashOnline}
+                    onChange={(e) => setPayuniPeriodHashOnline(e.target.value)}
+                    placeholder="例：線上Hash"
+                    style={{ maxWidth: 280 }}
+                  />
+                </Field>
               </>
             )}
             <Button type="submit" disabled={branchIds.length === 0}>
@@ -1400,6 +1440,28 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
                   </Field>
                 </>
               )}
+              <Field
+                label="PayUNi 續期 Hash（臨櫃）"
+                hint="臨櫃乙禾後約定頁；空則用 PAYUNI_PERIOD_HASH"
+              >
+                <Input
+                  value={editPayuniPeriodHash}
+                  onChange={(e) => setEditPayuniPeriodHash(e.target.value)}
+                  placeholder="例：臨櫃Hash"
+                  style={{ maxWidth: 280 }}
+                />
+              </Field>
+              <Field
+                label="PayUNi 續期 Hash（會員線上）"
+                hint="會員線上購買；須與臨櫃不同。空則用 PAYUNI_PERIOD_HASH_ONLINE"
+              >
+                <Input
+                  value={editPayuniPeriodHashOnline}
+                  onChange={(e) => setEditPayuniPeriodHashOnline(e.target.value)}
+                  placeholder="例：線上Hash"
+                  style={{ maxWidth: 280 }}
+                />
+              </Field>
             </>
           )}
           <label className="checkbox-item">

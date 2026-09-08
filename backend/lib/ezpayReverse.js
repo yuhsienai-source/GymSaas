@@ -11,6 +11,28 @@ function roundMoney(n) {
 }
 
 /**
+ * 折讓僅能對「已成功開立」的真實發票號碼；SPLIT:／複合標記／空值一律拒絕
+ * @returns {string} 正規化後發票號
+ */
+export function assertRealInvoiceForAllowance(invoiceNumber, label = '退費折讓') {
+  const s = String(invoiceNumber || '').trim().toUpperCase();
+  if (!s || s.startsWith('SPLIT:') || s.includes(',')) {
+    const err = new Error(
+      `${label}須在開票成功後才能辦理（尚無有效發票號碼；未開票或開票失敗的交易不可折讓）`,
+    );
+    err.statusCode = 400;
+    throw err;
+  }
+  return s;
+}
+
+/** 是否為可折讓的真實發票號（不作 throw） */
+export function isRealInvoiceNumber(invoiceNumber) {
+  const s = String(invoiceNumber || '').trim();
+  return Boolean(s && !s.startsWith('SPLIT:') && !s.includes(','));
+}
+
+/**
  * @typedef {object} InvoiceReverseCtx
  * @property {string|null} invoiceNumber
  * @property {string} merchantOrderNo  開立時 MerchantOrderNo（軟拆＝子單號；舊合併＝CHK）
@@ -327,10 +349,21 @@ export async function resolveOrderInvoiceReverse(order, { refundCash, tx } = {})
  * 執行 ezPay 反向；成功時可選擇回寫 CheckoutSession／關聯單據註記
  */
 export async function executeInvoiceReverse(ctx, { reason, buyerEmail, prefer } = {}) {
+  const mode = prefer || ctx?.prefer || 'void';
+  const amt = roundMoney(ctx?.amount);
   if (!ctx?.invoiceNumber || ctx.skip) {
+    // 折讓且仍有應反向金額時不可略過（無發票不得「假裝成功」）
+    if (mode === 'allowance' && amt > 0) {
+      assertRealInvoiceForAllowance(ctx?.invoiceNumber, '退費折讓');
+      const err = new Error('退費折讓須在開票成功後才能辦理（發票上下文已略過）');
+      err.statusCode = 400;
+      throw err;
+    }
     return { action: 'none', invoiceNumber: null };
   }
-  const mode = prefer || ctx.prefer || 'void';
+  if (mode === 'allowance') {
+    assertRealInvoiceForAllowance(ctx.invoiceNumber, '退費折讓');
+  }
   return reverseIssuedInvoice({
     invoiceNumber: ctx.invoiceNumber,
     merchantOrderNo: ctx.merchantOrderNo,

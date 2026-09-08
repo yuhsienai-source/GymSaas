@@ -27,7 +27,7 @@ export function denomRows(counts: DenomCounts) {
 
 export const CLOSE_CHECKLIST = [
   { key: 'cashCounted', label: '錢櫃現金已逐面額清點' },
-  { key: 'cardSettled', label: '刷卡／信用卡班報已核對' },
+  { key: 'cardSettled', label: '刷卡／乙禾 EDC 日結單已核對（筆數＋金額）' },
   { key: 'voucherChecked', label: '抵用券／禮券已清點' },
   { key: 'drawerReady', label: '錢櫃已歸位、交班單已確認' },
 ] as const;

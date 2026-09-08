@@ -1,0 +1,566 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>體育客 GymSaaS 前端架構與防弊方案</title>
+  <style>
+    :root {
+      --primary: #083D4F;
+      --primary-dark: #052631;
+      --accent: #20b2aa;
+      --bg-light: #f4f6f8;
+      --text-main: #1e293b;
+      --text-muted: #64748b;
+      --white: #ffffff;
+      --yellow: #f59e0b;
+      --green: #10b981;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang TC", "Microsoft JhengHei", sans-serif; }
+    body { background: #000; overflow: hidden; display: flex; align-items: center; justify-content: center; height: 100vh; }
+    .slide-deck { width: 100vw; height: 100vh; position: relative; }
+    .slide {
+      position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+      padding: 40px 60px; display: none; flex-direction: column; justify-content: space-between;
+      background: var(--bg-light); color: var(--text-main);
+    }
+    .slide.active { display: flex; }
+    .slide.dark { background: var(--primary); color: var(--white); }
+    
+    /* Header */
+    .slide-header { border-bottom: 2px solid rgba(0,0,0,0.08); padding-bottom: 12px; }
+    .slide.dark .slide-header { border-bottom: 2px solid rgba(255,255,255,0.15); }
+    .slide-header h2 { font-size: 2rem; font-weight: 700; color: var(--primary); }
+    .slide.dark .slide-header h2 { color: var(--white); }
+    .slide-header p { font-size: 1rem; color: var(--text-muted); margin-top: 4px; }
+    .slide.dark .slide-header p { color: rgba(255,255,255,0.7); }
+
+    /* Content Body */
+    .slide-body { flex: 1; display: flex; align-items: center; justify-content: center; padding: 18px 0; overflow: hidden; }
+    .slide-footer { display: flex; justify-content: space-between; align-items: center; font-size: 0.85rem; color: var(--text-muted); }
+    .slide.dark .slide-footer { color: rgba(255,255,255,0.5); }
+
+    /* Layout Grids */
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; width: 100%; height: 100%; }
+    .grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 20px; width: 100%; height: 100%; }
+    .grid-4 { display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; gap: 16px; width: 100%; height: 100%; }
+    
+    /* Cards */
+    .card { background: var(--white); border-radius: 12px; padding: 20px; border: 1px solid rgba(0,0,0,0.08); box-shadow: 0 4px 12px rgba(0,0,0,0.02); display: flex; flex-direction: column; justify-content: space-between; }
+    .card.dark-card { background: var(--primary-dark); border-color: rgba(255,255,255,0.1); color: var(--white); }
+    .card h3 { font-size: 1.25rem; color: var(--primary); margin-bottom: 8px; }
+    .card.dark-card h3 { color: var(--accent); }
+    .card ul { list-style: none; display: flex; flex-direction: column; gap: 8px; font-size: 0.95rem; color: var(--text-main); }
+    .card.dark-card ul { color: rgba(255,255,255,0.85); }
+    .card li::before { content: "•"; color: var(--accent); font-weight: bold; margin-right: 6px; }
+
+    /* Plain Talk Box (白話翻譯框) */
+    .plain-box {
+      margin-top: 10px; background: #fffbeb; border-left: 4px solid var(--yellow);
+      padding: 8px 12px; border-radius: 4px; font-size: 0.85rem; color: #92400e; line-height: 1.4;
+    }
+    .plain-box strong { font-weight: 700; color: #78350f; }
+
+    /* Image / Diagram Slot (自填圖片插槽) */
+    .img-slot {
+      background: #e2e8f0; border: 2px dashed #94a3b8; border-radius: 8px;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      text-align: center; padding: 16px; color: #475569; font-size: 0.9rem; min-height: 140px;
+    }
+    .img-slot span { font-weight: bold; margin-bottom: 4px; color: var(--primary); }
+    .img-slot img { max-width: 100%; max-height: 180px; object-fit: contain; border-radius: 6px; }
+
+    /* Comparison Table */
+    table { width: 100%; border-collapse: collapse; background: var(--white); border-radius: 8px; overflow: hidden; }
+    th, td { padding: 14px 18px; text-align: left; font-size: 0.95rem; }
+    th { background: var(--primary); color: var(--white); font-weight: 600; }
+    tr:nth-child(even) { background: #f8fafc; }
+    td { border-bottom: 1px solid #e2e8f0; }
+
+    /* Badges */
+    .badge { display: inline-block; padding: 4px 10px; border-radius: 6px; font-size: 0.85rem; font-weight: 600; background: #e0f2fe; color: #0369a1; }
+    .badge.green { background: #d1fae5; color: #065f46; }
+
+    /* Controls */
+    .nav-controls { position: fixed; bottom: 15px; right: 20px; z-index: 100; display: flex; gap: 8px; }
+    .nav-btn { background: rgba(0,0,0,0.6); color: #fff; border: none; border-radius: 6px; padding: 8px 14px; cursor: pointer; }
+    .nav-btn:hover { background: var(--primary); }
+  </style>
+</head>
+<body>
+
+<div class="slide-deck" id="deck">
+
+  <!-- Slide 1: 封面 -->
+  <div class="slide dark active">
+    <div style="flex:1; display:flex; flex-direction:column; justify-content:center; max-width:900px;">
+      <span class="badge" style="background:var(--accent); color:#052631; width:fit-content; margin-bottom:16px;">1st FITNESS 體育客</span>
+      <h1 style="font-size: 3.4rem; font-weight:800; line-height:1.2; margin-bottom:18px;">次世代營運中樞架構</h1>
+      <h3 style="font-size: 1.6rem; font-weight:400; color:rgba(255,255,255,0.85); margin-bottom:28px;">純 API 物理邊界 ✕ 雙軌身分核身 ✕ 門禁零白嫖防線</h3>
+      <p style="font-size: 1.05rem; color:rgba(255,255,255,0.6);">9 月 9 日 專案架構進度報告</p>
+    </div>
+    <div class="slide-footer">
+      <span>體育客 Frontend SPA 架構標準</span>
+      <span>Slide 1 / 10</span>
+    </div>
+  </div>
+
+  <!-- Slide 2: 痛點對比 -->
+  <div class="slide">
+    <div class="slide-header">
+      <h2>傳統架構痛點 vs. 體育客 SaaS 解法</h2>
+      <p>從傳統大型連鎖（健身工廠 Web 模式）走向新一代純 API 自動化運營</p>
+    </div>
+    <div class="slide-body">
+      <table>
+        <thead>
+          <tr>
+            <th style="width: 18%;">比較維度</th>
+            <th style="width: 41%;">傳統健身房 (Web 表單門戶)</th>
+            <th style="width: 41%;">體育客 GymSaaS (當前標準)</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>身分識別</strong></td>
+            <td>身分證號＋密碼，現場紙本簽核，高度依賴櫃檯建檔。</td>
+            <td><strong>LINE OAuth ✕ Email OTP</strong> 雙軌，100% 自助開卡。</td>
+          </tr>
+          <tr>
+            <td><strong>門禁防弊</strong></td>
+            <td>實體卡片／靜態條碼，截圖借卡、朋友代刷普遍。</td>
+            <td><strong>30 秒動態 QR ✕ 單相機 Face8</strong>，截圖轉貼無效。</td>
+          </tr>
+          <tr>
+            <td><strong>裝置安全</strong></td>
+            <td>多瀏覽器隨意登入，無「一機一帳」約束。</td>
+            <td><strong>JWT 內嵌 `deviceId`</strong>，改綁即作廢舊手機憑證。</td>
+          </tr>
+          <tr>
+            <td><strong>外國旅客</strong></td>
+            <td>困於台灣門號簡訊與繁體 LINE 介面，卡在門口。</td>
+            <td><strong>國際 Email OTP 通道</strong>，免裝 App 零摩擦進場。</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="slide-footer">
+      <span>1st FITNESS System Overview</span>
+      <span>Slide 2 / 10</span>
+    </div>
+  </div>
+
+  <!-- Slide 3: 核心架構哲學 (API-Only) -->
+  <div class="slide">
+    <div class="slide-header">
+      <h2>前後端絕對物理邊界 (API-Only)</h2>
+      <p>前端（手機／網頁）只做畫面與操作；所有金額、身分與商業真相全在後端</p>
+    </div>
+    <div class="slide-body">
+      <div class="grid-3">
+        <div class="card">
+          <div>
+            <h3>物理邊界禁令</h3>
+            <ul>
+              <li>Vite + React 19 + TS 純靜態部署。</li>
+              <li><strong>嚴禁</strong>在前端偷放資料庫密碼、金流私鑰或計算邏輯。</li>
+              <li>所有資料一律經標準 JSON 管道溝通。</li>
+            </ul>
+          </div>
+          <div class="plain-box">
+            <strong>🗣️ 白話翻譯：</strong>
+            前端只是一面鏡子，後台才是大腦。就算有人把前端程式碼拆開來看，也看不到任何機密或金流漏洞。
+          </div>
+        </div>
+        <div class="card">
+          <div>
+            <h3>身分不信任 UI</h3>
+            <ul>
+              <li>會員操作<strong>禁止</strong>傳送 <code>memberId</code>（由 Token 自動提取）。</li>
+              <li>進出閘機只送 <code>qrToken</code> 或影像。</li>
+              <li>儲值與購案<strong>禁止</strong>自填金額，只送促銷代碼。</li>
+            </ul>
+          </div>
+          <div class="plain-box">
+            <strong>🗣️ 白話翻譯：</strong>
+            不讓使用者或駭客在網頁上「自己竄改會員編號或金額」。買 1000 元就是 1000 元，由後端資料庫說了算。
+          </div>
+        </div>
+        <div class="card">
+          <div>
+            <h3>Token 獨立分倉</h3>
+            <ul>
+              <li>會員專屬通行證（JWT）與員工通行證分開存放。</li>
+              <li>各自維護獨立的 Context，嚴禁混用。</li>
+              <li>發生過期或裝置異常時，強制登出硬導回首頁。</li>
+            </ul>
+          </div>
+          <div class="plain-box">
+            <strong>🗣️ 白話翻譯：</strong>
+            員工歸員工、客人歸客人，通行鑰匙完全分開，避免會員意外摸進管理後台。
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="slide-footer">
+      <span>Security & Physical Boundary</span>
+      <span>Slide 3 / 10</span>
+    </div>
+  </div>
+
+  <!-- Slide 4: 雙軌進場 -->
+  <div class="slide">
+    <div class="slide-header">
+      <h2>零摩擦雙軌進場 — 本地極速 ✕ 外籍 Email</h2>
+      <p>解決「外國旅客無 LINE、無台灣門號收不到 SMS」的現場卡關硬傷</p>
+    </div>
+    <div class="slide-body">
+      <div class="grid-2">
+        <div class="card">
+          <div>
+            <span class="badge" style="margin-bottom:8px;">本地會員通道</span>
+            <h3>軌道 A：LINE 快速通道</h3>
+            <ul>
+              <li>一鍵點擊 LINE 授權回流 <code>/auth/callback</code>。</li>
+              <li>前端自動抓取手機裝置代碼，無縫綁定當前手機。</li>
+              <li>同步啟用官方帳號推播、即時預約教練與銷課通知。</li>
+            </ul>
+          </div>
+          <div class="img-slot">
+            <span>📷 [此處建議放圖：手機 LINE 登入授權頁面]</span>
+            <small>建議展示：點擊後直接連回體育客首頁畫面</small>
+          </div>
+          <div class="plain-box">
+            <strong>🗣️ 白話優點：</strong>台灣人天天用 LINE，按一下就登入，不用記任何帳號密碼。
+          </div>
+        </div>
+        <div class="card">
+          <div>
+            <span class="badge green" style="margin-bottom:8px;">外國旅客 / 無 LINE 者</span>
+            <h3>軌道 B：國際 Email OTP 通道</h3>
+            <ul>
+              <li><strong>完全零簡訊</strong>：無需台灣門號，全球信箱 5 秒收取驗證碼。</li>
+              <li><strong>免裝 App</strong>：手機瀏覽器開啟即用，自動採集瀏覽器裝置代碼。</li>
+              <li>直接填寫資料、簽署入會合約，即刻啟用 30 秒動態碼進場。</li>
+            </ul>
+          </div>
+          <div class="img-slot">
+            <span>📷 [此處建議放圖：手機瀏覽器 Email 驗證碼畫面]</span>
+            <small>建議展示：輸入 6 位數 Email 驗證碼即開卡成功</small>
+          </div>
+          <div class="plain-box">
+            <strong>🗣️ 白話優點：</strong>歐美外國客不用下載 LINE、沒有台灣門號也能在 1 分鐘內在手機開卡進場！
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="slide-footer">
+      <span>Global User Onboarding</span>
+      <span>Slide 4 / 10</span>
+    </div>
+  </div>
+
+  <!-- Slide 5: 防弊防線 (修正破口) -->
+  <div class="slide">
+    <div class="slide-header">
+      <h2>零死角防弊 — 封死所有「代打卡與白嫖」漏洞</h2>
+      <p>徹底解決「把驗證碼轉寄給朋友、早晚輪流換機借帳號」與「尾隨進場」破口</p>
+    </div>
+    <div class="slide-body">
+      <div class="grid-4">
+        <div class="card">
+          <h3>1. 30 秒 HMAC 動態條碼</h3>
+          <p style="color:var(--text-muted); font-size:0.85rem;">防「截圖轉發給朋友」</p>
+          <div class="plain-box">
+            <strong>白話解說：</strong>條碼每 30 秒變一次，截圖傳給朋友，朋友走到閘機早就過期打不開了。
+          </div>
+        </div>
+        <div class="card">
+          <h3>2. 一機一帳＋改綁即作廢</h3>
+          <p style="color:var(--text-muted); font-size:0.85rem;">防「多台手機共用帳號」</p>
+          <div class="plain-box">
+            <strong>白話解說：</strong>一個帳號同時只能在一台手機上亮條碼。一旦新手機登入，舊手機立即失效被踢出。
+          </div>
+        </div>
+        <div class="card">
+          <h3>3. 24 小時換機頻率熔斷</h3>
+          <p style="color:var(--text-muted); font-size:0.85rem;">防「早晚輪流用 Email 借帳號」</p>
+          <div class="plain-box">
+            <strong>關鍵補漏：</strong>24 小時內只准自主換機 1 次！封死兩個人早上借完、晚上再換回去的作弊循環。
+          </div>
+        </div>
+        <div class="card">
+          <h3>4. 閘機 Anti-Passback</h3>
+          <p style="color:var(--text-muted); font-size:0.85rem;">防「一卡刷兩人／門縫遞手機」</p>
+          <div class="plain-box">
+            <strong>白話解說：</strong>條碼刷進去後，沒在出口刷出來之前，禁止再次刷進門，門禁條碼無法隔空給第二人使用。
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="slide-footer">
+      <span>Anti-Fraud & Zero-Trust Gate</span>
+      <span>Slide 5 / 10</span>
+    </div>
+  </div>
+
+  <!-- Slide 6: 合規前置狀態機 -->
+  <div class="slide">
+    <div class="slide-header">
+      <h2>合規前置狀態機 — 契約必簽與嚴密風控</h2>
+      <p>消除傳統健身房「先進場運動、之後再補簽名」的嚴重法律爭議</p>
+    </div>
+    <div class="slide-body">
+      <div class="grid-3">
+        <div class="card">
+          <div>
+            <h3>Step 1. 人臉偏好</h3>
+            <ul>
+              <li>會員自主選擇是否啟用 Face8 刷臉。</li>
+              <li>不啟用則維持 30 秒動態 QR 進場。</li>
+            </ul>
+          </div>
+          <div class="plain-box">
+            <strong>合規保障：</strong>完全尊重個資法，不強制蒐集臉部特徵，會員二選一。
+          </div>
+        </div>
+        <div class="card">
+          <div>
+            <h3>Step 2. 契約簽署</h3>
+            <ul>
+              <li>線上必簽 <code>NEW_MEMBER</code> 入會定型化契約。</li>
+              <li>啟用人臉者加簽「生物辨識同意書」。</li>
+              <li><strong>未簽署者標紅、禁產 QR、拒絕開門</strong>。</li>
+            </ul>
+          </div>
+          <div class="plain-box">
+            <strong>白話保障：</strong>「沒簽約，連條碼都看不到，閘機絕對不開。」從程式底層杜絕消費合約糾紛。
+          </div>
+        </div>
+        <div class="card">
+          <div>
+            <h3>Step 3. 綁定開卡與警示管控</h3>
+            <ul>
+              <li>依序完成簽核才允許完成裝置綁定。</li>
+              <li>異常帳號標記 <code>isAlert</code>，即時停用門禁。</li>
+              <li>解鎖限總部「合規補償」專案覆核，櫃檯不可擅自取消。</li>
+            </ul>
+          </div>
+          <div class="plain-box">
+            <strong>白話保障：</strong>被鎖卡的黑名單，櫃檯人員不能私下放水偷開門，必須由主管系統審核。
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="slide-footer">
+      <span>Legal & Compliance Pipeline</span>
+      <span>Slide 6 / 10</span>
+    </div>
+  </div>
+
+  <!-- Slide 7: 一站式金流與現場 POS -->
+  <div class="slide">
+    <div class="slide-header">
+      <h2>一站式金流與現場 POS 混合支付</h2>
+      <p>現場、線上分流，後端自動分腿開立電子發票</p>
+    </div>
+    <div class="slide-body">
+      <div class="grid-3">
+        <div class="card">
+          <div>
+            <h3>雙錢包機制 (現金 / 運動金)</h3>
+            <ul>
+              <li>會員錢包清晰分開顯示。</li>
+              <li><strong>方案加贈一律標示 <code>SC $金額</code></strong>。</li>
+              <li>扣款順序由後台系統自動決定。</li>
+            </ul>
+          </div>
+          <div class="plain-box">
+            <strong>白話解說：</strong>儲值送的紅利叫「運動金 (SC)」，買東西或扣分鐘時系統會優先折抵，清楚不混淆。
+          </div>
+        </div>
+        <div class="card">
+          <div>
+            <h3>現場 POS 混合支付場景</h3>
+            <ul>
+              <li><strong>實體刷卡</strong>：走乙禾 <code>YIPAY</code> 端末，刷完系統自動確認。</li>
+              <li><strong>臨櫃 LinePay</strong>：掃會員手機付款碼，秒級完成。</li>
+              <li><strong>月卡定期定額</strong>：現場刷乙禾首期，次期起走 PayUNi 約定自動扣款。</li>
+            </ul>
+          </div>
+          <div class="plain-box">
+            <strong>白話解說：</strong>櫃檯刷卡機、LINE Pay、每月定期扣款全部打通，店員不再拿計算機手工對帳。
+          </div>
+        </div>
+        <div class="card">
+          <div>
+            <h3>發票自動分腿 (Split Invoicing)</h3>
+            <ul>
+              <li>會員買一堂課＋一瓶水，一次結帳。</li>
+              <li>後端自動拆分開立發票（商品一張、課程一張）。</li>
+              <li>退費折讓保留單號追溯，稅務合規零風險。</li>
+            </ul>
+          </div>
+          <div class="plain-box">
+            <strong>白話解說：</strong>買東西跟買課程稅率與帳目不同，系統結帳時在後台自動拆開開發票，會計免頭痛。
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="slide-footer">
+      <span>Payment & Invoicing Architecture</span>
+      <span>Slide 7 / 10</span>
+    </div>
+  </div>
+
+  <!-- Slide 8: 極限前端工程 -->
+  <div class="slide">
+    <div class="slide-header">
+      <h2>極限前端工程 — 單相機雙工閘機與行動體驗</h2>
+      <p>硬體成本減半、秒級開門、手機單手操作優化</p>
+    </div>
+    <div class="slide-body">
+      <div class="grid-2">
+        <div class="card">
+          <div>
+            <span class="badge" style="margin-bottom:8px;">硬體創新</span>
+            <h3>單一路相機雙工閘機 (<code>/gate</code>)</h3>
+            <ul>
+              <li><strong>同一顆相機鏡頭</strong>同時處理「Face8 刷臉」與「掃描 30 秒動態 QR」。</li>
+              <li>絕不再開第二路鏡頭串流，大幅降低平板與閘機硬體發熱與功耗。</li>
+              <li>總部配對金鑰存於本地，短暫網路斷線重開自動還原，不卡門。</li>
+            </ul>
+          </div>
+          <div class="img-slot">
+            <span>📷 [此處建議放圖：現場閘機鏡頭與刷臉/掃碼介面實拍]</span>
+            <small>展示重點：同一個鏡頭畫面中，客人靠臉或靠手機 QR 都能瞬間開門</small>
+          </div>
+        </div>
+        <div class="card">
+          <div>
+            <span class="badge green" style="margin-bottom:8px;">體驗優化</span>
+            <h3>手機優先 UX (Mobile-First)</h3>
+            <ul>
+              <li>底部導覽列恆定顯示，門禁 QR 單手拇指秒點開。</li>
+              <li>觸控標的全部 ≥44px，輸入框字級 ≥16px（防止 iPhone 畫面亂縮放）。</li>
+              <li>金流付款按鈕加裝「防連點同步鎖」，徹底杜絕客人手抖連點重複扣款。</li>
+            </ul>
+          </div>
+          <div class="img-slot">
+            <span>📷 [此處建議放圖：手機版體育客底欄與大條碼畫面]</span>
+            <small>展示重點：會員站在閘機前，單手握手機就能立刻開條碼進場</small>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="slide-footer">
+      <span>Frontend Engineering Standards</span>
+      <span>Slide 8 / 10</span>
+    </div>
+  </div>
+
+  <!-- Slide 9: 全鏈路營運矩陣 -->
+  <div class="slide">
+    <div class="slide-header">
+      <h2>全鏈路營運矩陣 — 多角色專屬工作台</h2>
+      <p>為現場教練、櫃檯接待、總部財務打造無縫協作平台</p>
+    </div>
+    <div class="slide-body">
+      <div class="grid-4">
+        <div class="card">
+          <h3>教練工作台</h3>
+          <ul>
+            <li>私教專屬 QR 簽到銷課。</li>
+            <li>Google 日曆雙向同步課表。</li>
+            <li>指派學員自主訓練課表。</li>
+          </ul>
+          <div class="plain-box"><strong>白話：</strong>教練手機刷一下直接銷課，課表自動同步到自己的 Google 日曆。</div>
+        </div>
+        <div class="card">
+          <h3>櫃檯維運 (Staff)</h3>
+          <ul>
+            <li>進場會員即時看板（補登／取消）。</li>
+            <li><strong>Ctrl/⌘K</strong> 秒查會員資料。</li>
+            <li>作業分店與會員 Sticky 頂欄固定。</li>
+          </ul>
+          <div class="plain-box"><strong>白話：</strong>按個快捷鍵 0.5 秒查到會員，操作不會因捲動畫面跳掉。</div>
+        </div>
+        <div class="card">
+          <h3>總部財務 (HQ)</h3>
+          <ul>
+            <li>門票／商品月份圖表與歷年比較。</li>
+            <li>性別、年齡、平均停留客群分析。</li>
+            <li>教練拆帳抽成係數精準核算。</li>
+          </ul>
+          <div class="plain-box"><strong>白話：</strong>老闆打開後台就能看到今天賺多少、哪時段人最多、教練要發多少獎金。</div>
+        </div>
+        <div class="card">
+          <h3>精準行銷 (CRM)</h3>
+          <ul>
+            <li>久未續課、沉睡客人一鍵名單推播。</li>
+            <li>集點、贈品券、InBody 兌換管理。</li>
+            <li>員工與會員共用備註時間軸。</li>
+          </ul>
+          <div class="plain-box"><strong>白話：</strong>兩個禮拜沒來運動的客人，系統一鍵撈出推播發問候券。</div>
+        </div>
+      </div>
+    </div>
+    <div class="slide-footer">
+      <span>Ecosystem Matrix</span>
+      <span>Slide 9 / 10</span>
+    </div>
+  </div>
+
+  <!-- Slide 10: 結論 -->
+  <div class="slide dark">
+    <div style="flex:1; display:flex; flex-direction:column; justify-content:center; align-items:center; text-align:center;">
+      <h2 style="font-size: 2.8rem; margin-bottom: 20px;">技術封死弊端，體驗留給會員，效率賦能場館</h2>
+      <p style="font-size: 1.25rem; color:rgba(255,255,255,0.7); max-width:720px; margin-bottom:36px;">
+        前端規範全面收斂完成。9 月 9 日專案會議後，即刻推進現場閘機實測與分店聯調。
+      </p>
+      <div style="display:flex; gap:16px;">
+        <span class="badge" style="background:var(--accent); color:#052631; padding:10px 18px; font-size:1rem;">雙軌核身就緒</span>
+        <span class="badge" style="background:var(--accent); color:#052631; padding:10px 18px; font-size:1rem;">單相機閘機聯調</span>
+        <span class="badge" style="background:var(--accent); color:#052631; padding:10px 18px; font-size:1rem;">換機 24hr 熔斷生效</span>
+      </div>
+    </div>
+    <div class="slide-footer">
+      <span>1st FITNESS GymSaaS 2026</span>
+      <span>Slide 10 / 10</span>
+    </div>
+  </div>
+
+</div>
+
+<!-- 導覽控制按鈕 -->
+<div class="nav-controls">
+  <button class="nav-btn" onclick="prevSlide()">◀ 上一頁</button>
+  <button class="nav-btn" onclick="nextSlide()">下一頁 ▶</button>
+</div>
+
+<script>
+  let current = 0;
+  const slides = document.querySelectorAll('.slide');
+
+  function showSlide(idx) {
+    slides.forEach((s, i) => s.classList.toggle('active', i === idx));
+  }
+  function nextSlide() {
+    if (current < slides.length - 1) { current++; showSlide(current); }
+  }
+  function prevSlide() {
+    if (current > 0) { current--; showSlide(current); }
+  }
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'ArrowRight' || e.key === 'PageDown' || e.key === ' ') nextSlide();
+    if (e.key === 'ArrowLeft' || e.key === 'PageUp') prevSlide();
+    if (e.key.toLowerCase() === 'f') {
+      if (!document.fullscreenElement) document.documentElement.requestFullscreen();
+      else document.exitFullscreen();
+    }
+  });
+</script>
+
+</body>
+</html>

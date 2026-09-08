@@ -1,5 +1,6 @@
 import { useEffect, useRef, type ReactNode } from 'react';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
+import BrandMark from '../BrandMark';
 
 const SECRET_CLICKS = 3;
 const SECRET_WINDOW_MS = 900;
@@ -14,7 +15,7 @@ export default function LandingLayout({ children }: { children: ReactNode }) {
   const enableSecretEntry = pathname === '/';
   /** 短表單頁鎖視窗高度；員工登入不鎖，避免手機鍵盤遮住送出鈕 */
   const fitViewport = pathname === '/' || pathname.startsWith('/auth/');
-  /** 會員表面用亮色；員工／入口／看板維持海軍藍深色 */
+  /** 會員表面用亮色；員工／入口／看板維持品牌深色 */
   const memberSurface =
     pathname === '/' ||
     pathname.startsWith('/auth') ||
@@ -23,7 +24,7 @@ export default function LandingLayout({ children }: { children: ReactNode }) {
   useEffect(() => {
     const meta = document.querySelector('meta[name="theme-color"]');
     if (!meta) return;
-    const next = memberSurface ? '#f2f5f8' : '#1A2332';
+    const next = memberSurface ? '#F3F6F8' : '#083D4F';
     const prev = meta.getAttribute('content');
     meta.setAttribute('content', next);
     return () => {
@@ -61,16 +62,16 @@ export default function LandingLayout({ children }: { children: ReactNode }) {
       )}
       <header className="landing__header">
         <Link to="/" className="brand brand--compact">
-          <span className="brand__mark">體</span>
+          <BrandMark />
           <span className="brand__text">
-            體育客
-            <small>GymSaaS</small>
+            1st FITNESS
+            <small>體育客 GymSaaS</small>
           </span>
         </Link>
       </header>
       <main className="landing__main">{children}</main>
-      <footer className="landing__footer">
-        <p>連鎖健身 SaaS · 雙錢包 · 動態門禁 · 私教合約</p>
+      <footer className="landing__footer landing__footer--minimal">
+        <p>© 1st FITNESS</p>
       </footer>
     </div>
   );

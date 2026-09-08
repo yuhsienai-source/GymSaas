@@ -86,6 +86,10 @@ export function clearStaffToken(): void {
   removeSecure(STAFF_INFO_KEY);
 }
 
+/** API interceptor 與 AuthContext 同步：登入票失效時派發 */
+export const MEMBER_AUTH_LOST_EVENT = 'gymsaas:member-auth-lost';
+export const STAFF_AUTH_LOST_EVENT = 'gymsaas:staff-auth-lost';
+
 export type StaffPermission = 'ops' | 'pt' | 'trainer';
 
 /** 職位：STAFF < DUTY < MANAGER < ADMIN；交易異動限 DUTY 以上 */

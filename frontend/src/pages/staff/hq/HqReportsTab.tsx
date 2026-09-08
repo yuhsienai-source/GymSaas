@@ -35,7 +35,7 @@ function gateAccessLabel(r: Record<string, unknown>) {
   if (r.gateAccessNo) return String(r.gateAccessNo);
   return formatGateAccessNo(
     r.checkInAt != null ? String(r.checkInAt) : null,
-    r.gateLogId ?? r.id,
+    (r.gateLogId ?? r.id) as string | number | null | undefined,
   );
 }
 
@@ -112,12 +112,25 @@ function toastRefundDone(
 function txnStatusText(r: Record<string, unknown>) {
   if (r.txnStatus) return String(r.txnStatus);
   const s = String(r.status ?? '').toUpperCase();
-  if (s === 'PAID' || s === 'ACTIVE') return '成功';
+  if (s === 'PAID' || s === 'ACTIVE') {
+    if (r.recurringStopped) return '成功（訂閱已停）';
+    const inv = String(r.invoiceNumber ?? '').trim();
+    return inv ? '成功' : '成功（未開票）';
+  }
   if (s === 'CANCELLED') return '沖回';
   if (s === 'REFUNDED') return '退費';
   if (s === 'PENDING') return '待付款';
   if (s === 'FAILED') return '失敗';
   return s || '—';
+}
+
+function invoiceStatusText(r: Record<string, unknown>) {
+  if (r.invoiceStatusLabel) return String(r.invoiceStatusLabel);
+  const inv = String(r.invoiceNumber ?? '').trim();
+  if (inv) return '已開立';
+  const s = String(r.status ?? '').toUpperCase();
+  if (s === 'PAID' || s === 'ACTIVE') return '未開票';
+  return '—';
 }
 
 function dash(v: unknown) {
@@ -327,7 +340,10 @@ export default function HqReportsTab({
       if (
         !window.confirm(
           `確定對月卡 ${orderId} 執行退費折讓？\n` +
-            `將截斷效期。退費基準：30 日為一期；未滿十五日＝已繳×存續比例−手續費$500；滿／逾十五日以一期計不可退。`,
+            `將截斷效期。退費基準：30 日為一期；未滿十五日＝已繳×存續比例−手續費$500；滿／逾十五日以一期計不可退。` +
+            (r.recurringStopped
+              ? `\n（此單定期定額已停，將直接依訂單做截斷／折讓）`
+              : ''),
         )
       )
         return;
@@ -355,9 +371,8 @@ export default function HqReportsTab({
       return;
     await withRowAction(`topup-refund-${orderId}`, async () => {
       try {
-        const result = await opsRefund(orderId, {
-          invoiceNumber: r.invoiceNumber ? String(r.invoiceNumber) : undefined,
-        });
+        // 發票號以後端訂單為準，勿帶報表顯示值（避免格式／複合號誤判）
+        const result = await opsRefund(orderId);
         toastRefundDone(toast, result, '退費折讓完成');
       } catch (err) {
         toast(getErrorMessage(err, '退費折讓失敗'), 'error');
@@ -447,7 +462,7 @@ export default function HqReportsTab({
     if (!window.confirm(`確定取消沖回進出場單號 ${accessNo}？已出場費用將退回零錢包。`)) return;
     await withRowAction(`gate-cancel-${logId}`, async () => {
       try {
-        const result = await opsCancelGate(logId, '報表取消沖回');
+        const result = await opsCancelGate(logId as string | number, '報表取消沖回');
         toast(result.message || '進出場已取消', 'success');
       } catch (err) {
         toast(getErrorMessage(err, '取消沖回失敗'), 'error');
@@ -634,9 +649,9 @@ export default function HqReportsTab({
 
   const reverseRulesByKind: Record<Exclude<ReportKind, 'orders'>, string> = {
     topup:
-      '儲值／月卡：計時儲值僅能「退費折讓」，公式＝實付金額 − 實際使用額度 − 手續費$100。無限月卡／訂閱「退費折讓」＝截斷效期；未滿十五日＝已繳金額×契約存續比例−手續費$500，滿／逾十五日以一期計不可退。無限月卡「取消沖回」＝截斷效期、不開折讓。定期定額「取消沖回」＝停續扣並保留效期。',
+      '儲值／月卡：計時儲值僅能「退費折讓」，公式＝實付金額 − 實際使用額度 − 手續費$100。無限月卡／訂閱「退費折讓」＝截斷效期；未滿十五日＝已繳金額×契約存續比例−手續費$500，滿／逾十五日以一期計不可退。無限月卡「取消沖回」＝截斷效期、不開折讓。定期定額「取消沖回」＝停續扣並保留效期（訂單仍顯示成功／訂閱已停）；之後仍可再按「退費折讓」截斷效期並開折讓。',
     sales:
-      '銷貨：兩者皆回補庫存並退回零錢包。「取消沖回」優先作廢發票；「退費折讓」優先開立折讓單（應退現金＞0 且有真實發票時）。已結案列不可再操作。',
+      '銷貨：兩者皆回補庫存並退回零錢包。「取消沖回」優先作廢發票；「退費折讓」優先開立折讓單（須已開票成功；無真實發票號不可折讓）。已結案列不可再操作。',
     gate:
       '進出場：僅「取消沖回」。在場可取消不計費；已出場則退回已扣費用至零錢包（已出場退費限 DUTY 以上）。無退費折讓按鈕。',
     coursePurchases:
@@ -658,7 +673,7 @@ export default function HqReportsTab({
               </p>
               <p className="text-sm" style={{ margin: 0 }}>
                 <strong>退費折讓</strong>
-                ：已開發票後需退現金／部分退費時開立 ezPay 折讓單；完成後可至「折讓單據」查詢或列印號碼。
+                ：須已開票成功；已開發票後需退現金／部分退費時開立 ezPay 折讓單；完成後可至「折讓單據」查詢或列印號碼。未開票不可折讓。
               </p>
               <ul className="text-sm" style={{ margin: 0, paddingLeft: '1.2rem' }}>
                 <li>
@@ -672,7 +687,7 @@ export default function HqReportsTab({
                 </li>
                 <li>
                   <strong>定期定額訂閱</strong>
-                  ：取消沖回＝停續扣、保留效期；要退本期請改退費折讓（同上月卡基準）。
+                  ：取消沖回＝停續扣、保留效期（訂單仍為成功／訂閱已停）；若要截斷效期並退費請再按退費折讓（同上月卡基準）。
                 </li>
                 <li>
                   <strong>銷貨</strong>：兩者皆可；沖回優先作廢發票，折讓優先開折讓單。
@@ -943,6 +958,7 @@ export default function HqReportsTab({
                 const orderId = String(r.orderId ?? '');
                 const busy = actionBusyKey === `topup-cancel-${orderId}` || actionBusyKey === `topup-refund-${orderId}`;
                 const done = rowIsFinal(r);
+                const recurringStopped = Boolean(r.recurringStopped);
                 return (
                   <tr key={orderId}>
                     <td className="mono text-sm">{orderId}</td>
@@ -962,7 +978,7 @@ export default function HqReportsTab({
                         <Button
                           size="sm"
                           variant="secondary"
-                          disabled={done || Boolean(busy) || loading}
+                          disabled={done || recurringStopped || Boolean(busy) || loading}
                           onClick={() => void onTopupCancel(r)}
                         >
                           取消沖回
@@ -1138,6 +1154,7 @@ export default function HqReportsTab({
             />
             <DetailRow label="抵用券" value={<span className="mono">{dash(detailRow.voucherCode)}</span>} />
             <DetailRow label="刷卡模式" value={cardModeLabel(detailRow)} />
+            <DetailRow label="發票狀態" value={invoiceStatusText(detailRow)} />
             <DetailRow label="發票號碼" value={<span className="mono">{dash(detailRow.invoiceNumber)}</span>} />
             <DetailRow label="載具" value={<span className="mono">{dash(detailRow.carrierNum)}</span>} />
             <DetailRow label="公司統編" value={<span className="mono">{dash(detailRow.buyerUbn)}</span>} />

@@ -28,6 +28,11 @@ export interface MemberProfile {
   branches?: { branchId: number; name: string }[];
   /** 分店正式名稱串接，如「體育客和平店(GYM)」 */
   branchLabel?: string | null;
+  idPhotoUrl?: string | null;
+  idPhotoBackUrl?: string | null;
+  email?: string | null;
+  gender?: string | null;
+  birthDate?: string | null;
 }
 
 export interface MemberWallet {
@@ -69,6 +74,9 @@ export interface OpsMember {
   memberNo?: string | null;
   name: string;
   phone: string;
+  email?: string | null;
+  /** 身分證／居留證／護照（換機核身；開卡／註冊必填） */
+  idNumber?: string | null;
   emergencyContact?: string | null;
   emergencyContactPhone?: string | null;
   plan: string;
@@ -141,6 +149,10 @@ export interface Promotion {
   enableCardRecurring?: boolean;
   /** 定期定額每期扣款金額 */
   recurringAmount?: number | null;
+  /** PayUNi 續期 Hash · 臨櫃 */
+  payuniPeriodHash?: string | null;
+  /** PayUNi 續期 Hash · 會員線上 */
+  payuniPeriodHashOnline?: string | null;
   contracts?: { id: number; title: string; shortName?: string | null; displayName?: string; status: string }[];
   branchId?: number;
   branch?: { id: number; name: string; code?: string | null };
@@ -192,7 +204,8 @@ export interface CardSubscriptionCharge {
 export interface CardSubscription {
   id: string;
   memberId: number;
-  promotionId: number;
+  promotionId?: number | null;
+  coursePlanId?: number | null;
   originOrderId?: string | null;
   amount: number;
   periodType: string;
@@ -224,7 +237,14 @@ export interface CardSubscription {
     durationDays?: number | null;
     branchId: number;
     branch?: { id: number; name: string; code?: string | null };
-  };
+  } | null;
+  coursePlan?: {
+    id: number;
+    name: string;
+    price?: number;
+    branchId: number;
+    branch?: { id: number; name: string; code?: string | null };
+  } | null;
   charges?: CardSubscriptionCharge[];
 }
 
@@ -383,6 +403,10 @@ export interface CoursePlan {
   recurringAmount4?: number | null;
   /** 4 期：第4期扣款金額 */
   recurringAmountFinal?: number | null;
+  /** PayUNi 續期 Hash · 臨櫃 */
+  payuniPeriodHash?: string | null;
+  /** PayUNi 續期 Hash · 會員線上 */
+  payuniPeriodHashOnline?: string | null;
   /** 是否開放「課程第二人+$500(課程當日現場支付)」 */
   enableSecondPerson?: boolean;
   /** 加贈禮（入購物車，金額 $0） */
@@ -699,7 +723,7 @@ export interface PurchaseOrder {
   }[];
 }
 
-export type PosPayMethod = 'CASH' | 'CARD' | 'WALLET_CASH' | 'VOUCHER';
+export type PosPayMethod = 'CASH' | 'CARD' | 'YIPAY' | 'LINEPAY' | 'WALLET_CASH' | 'VOUCHER';
 
 export interface PosCheckoutResult {
   saleId: string;
@@ -737,5 +761,170 @@ export interface MemberIdentifyResult {
   match?: string;
   member: OpsMember | null;
   candidates: OpsMember[];
+}
+
+// ── CMS / 探索 ──
+export interface CmsAnnouncement {
+  id: number;
+  title: string;
+  body: string;
+  branchId?: number | null;
+  category?: string;
+  pushEnabled?: boolean;
+  publishedAt?: string;
+  expiresAt?: string | null;
+  isActive?: boolean;
+}
+
+export interface CmsFaqItem {
+  id: number;
+  branchId?: number | null;
+  category?: string;
+  question: string;
+  answer: string;
+  sortOrder?: number;
+  isActive?: boolean;
+}
+
+export interface CmsBranchIntro {
+  id: number;
+  name: string;
+  code?: string;
+  address?: string | null;
+  introText?: string | null;
+  introImages?: unknown;
+  introVideos?: unknown;
+  showOccupancy?: boolean;
+}
+
+export interface CmsTrainerPublic {
+  id: number;
+  displayName: string;
+  bio?: string | null;
+  photoUrl?: string | null;
+  branches?: { branchId: number; name?: string | null; code?: string | null }[];
+}
+
+export interface MemberOrderHistoryItem {
+  kind: 'ORDER' | 'CHECKIN';
+  at: string;
+  id: number | string;
+  amount?: number;
+  itemDesc?: string;
+  status?: string;
+  payMethod?: string;
+  checkInAt?: string;
+  checkOutAt?: string | null;
+  fee?: number;
+  billingMode?: string;
+  branchId?: number;
+}
+
+export interface MemberClassRecords {
+  reservations: MemberReservation[];
+  attendances: {
+    id: number;
+    checkedInAt?: string;
+    class?: {
+      id: number;
+      title: string;
+      type?: string;
+      startAt?: string;
+      endAt?: string;
+    };
+  }[];
+}
+
+export interface MemberSubscription {
+  id: string;
+  status: string;
+  nextChargeAt?: string | null;
+  promotion?: { id: number; name: string; usageType?: string; branchId?: number };
+}
+
+export interface MemberGiftCards {
+  purchased: { id: string; code: string; amount: number; status: string; createdAt?: string }[];
+  redeemed: { id: string; code: string; amount: number; status: string; redeemedAt?: string }[];
+}
+
+export interface MemberPointsLedgerEntry {
+  id: number;
+  delta: number;
+  balance: number;
+  reason?: string;
+  createdAt: string;
+}
+
+export interface MarketingCampaign {
+  id: number;
+  name: string;
+  segment?: string;
+  message?: string;
+  status?: string;
+  scheduledAt?: string | null;
+  createdAt?: string;
+  _count?: { pushLogs: number };
+}
+
+export interface LotteryPool {
+  id: number;
+  name: string;
+  status?: string;
+  drawAt?: string | null;
+  _count?: { entries: number };
+}
+
+export interface StaffAttendanceRow {
+  id: number;
+  staffId: number;
+  punchIn: string;
+  punchOut?: string | null;
+  note?: string | null;
+  staff?: { id: number; name: string; displayName?: string | null; role?: string };
+}
+
+export interface StaffLeaveRow {
+  id: number;
+  staffId: number;
+  startAt: string;
+  endAt: string;
+  status: string;
+  reason?: string | null;
+  staff?: { id: number; name: string; displayName?: string | null };
+}
+
+export interface StaffScheduleRow {
+  id: number;
+  staffId: number;
+  startAt: string;
+  endAt: string;
+  slotType?: string;
+  note?: string | null;
+  staff?: { id: number; name: string; displayName?: string | null };
+}
+
+export interface CoachCommissionRule {
+  id: number;
+  trainerId?: number | null;
+  courseKind?: string;
+  payModel?: string;
+  baseSalary?: number;
+  isActive?: boolean;
+  trainer?: { id: number; name: string };
+}
+
+export interface CoachCommissionLedger {
+  id: string;
+  trainerId: number;
+  periodStart: string;
+  periodEnd: string;
+  grossAmount: number;
+  netAmount: number;
+  trainer?: { id: number; name: string };
+}
+
+export interface ClassCheckInTokenResult {
+  token: string;
+  expiresAt: string;
 }
 

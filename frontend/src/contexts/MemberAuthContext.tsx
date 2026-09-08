@@ -2,11 +2,17 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
   useState,
   type ReactNode,
 } from 'react';
-import { getMemberToken, setMemberToken, clearMemberToken } from '../lib/storage';
+import {
+  getMemberToken,
+  setMemberToken,
+  clearMemberToken,
+  MEMBER_AUTH_LOST_EVENT,
+} from '../lib/storage';
 
 interface MemberAuthContextValue {
   token: string | null;
@@ -28,6 +34,12 @@ export function MemberAuthProvider({ children }: { children: ReactNode }) {
   const logout = useCallback(() => {
     clearMemberToken();
     setToken(null);
+  }, []);
+
+  useEffect(() => {
+    const onLost = () => setToken(null);
+    window.addEventListener(MEMBER_AUTH_LOST_EVENT, onLost);
+    return () => window.removeEventListener(MEMBER_AUTH_LOST_EVENT, onLost);
   }, []);
 
   const value = useMemo(

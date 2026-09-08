@@ -16,6 +16,13 @@ import {
   deviceBindUpdateData,
   memberTokenDeviceOpts,
 } from '../lib/memberDevice.js';
+import {
+  deviceResetErrorBody,
+  requestDeviceResetEmail,
+  throwDeviceMismatchResetRequired,
+  verifyAndBindDeviceResetEmail,
+} from '../lib/deviceReset.js';
+import { clientIp, clientUserAgent } from '../lib/memberDeviceAudit.js';
 
 const router = express.Router();
 
@@ -47,6 +54,33 @@ const lineLoginUrlLimiter = createRateLimiter({
   max: 40,
   keyFn: (req) => req.ip || 'unknown',
   message: '請求過於頻繁，請稍後再試',
+});
+
+/** 換機：IP 總限流 */
+const deviceResetIpLimiter = createRateLimiter({
+  keyPrefix: 'device-reset-ip',
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  keyFn: (req) => req.ip || req.headers['x-forwarded-for'] || 'unknown',
+  message: '換機請求過於頻繁，請稍後再試',
+});
+
+/** 換機：IP＋查詢目標（Email／身分）防掃庫 */
+const deviceResetTargetLimiter = createRateLimiter({
+  keyPrefix: 'device-reset-target',
+  windowMs: 15 * 60 * 1000,
+  max: 8,
+  keyFn: (req) => {
+    const ip = req.ip || req.headers['x-forwarded-for'] || 'unknown';
+    const email = String(req.body?.email || '')
+      .trim()
+      .toLowerCase();
+    const identity = String(req.body?.identity || '')
+      .trim()
+      .toLowerCase();
+    return `${ip}:${email}:${identity}`;
+  },
+  message: '換機核身請求過於頻繁，請稍後再試',
 });
 
 function sweepStore(store) {
@@ -232,9 +266,18 @@ async function bindLineToMemberAndIssueJwt(lineProfile, bind, deviceId = null) {
     throw err;
   }
   if (bind.phone && member.phone !== bind.phone) {
-    const err = new Error('手機與會員資料不符，請重新驗證');
+    const err = new Error('身分資料與會員不符，請重新驗證');
     err.statusCode = 403;
     throw err;
+  }
+  if (bind.email && member.email) {
+    const a = String(bind.email).trim().toLowerCase();
+    const b = String(member.email).trim().toLowerCase();
+    if (a && b && a !== b) {
+      const err = new Error('身分資料與會員不符，請重新驗證');
+      err.statusCode = 403;
+      throw err;
+    }
   }
   if (member.lineId && member.lineId !== lineId) {
     const err = new Error('此會員已綁定其他 LINE，請洽櫃檯');
@@ -250,11 +293,9 @@ async function bindLineToMemberAndIssueJwt(lineProfile, bind, deviceId = null) {
   const did = deviceId ? String(deviceId).trim() : '';
   if (did.length >= 8) {
     if (!member.deviceId) {
-      Object.assign(patch, deviceBindUpdateData({ deviceId: did }));
+      Object.assign(patch, deviceBindUpdateData({ deviceId: did }, member.id));
     } else if (member.deviceId !== did) {
-      const err = new Error('此帳號已綁定其他裝置，請洽櫃檯解除後再綁定');
-      err.statusCode = 403;
-      throw err;
+      await throwDeviceMismatchResetRequired(member);
     }
   }
 
@@ -270,30 +311,28 @@ async function bindLineToMemberAndIssueJwt(lineProfile, bind, deviceId = null) {
 }
 
 /**
- * 既有 LINE 會員登入（不再自動開新帳；新客請走手機註冊）
+ * 既有 LINE 會員登入（不再自動開新帳；新客請走 Email 註冊後綁定 LINE）
  * 若本機尚未綁裝置且帶 deviceId，一併寫入（LINE 登入＝完成裝置綁定）
  */
 async function loginExistingLineMember(lineProfile, deviceId = null) {
   const lineId = lineProfile.sub;
   let member = await prisma.member.findUnique({ where: { lineId } });
   if (!member) {
-    const err = new Error('尚未註冊：請先以手機號碼完成會員註冊與驗證後再綁定 LINE');
+    const err = new Error('尚未註冊：請先以 Email 完成會員註冊與驗證後再綁定 LINE');
     err.statusCode = 404;
     throw err;
   }
-  // LINE 快速登入：契約未簽完不得發 JWT（須改走手機驗證完成簽署）
+  // LINE 快速登入：契約未簽完不得發 JWT（須改走 Email OTP 完成簽署）
   await assertMemberReadyForLineLogin(member);
   const did = deviceId ? String(deviceId).trim() : '';
   if (did.length >= 8) {
     if (!member.deviceId) {
       member = await prisma.member.update({
         where: { id: member.id },
-        data: deviceBindUpdateData({ deviceId: did }),
+        data: deviceBindUpdateData({ deviceId: did }, member.id),
       });
     } else if (member.deviceId !== did) {
-      const err = new Error('此帳號已綁定其他裝置，請洽櫃檯解除後再以此裝置登入');
-      err.statusCode = 403;
-      throw err;
+      await throwDeviceMismatchResetRequired(member);
     }
   }
   const accessToken = issueMemberToken(member.id, memberTokenDeviceOpts(member));
@@ -385,10 +424,7 @@ router.post('/line/token', lineExchangeLimiter, async (req, res) => {
     });
   } catch (error) {
     console.error('LINE code 換票失敗:', error);
-    res.status(error.statusCode || 500).json({
-      status: 'error',
-      message: error.message || 'LINE 登入驗證失敗',
-    });
+    res.status(error.statusCode || 500).json(deviceResetErrorBody(error));
   }
 });
 
@@ -412,15 +448,18 @@ router.post('/exchange-auth-code', lineExchangeLimiter, async (req, res) => {
       if (member) {
         if (deviceId.length >= 8) {
           if (member.deviceId && member.deviceId !== deviceId) {
-            return res.status(403).json({
-              status: 'error',
-              message: '此帳號已綁定其他裝置，請洽櫃檯解除後再以此裝置登入',
-            });
+            try {
+              await throwDeviceMismatchResetRequired(member);
+            } catch (mismatchErr) {
+              return res
+                .status(mismatchErr.statusCode || 403)
+                .json(deviceResetErrorBody(mismatchErr));
+            }
           }
           if (!member.deviceId) {
             member = await prisma.member.update({
               where: { id: member.id },
-              data: deviceBindUpdateData({ deviceId }),
+              data: deviceBindUpdateData({ deviceId }, member.id),
             });
           }
         }
@@ -445,10 +484,7 @@ router.post('/exchange-auth-code', lineExchangeLimiter, async (req, res) => {
       },
     });
   } catch (error) {
-    res.status(error.statusCode || 500).json({
-      status: 'error',
-      message: error.message || 'authCode 交換失敗',
-    });
+    res.status(error.statusCode || 500).json(deviceResetErrorBody(error));
   }
 });
 
@@ -497,5 +533,68 @@ router.get('/line/callback', async (req, res) => {
     }
   }
 });
+
+// ==========================================
+// 自助換機：雙重核對＋Email OTP（禁僅靠 Email 換綁）
+// POST /api/auth/device-reset/request-email
+// POST /api/auth/device-reset/verify-email
+// ==========================================
+router.post(
+  '/device-reset/request-email',
+  deviceResetIpLimiter,
+  deviceResetTargetLimiter,
+  async (req, res) => {
+    try {
+      const data = await requestDeviceResetEmail({
+        resetTicket: req.body?.resetTicket,
+        identity: req.body?.identity,
+        email: req.body?.email,
+      });
+      res.json({
+        status: 'success',
+        message: data.message,
+        data: {
+          maskedEmail: data.maskedEmail,
+          expiresInSec: data.expiresInSec,
+          resetTicket: data.resetTicket,
+          ...(data.mock ? { mock: true } : {}),
+        },
+      });
+    } catch (error) {
+      res.status(error.statusCode || 500).json(deviceResetErrorBody(error));
+    }
+  },
+);
+
+router.post(
+  '/device-reset/verify-email',
+  deviceResetIpLimiter,
+  deviceResetTargetLimiter,
+  async (req, res) => {
+    try {
+      const data = await verifyAndBindDeviceResetEmail({
+        resetTicket: req.body?.resetTicket,
+        identity: req.body?.identity,
+        email: req.body?.email,
+        otpCode: req.body?.otpCode,
+        newDeviceId: req.body?.newDeviceId || req.body?.deviceId,
+        req,
+        ip: clientIp(req),
+        userAgent: clientUserAgent(req),
+      });
+      res.json({
+        status: 'success',
+        message: data.message,
+        data: {
+          token: data.token,
+          member: data.member,
+          deviceChanged: data.deviceChanged,
+        },
+      });
+    } catch (error) {
+      res.status(error.statusCode || 500).json(deviceResetErrorBody(error));
+    }
+  },
+);
 
 export default router;

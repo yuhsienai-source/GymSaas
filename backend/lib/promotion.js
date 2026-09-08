@@ -135,6 +135,8 @@ export function resolvePromotionFields(body, { partial = false, current = null }
       requiresMemberContract: false,
       enableCardRecurring: false,
       recurringAmount: null,
+      payuniPeriodHash: null,
+      payuniPeriodHashOnline: null,
     };
   }
 
@@ -220,7 +222,7 @@ export function resolvePromotionFields(body, { partial = false, current = null }
     }
   }
 
-  // 儲值定期定額：每期金額固定＝方案費用；扣款期數＝有效期 periodCount（忽略前端自填金額）
+  // 儲值定期定額：首期＝price；後續扣款＝recurringAmount（可與首期不同）；總期數＝periodCount
   let recurringAmount = null;
   if (enableCardRecurring) {
     if (usageType !== 'UNLIMITED' || !periodCount || periodCount <= 0) {
@@ -228,7 +230,22 @@ export function resolvePromotionFields(body, { partial = false, current = null }
       err.statusCode = 400;
       throw err;
     }
-    recurringAmount = parsedPrice;
+    const raw =
+      body.recurringAmount !== undefined ? body.recurringAmount : current?.recurringAmount;
+    if (raw === undefined || raw === null || raw === '') {
+      const err = new Error(
+        '啟用定期定額時必須填寫後續扣款金額 recurringAmount（可與首期方案費用不同）',
+      );
+      err.statusCode = 400;
+      throw err;
+    }
+    const parsedRecurring = parseFloat(raw);
+    if (!Number.isFinite(parsedRecurring) || parsedRecurring <= 0) {
+      const err = new Error('定期定額扣款金額必須為正數');
+      err.statusCode = 400;
+      throw err;
+    }
+    recurringAmount = Math.round(parsedRecurring * 100) / 100;
   }
 
   return {
@@ -242,7 +259,41 @@ export function resolvePromotionFields(body, { partial = false, current = null }
     requiresMemberContract,
     enableCardRecurring,
     recurringAmount,
+    payuniPeriodHash: (() => {
+      if (!enableCardRecurring) return null;
+      const raw =
+        body.payuniPeriodHash !== undefined
+          ? body.payuniPeriodHash
+          : current?.payuniPeriodHash;
+      const s = raw == null ? '' : String(raw).trim();
+      return s || null;
+    })(),
+    payuniPeriodHashOnline: (() => {
+      if (!enableCardRecurring) return null;
+      const raw =
+        body.payuniPeriodHashOnline !== undefined
+          ? body.payuniPeriodHashOnline
+          : current?.payuniPeriodHashOnline;
+      const s = raw == null ? '' : String(raw).trim();
+      return s || null;
+    })(),
   };
+}
+
+/**
+ * 儲值定期定額後續扣款金額：方案設定優先；舊資料未填則回退首期 price
+ * @returns {number|null}
+ */
+export function resolvePromotionRecurringAmount(promotion) {
+  const stored = Number(promotion?.recurringAmount);
+  if (Number.isFinite(stored) && stored > 0) {
+    return Math.round(stored * 100) / 100;
+  }
+  const price = Number(promotion?.price);
+  if (Number.isFinite(price) && price > 0) {
+    return Math.round(price * 100) / 100;
+  }
+  return null;
 }
 
 export function isPromotionSellable(promotion, now = new Date()) {
@@ -300,8 +351,13 @@ export function computeMemberExpireDate(currentExpireDate, durationDays, now = n
     currentExpireDate && new Date(currentExpireDate) > now
       ? new Date(currentExpireDate)
       : new Date(now);
-  const expire = new Date(base);
-  expire.setDate(expire.getDate() + days);
+  // 起始日算第 1 天：以 base 當日 00:00 起算，第 days 天 23:59:59.999 截止
+  // 例：9/7 買 30 天 → 效期至 10/6 結束（含購日共 30 個日曆日）
+  const start = new Date(base);
+  start.setHours(0, 0, 0, 0);
+  const expire = new Date(start);
+  expire.setDate(expire.getDate() + days - 1);
+  expire.setHours(23, 59, 59, 999);
   return expire;
 }
 

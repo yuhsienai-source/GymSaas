@@ -1,8 +1,7 @@
-// routes/onboarding.js — 會員自助：手機查詢／OTP／註冊／合約簽署／裝置綁定
+// routes/onboarding.js — 會員自助：Email 查詢／OTP／註冊／合約簽署／裝置綁定
 import express from 'express';
 import prisma from '../lib/prisma.js';
-import { normalizePhone } from '../lib/memberIdentify.js';
-import { assertTaiwanMobile, sendPhoneOtp, verifyPhoneOtp } from '../lib/phoneOtp.js';
+import { assertMemberPhone } from '../lib/phoneOtp.js';
 import {
   issueOnboardingToken,
   issueMemberToken,
@@ -38,21 +37,59 @@ import {
   memberTokenDeviceOpts,
 } from '../lib/memberDevice.js';
 import { createRateLimiter } from '../middleware/rateLimit.js';
+import { normalizeEmail, sendEmailOtp, verifyEmailOtp, maskEmail } from '../lib/emailOtp.js';
+import {
+  normalizeIdPhotoSide,
+  uploadMemberIdPhoto,
+  getIdPhotoMetaForMember,
+} from '../lib/idPhoto.js';
+import { assertRequiredIdNumber, normalizeIdNumber } from '../lib/deviceReset.js';
+import { requestEmailEnroll, verifyEmailEnroll } from '../lib/emailEnroll.js';
 
 const router = express.Router();
 const otpSendLimiter = createRateLimiter({
   keyPrefix: 'onboarding-otp-send',
   windowMs: 10 * 60 * 1000,
   max: 8,
-  keyFn: (req) => `${req.ip || 'unknown'}:${String(req.body?.phone || '').trim()}`,
+  keyFn: (req) => {
+    const id = String(req.body?.identity || req.body?.email || req.body?.phone || '')
+      .trim()
+      .toLowerCase();
+    return `${req.ip || 'unknown'}:${id}`;
+  },
   message: '驗證碼發送過於頻繁，請稍後再試',
 });
 const otpVerifyLimiter = createRateLimiter({
   keyPrefix: 'onboarding-otp-verify',
   windowMs: 10 * 60 * 1000,
   max: 20,
-  keyFn: (req) => `${req.ip || 'unknown'}:${String(req.body?.phone || '').trim()}`,
+  keyFn: (req) => {
+    const id = String(req.body?.identity || req.body?.email || req.body?.phone || '')
+      .trim()
+      .toLowerCase();
+    return `${req.ip || 'unknown'}:${id}`;
+  },
   message: '驗證嘗試過於頻繁，請稍後再試',
+});
+const emailEnrollSendLimiter = createRateLimiter({
+  keyPrefix: 'onboarding-email-enroll-send',
+  windowMs: 10 * 60 * 1000,
+  max: 6,
+  keyFn: (req) => {
+    const phone = String(req.body?.phone || '').trim();
+    return `${req.ip || 'unknown'}:${phone}`;
+  },
+  message: 'Email 補登發送過於頻繁，請稍後再試',
+});
+const emailEnrollVerifyLimiter = createRateLimiter({
+  keyPrefix: 'onboarding-email-enroll-verify',
+  windowMs: 10 * 60 * 1000,
+  max: 15,
+  keyFn: (req) => {
+    const phone = String(req.body?.phone || '').trim();
+    return `${req.ip || 'unknown'}:${phone}`;
+  },
+  message: 'Email 補登驗證過於頻繁，請稍後再試',
 });
 
 function getBearer(req) {
@@ -65,7 +102,7 @@ function requireOnboarding(req, res, next) {
   try {
     const token = getBearer(req);
     if (!token) {
-      return res.status(401).json({ status: 'error', message: '請先完成手機驗證' });
+      return res.status(401).json({ status: 'error', message: '請先完成 Email 驗證' });
     }
     req.onboarding = verifyOnboardingToken(token);
     next();
@@ -91,6 +128,7 @@ function memberPublic(m) {
     memberNo: m.memberNo || null,
     name: m.name,
     phone: m.phone,
+    email: m.email || null,
     hasLineBound: Boolean(m.lineId),
     hasDeviceBound: Boolean(m.deviceId),
     faceEnabled: Boolean(m.faceEnabled),
@@ -99,17 +137,204 @@ function memberPublic(m) {
   };
 }
 
+/** 以已正規化 Email 查會員（多筆則拒） */
+async function findMemberByEmail(email) {
+  const rows = await prisma.member.findMany({
+    where: { email },
+    take: 2,
+  });
+  if (rows.length > 1) {
+    const err = new Error('此 Email 對應多筆帳號，請洽櫃檯');
+    err.statusCode = 409;
+    throw err;
+  }
+  return rows[0] || null;
+}
+
+function isRealMember(member) {
+  return Boolean(member) && !String(member.phone || '').startsWith('LINE_');
+}
+
+function maskPhone(phone) {
+  const p = String(phone || '');
+  if (p.length < 7) return '****';
+  return `${p.slice(0, 3)}****${p.slice(-3)}`;
+}
+
+function httpError(message, statusCode = 400, code) {
+  const err = new Error(message);
+  err.statusCode = statusCode;
+  if (code) err.code = code;
+  return err;
+}
+
+/**
+ * 手機＋證件號辨識新舊會員（入口主流程）
+ * @returns {Promise<{
+ *   kind: 'phone_id',
+ *   phone: string,
+ *   idNumber: string,
+ *   email: string|null,
+ *   member: object|null,
+ *   exists: boolean,
+ * }>}
+ */
+async function resolvePhoneIdLookup(body) {
+  let phone;
+  try {
+    phone = assertMemberPhone(body?.phone);
+  } catch {
+    throw httpError('請輸入有效手機號碼（台灣 09 開頭，或含國碼國際門號）', 400);
+  }
+  const idNumber = normalizeIdNumber(body?.idNumber);
+  if (!idNumber) {
+    throw httpError('請輸入有效的身分證／居留證／護照／國籍證件號碼', 400);
+  }
+
+  const member = await prisma.member.findUnique({ where: { phone } });
+
+  if (!isRealMember(member)) {
+    const idTaken = await prisma.member.findUnique({ where: { idNumber } });
+    if (idTaken && isRealMember(idTaken)) {
+      throw httpError(
+        '此證件號已有會員資料，請確認手機是否正確，或洽櫃檯',
+        409,
+        'ID_NUMBER_TAKEN',
+      );
+    }
+    return {
+      kind: 'phone_id',
+      phone,
+      idNumber,
+      email: null,
+      member: null,
+      exists: false,
+    };
+  }
+
+  const storedId = member.idNumber ? normalizeIdNumber(member.idNumber) : null;
+  if (!storedId || storedId !== idNumber) {
+    throw httpError('手機與證件資料不符，請確認後再試或洽櫃檯', 400, 'IDENTITY_MISMATCH');
+  }
+
+  let email = null;
+  if (member.email) {
+    try {
+      email = normalizeEmail(member.email);
+    } catch {
+      email = null;
+    }
+  }
+
+  return {
+    kind: 'phone_id',
+    phone,
+    idNumber,
+    email,
+    member,
+    exists: true,
+  };
+}
+
+/**
+ * 解析查詢鍵：Email 或台灣手機（body.identity｜email｜phone）
+ * @returns {Promise<{ kind: 'email'|'phone', email: string|null, phone: string|null, member: object|null }>}
+ */
+async function resolveAccountLookup(body) {
+  const raw = String(body?.identity || body?.email || body?.phone || '').trim();
+  if (!raw) {
+    throw httpError('請輸入手機號碼或 Email');
+  }
+
+  if (raw.includes('@')) {
+    const email = normalizeEmail(raw);
+    const member = await findMemberByEmail(email);
+    return {
+      kind: 'email',
+      email,
+      phone: member?.phone || null,
+      member,
+    };
+  }
+
+  const phone = assertMemberPhone(raw);
+  const member = await prisma.member.findUnique({ where: { phone } });
+  let email = null;
+  if (member?.email) {
+    try {
+      email = normalizeEmail(member.email);
+    } catch {
+      email = null;
+    }
+  }
+  return {
+    kind: 'phone',
+    email,
+    phone,
+    member,
+  };
+}
+
+/**
+ * 決定 OTP 寄送目標 Email（舊會員用檔案 Email；新客須直接輸入 Email）
+ */
+async function resolveOtpTarget(body) {
+  const looked = await resolveAccountLookup(body);
+  const exists = isRealMember(looked.member);
+
+  if (exists) {
+    if (!looked.email) {
+      throw httpError(
+        '此會員尚未登記 Email，請洽櫃檯補登後再登入，或改用 LINE 登入（若已綁定）',
+        400,
+        'EMAIL_MISSING',
+      );
+    }
+    const gate = await evaluateMemberOnboardingGate(looked.member);
+    const incomplete = gate.nextStep !== 'DONE';
+    return {
+      ...looked,
+      exists: true,
+      otpEmail: looked.email,
+      /** 未完成註冊一律走 REGISTER，完成後才 LOGIN */
+      purpose: incomplete ? 'REGISTER' : 'LOGIN',
+      registrationComplete: !incomplete,
+      nextStep: gate.nextStep,
+    };
+  }
+
+  if (looked.kind !== 'email' || !looked.email) {
+    throw httpError('查無此手機對應會員。新客請改以 Email 註冊', 404, 'MEMBER_NOT_FOUND');
+  }
+
+  return {
+    ...looked,
+    exists: false,
+    otpEmail: looked.email,
+    purpose: 'REGISTER',
+    registrationComplete: false,
+    nextStep: 'REGISTER_PROFILE',
+  };
+}
+
 async function buildOnboardingStatus(decoded) {
-  const phone = decoded.phone;
-  const member = decoded.memberId
-    ? await prisma.member.findUnique({ where: { id: decoded.memberId } })
-    : await prisma.member.findUnique({ where: { phone } });
+  const email = decoded.email ? String(decoded.email).toLowerCase() : null;
+  const phone = decoded.phone || null;
+  let member = null;
+  if (decoded.memberId) {
+    member = await prisma.member.findUnique({ where: { id: decoded.memberId } });
+  } else if (email) {
+    member = await findMemberByEmail(email);
+  } else if (phone) {
+    member = await prisma.member.findUnique({ where: { phone } });
+  }
 
   const isRegister = decoded.purpose === 'REGISTER';
   const isLogin = decoded.purpose === 'LOGIN';
 
-  if (!member) {
+  if (!member || !isRealMember(member)) {
     return {
+      email,
       phone,
       purpose: decoded.purpose,
       isNew: true,
@@ -124,7 +349,6 @@ async function buildOnboardingStatus(decoded) {
     };
   }
 
-  // 新舊會員只要進入 onboarding，皆須：人臉偏好 → 必簽契約 → 再綁定
   if (!isRegister && !isLogin) {
     // 非預期 purpose：仍依 gate 評估，避免略過簽署
   }
@@ -132,7 +356,8 @@ async function buildOnboardingStatus(decoded) {
   const gate = await evaluateMemberOnboardingGate(member);
 
   return {
-    phone,
+    email: member.email || email,
+    phone: member.phone || phone,
     purpose: decoded.purpose,
     isNew: false,
     member: memberPublic(member),
@@ -143,85 +368,259 @@ async function buildOnboardingStatus(decoded) {
     allContractsSigned: gate.allContractsSigned,
     missingNewMemberContract: gate.missingNewMemberContract,
     nextStep: gate.nextStep,
+    lineOptional: true,
+    hasLineBound: gate.hasLineBound,
+    idPhotosReady: gate.idPhotosReady,
   };
 }
 
-// POST /api/onboarding/lookup { phone }
+function nextStepLabel(nextStep) {
+  switch (String(nextStep || '')) {
+    case 'REGISTER_PROFILE':
+      return '尚未完成基本資料';
+    case 'CHOOSE_FACE':
+      return '尚未選擇是否使用生物辨識';
+    case 'SIGN_CONTRACTS':
+      return '尚未完成契約簽署';
+    case 'UPLOAD_ID_PHOTOS':
+      return '尚未上傳證件正／反面';
+    case 'BIND_LINE':
+      return '尚未綁定 LINE（選用）';
+    case 'BIND_DEVICE':
+      return '尚未綁定本機裝置';
+    case 'DONE':
+      return '註冊流程已完成';
+    default:
+      return '註冊流程未完成';
+  }
+}
+
+// POST /api/onboarding/lookup
+// 主流程：{ phone, idNumber } 辨識新舊；相容舊客戶端 { identity｜email｜phone }
 router.post('/lookup', async (req, res) => {
   try {
-    const phone = assertTaiwanMobile(req.body?.phone);
-    const member = await prisma.member.findUnique({
-      where: { phone },
-      select: { id: true, name: true, lineId: true, deviceId: true },
-    });
-    // 排除 LINE 佔位手機，視為新客
-    const isPlaceholder = member && String(member.phone || '').startsWith('LINE_');
-    const exists = Boolean(member) && !isPlaceholder;
+    const body = req.body || {};
+    const usePhoneId = Boolean(String(body.phone || '').trim() && String(body.idNumber || '').trim());
+
+    let looked;
+    if (usePhoneId) {
+      looked = await resolvePhoneIdLookup(body);
+    } else {
+      const legacy = await resolveAccountLookup(body);
+      looked = {
+        ...legacy,
+        idNumber: null,
+        exists: isRealMember(legacy.member),
+      };
+    }
+
+    const exists = Boolean(looked.exists && isRealMember(looked.member));
+    const hasEmail = Boolean(exists && looked.email);
+    const hasIdNumber = Boolean(
+      exists ? looked.member.idNumber : looked.idNumber || looked.kind === 'phone_id',
+    );
+    /** 無 Email、有手機、檔案已有證件 → 可自助補登 Email */
+    const canEmailEnroll = Boolean(exists && !hasEmail && looked.member.phone && hasIdNumber);
+    /** 新客（手機＋證件尚無帳號）→ 須先綁定並驗證 Email */
+    const needsEmail = Boolean(!exists && usePhoneId);
+    const canStartRegister = needsEmail;
+    const canSendOtp = exists ? hasEmail : looked.kind === 'email' && Boolean(looked.email);
+
+    let registrationComplete = false;
+    let nextStep = null;
+    let nextStepHint = null;
+    let gateSnapshot = null;
+
+    if (exists) {
+      const gate = await evaluateMemberOnboardingGate(looked.member);
+      registrationComplete = gate.nextStep === 'DONE';
+      nextStep = gate.nextStep;
+      nextStepHint = nextStepLabel(gate.nextStep);
+      gateSnapshot = {
+        facePreferenceReady: gate.facePreferenceReady,
+        allContractsSigned: gate.allContractsSigned,
+        idPhotosReady: gate.idPhotosReady,
+        hasLineBound: Boolean(looked.member.lineId),
+        hasDeviceBound: Boolean(looked.member.deviceId),
+        missingNewMemberContract: gate.missingNewMemberContract,
+      };
+    }
+
+    let hint = '';
+    /** 前端分頁：未完成註冊一律導向 register；已完成導向 login；新客導向 register */
+    let suggestedAuthMode = 'register';
+    if (exists && hasEmail) {
+      if (registrationComplete) {
+        suggestedAuthMode = 'login';
+        hint = `歡迎回來，${maskName(looked.member.name)}。驗證碼將寄至 ${maskEmail(looked.email)}`;
+      } else {
+        suggestedAuthMode = 'register';
+        hint = `歡迎回來，${maskName(looked.member.name)}。註冊尚未完成（${nextStepHint}），請先驗證 Email 後繼續填寫會員資料。驗證碼將寄至 ${maskEmail(looked.email)}`;
+      }
+    } else if (exists && !hasEmail) {
+      suggestedAuthMode = registrationComplete ? 'login' : 'register';
+      if (canEmailEnroll) {
+        hint = registrationComplete
+          ? `歡迎回來，${maskName(looked.member.name)}。尚未綁定 Email，請先補登並驗證 Email`
+          : `歡迎回來，${maskName(looked.member.name)}。註冊尚未完成（${nextStepHint}），且尚未綁定 Email。請先補登並驗證 Email，再完成會員資料`;
+      } else {
+        hint = registrationComplete
+          ? '此帳號尚未登記 Email，且無法自助核身。請洽櫃檯補登，或改用已綁定的 LINE 登入'
+          : `此帳號註冊尚未完成（${nextStepHint}），且尚未登記 Email。請洽櫃檯補登後再繼續，或改用已綁定的 LINE 登入`;
+      }
+    } else if (needsEmail) {
+      suggestedAuthMode = 'register';
+      hint = '查無此會員。請先綁定並驗證 Email，再完成註冊資料（LINE 為選用，可於之後綁定）';
+    } else if (looked.kind === 'phone') {
+      suggestedAuthMode = 'register';
+      hint = '查無此手機對應會員。請改以手機＋證件號開始註冊，或輸入 Email';
+    } else {
+      suggestedAuthMode = 'register';
+      hint = '尚未註冊，下一步將寄送註冊驗證碼至此 Email';
+    }
+
     res.json({
       status: 'success',
       data: {
         exists,
-        maskedName: exists ? maskName(member.name) : null,
-        hasLineBound: exists ? Boolean(member.lineId) : false,
-        hasDeviceBound: exists ? Boolean(member.deviceId) : false,
+        lookupKind: looked.kind,
+        maskedName: exists ? maskName(looked.member.name) : null,
+        maskedEmail: hasEmail
+          ? maskEmail(looked.email)
+          : looked.kind === 'email'
+            ? maskEmail(looked.email)
+            : null,
+        maskedPhone:
+          exists && looked.member.phone
+            ? maskPhone(looked.member.phone)
+            : looked.phone
+              ? maskPhone(looked.phone)
+              : null,
+        phone: looked.phone || null,
+        hasEmail,
+        hasIdNumber,
+        canEmailEnroll,
+        canSendOtp,
+        canStartRegister,
+        needsEmail,
+        hasLineBound: exists ? Boolean(looked.member.lineId) : false,
+        hasDeviceBound: exists ? Boolean(looked.member.deviceId) : false,
+        registrationComplete,
+        nextStep,
+        nextStepHint,
+        registration: gateSnapshot,
+        suggestedAuthMode,
+        hint,
+        otpEmail: canSendOtp ? looked.email : null,
+        enrollPhone: canEmailEnroll
+          ? looked.member.phone
+          : needsEmail
+            ? looked.phone
+            : null,
       },
     });
   } catch (error) {
     res.status(error.statusCode || 500).json({
       status: 'error',
+      code: error.code || undefined,
       message: error.message || '查詢失敗',
     });
   }
 });
 
-// POST /api/onboarding/otp/send { phone }
-router.post('/otp/send', otpSendLimiter, async (req, res) => {
+// POST /api/onboarding/email-enroll/request { phone, idNumber, email }
+// 舊會員無 Email：手機＋檔案證件相符後，寄補登驗證碼至新 Email（尚未寫入 DB）
+router.post('/email-enroll/request', emailEnrollSendLimiter, async (req, res) => {
   try {
-    const phone = assertTaiwanMobile(req.body?.phone);
-    const member = await prisma.member.findUnique({ where: { phone } });
-    const isPlaceholder = member && String(member.phone || '').startsWith('LINE_');
-    const exists = Boolean(member) && !isPlaceholder;
-    const purpose = exists ? 'LOGIN' : 'REGISTER';
-    const sent = await sendPhoneOtp(phone, purpose, {
-      memberId: exists ? member.id : null,
-    });
+    const data = await requestEmailEnroll(req.body || {});
     res.json({
       status: 'success',
-      message: sent.message,
+      message: data.message,
       data: {
-        exists,
-        purpose,
-        expiresInSec: sent.expiresInSec,
-        ...(sent.devCode ? { devCode: sent.devCode } : {}),
+        maskedEmail: data.maskedEmail,
+        otpEmail: data.otpEmail,
+        expiresInSec: data.expiresInSec,
+        ...(data.devCode ? { devCode: data.devCode } : {}),
+        ...(data.mock ? { mock: true } : {}),
       },
     });
   } catch (error) {
     res.status(error.statusCode || 500).json({
       status: 'error',
+      code: error.code || undefined,
+      message: error.message || '無法寄送 Email 補登驗證碼',
+    });
+  }
+});
+
+// POST /api/onboarding/email-enroll/verify { phone, idNumber, email, code }
+// 驗證通過後寫入 Member.email，發 onboarding JWT，並回傳註冊完成度／未完步驟
+router.post('/email-enroll/verify', emailEnrollVerifyLimiter, async (req, res) => {
+  try {
+    const data = await verifyEmailEnroll(req.body || {}, buildOnboardingStatus);
+    res.json({
+      status: 'success',
+      message: data.message,
+      data,
+    });
+  } catch (error) {
+    res.status(error.statusCode || 500).json({
+      status: 'error',
+      code: error.code || undefined,
+      message: error.message || 'Email 補登驗證失敗',
+    });
+  }
+});
+
+// POST /api/onboarding/otp/send { identity｜email｜phone }
+router.post('/otp/send', otpSendLimiter, async (req, res) => {
+  try {
+    const target = await resolveOtpTarget(req.body || {});
+    const sent = await sendEmailOtp(target.otpEmail, target.purpose, {
+      memberId: target.exists ? target.member.id : null,
+    });
+    res.json({
+      status: 'success',
+      message: sent.message,
+      data: {
+        exists: target.exists,
+        purpose: target.purpose,
+        registrationComplete: target.registrationComplete ?? null,
+        nextStep: target.nextStep || null,
+        lookupKind: target.kind,
+        maskedEmail: sent.maskedEmail,
+        otpEmail: target.otpEmail,
+        expiresInSec: sent.expiresInSec,
+        ...(sent.devCode ? { devCode: sent.devCode } : {}),
+        ...(sent.mock ? { mock: true } : {}),
+      },
+    });
+  } catch (error) {
+    res.status(error.statusCode || 500).json({
+      status: 'error',
+      code: error.code || undefined,
       message: error.message || '發送驗證碼失敗',
     });
   }
 });
 
-// POST /api/onboarding/otp/verify { phone, code }
+// POST /api/onboarding/otp/verify { identity｜email｜phone, code }
 router.post('/otp/verify', otpVerifyLimiter, async (req, res) => {
   try {
-    const phone = assertTaiwanMobile(req.body?.phone);
-    const member = await prisma.member.findUnique({ where: { phone } });
-    const isPlaceholder = member && String(member.phone || '').startsWith('LINE_');
-    const exists = Boolean(member) && !isPlaceholder;
-    const purpose = exists ? 'LOGIN' : 'REGISTER';
-    await verifyPhoneOtp(phone, req.body?.code, purpose);
+    const target = await resolveOtpTarget(req.body || {});
+    await verifyEmailOtp(target.otpEmail, req.body?.code, target.purpose);
 
     const token = issueOnboardingToken({
-      phone,
-      memberId: exists ? member.id : null,
-      purpose,
+      email: target.otpEmail,
+      phone: target.exists ? target.member.phone : target.phone,
+      memberId: target.exists ? target.member.id : null,
+      purpose: target.purpose,
     });
     const status = await buildOnboardingStatus({
-      phone,
-      memberId: exists ? member.id : null,
-      purpose,
+      email: target.otpEmail,
+      phone: target.exists ? target.member.phone : target.phone,
+      memberId: target.exists ? target.member.id : null,
+      purpose: target.purpose,
     });
 
     let memberToken = null;
@@ -235,7 +634,7 @@ router.post('/otp/verify', otpVerifyLimiter, async (req, res) => {
 
     res.json({
       status: 'success',
-      message: '手機驗證成功',
+      message: 'Email 驗證成功',
       data: {
         onboardingToken: token,
         ...status,
@@ -245,6 +644,7 @@ router.post('/otp/verify', otpVerifyLimiter, async (req, res) => {
   } catch (error) {
     res.status(error.statusCode || 500).json({
       status: 'error',
+      code: error.code || undefined,
       message: error.message || '驗證失敗',
     });
   }
@@ -283,10 +683,12 @@ router.get('/branches', requireOnboarding, async (req, res) => {
 });
 
 // POST /api/onboarding/register
-// Body: { name, emergencyContact, emergencyContactPhone, faceEnabled?, branchId }
+// Body: { name, phone, emergencyContact, emergencyContactPhone, faceEnabled?, branchId, idNumber }
+// email 取自 onboarding JWT（Email OTP 已驗證），禁止前端另傳改寫
+// phone、idNumber 必填；外國客 idNumber 可填居留證或護照
 router.post('/register', requireOnboarding, async (req, res) => {
   try {
-    const { phone, purpose, memberId } = req.onboarding;
+    const { email: tokenEmail, purpose, memberId } = req.onboarding;
     if (purpose !== 'REGISTER' || memberId) {
       return res.status(400).json({
         status: 'error',
@@ -294,23 +696,45 @@ router.post('/register', requireOnboarding, async (req, res) => {
       });
     }
 
+    const email = normalizeEmail(tokenEmail);
     const name = String(req.body?.name || '').trim();
+    let phone;
+    try {
+      phone = assertMemberPhone(req.body?.phone);
+    } catch (e) {
+      return res.status(400).json({
+        status: 'error',
+        message: e.message || '請填寫有效的手機號碼',
+      });
+    }
     const emergencyContact = String(req.body?.emergencyContact || '').trim();
-    const emergencyContactPhone = normalizePhone(req.body?.emergencyContactPhone || '');
+    let emergencyContactPhone;
+    try {
+      emergencyContactPhone = assertMemberPhone(req.body?.emergencyContactPhone);
+    } catch (e) {
+      return res.status(400).json({
+        status: 'error',
+        message: e.message || '請填寫有效的緊急聯絡人手機',
+      });
+    }
     const faceEnabled = Boolean(req.body?.faceEnabled);
     const branch = await assertSelfRegisterBranchId(req.body?.branchId);
+
+    let idNumber;
+    try {
+      idNumber = assertRequiredIdNumber(req.body?.idNumber);
+    } catch (e) {
+      return res.status(400).json({
+        status: 'error',
+        message: e.message || '請填寫有效證件號（身分證／居留證／護照）',
+      });
+    }
 
     if (!name || name.length < 2) {
       return res.status(400).json({ status: 'error', message: '請填寫真實姓名（至少 2 字）' });
     }
     if (!emergencyContact) {
       return res.status(400).json({ status: 'error', message: '請填寫緊急聯絡人' });
-    }
-    if (!/^09\d{8}$/.test(emergencyContactPhone)) {
-      return res.status(400).json({
-        status: 'error',
-        message: '請填寫有效的緊急聯絡人手機（09 開頭 10 碼）',
-      });
     }
 
     if (faceEnabled) {
@@ -324,9 +748,19 @@ router.post('/register', requireOnboarding, async (req, res) => {
       }
     }
 
+    const emailTaken = await findMemberByEmail(email);
+    if (isRealMember(emailTaken)) {
+      return res.status(409).json({ status: 'error', message: '此 Email 已註冊，請改走登入' });
+    }
+
     const existing = await prisma.member.findUnique({ where: { phone } });
     if (existing && !String(existing.phone).startsWith('LINE_')) {
-      return res.status(409).json({ status: 'error', message: '此手機已註冊，請改走舊會員登入' });
+      return res.status(409).json({ status: 'error', message: '此手機已註冊，請洽櫃檯或改走登入' });
+    }
+
+    const idTaken = await prisma.member.findUnique({ where: { idNumber } });
+    if (idTaken) {
+      return res.status(409).json({ status: 'error', message: '此證件號已註冊，請洽櫃檯' });
     }
 
     const memberNo = await allocateUniqueMemberNo();
@@ -336,6 +770,8 @@ router.post('/register', requireOnboarding, async (req, res) => {
           memberNo,
           name,
           phone,
+          email,
+          idNumber,
           emergencyContact,
           emergencyContactPhone,
           plan: '計時會員',
@@ -362,11 +798,13 @@ router.post('/register', requireOnboarding, async (req, res) => {
     }
 
     const token = issueOnboardingToken({
+      email,
       phone,
       memberId: member.id,
       purpose: 'REGISTER',
     });
     const status = await buildOnboardingStatus({
+      email,
       phone,
       memberId: member.id,
       purpose: 'REGISTER',
@@ -379,7 +817,7 @@ router.post('/register', requireOnboarding, async (req, res) => {
     });
   } catch (error) {
     if (error.code === 'P2002') {
-      return res.status(409).json({ status: 'error', message: '此手機已被使用' });
+      return res.status(409).json({ status: 'error', message: '此手機或 Email 已被使用' });
     }
     console.error(error);
     res.status(error.statusCode || 500).json({
@@ -397,7 +835,7 @@ router.post('/face-preference', requireOnboarding, async (req, res) => {
     if (!memberId) {
       return res.status(400).json({
         status: 'error',
-        message: '請先完成基本資料或手機驗證',
+        message: '請先完成基本資料或 Email 驗證',
       });
     }
     if (req.body?.faceEnabled === undefined) {
@@ -705,6 +1143,77 @@ router.post('/contracts/:signId/sign', requireOnboarding, async (req, res) => {
   }
 });
 
+// POST /api/onboarding/id-photo — 註冊必傳證件正／反面（onboarding JWT）
+// Body: { image|dataUrl, side?: front|back, consent: true }
+router.post('/id-photo', requireOnboarding, async (req, res) => {
+  try {
+    const memberId = req.onboarding.memberId;
+    if (!memberId) {
+      return res.status(400).json({ status: 'error', message: '請先完成基本資料' });
+    }
+    if (req.body?.consent !== true && req.body?.consent !== 'true') {
+      return res.status(400).json({
+        status: 'error',
+        message: '請確認已閱讀證件蒐集告知並同意後再上傳',
+      });
+    }
+
+    const statusBefore = await buildOnboardingStatus(req.onboarding);
+    if (!statusBefore.allContractsSigned || statusBefore.nextStep === 'CHOOSE_FACE') {
+      return res.status(400).json({
+        status: 'error',
+        message: '請先完成人臉偏好與會員契約簽署後再上傳證件',
+      });
+    }
+
+    const side = normalizeIdPhotoSide(req.body?.side || 'front');
+    const saved = await uploadMemberIdPhoto(
+      memberId,
+      req.body?.image || req.body?.dataUrl,
+      side,
+      req,
+    );
+    const status = await buildOnboardingStatus(req.onboarding);
+    res.json({
+      status: 'success',
+      message: side === 'back' ? '證件反面已上傳' : '證件正面已上傳',
+      data: {
+        ...status,
+        side,
+        bytes: saved.bytes,
+        photoId: saved.photoId,
+        retentionUntil: saved.retentionUntil,
+      },
+    });
+  } catch (error) {
+    res.status(error.statusCode || 500).json({
+      status: 'error',
+      message: error.message || '上傳證件失敗',
+    });
+  }
+});
+
+// GET /api/onboarding/id-photo/meta
+router.get('/id-photo/meta', requireOnboarding, async (req, res) => {
+  try {
+    const memberId = req.onboarding.memberId;
+    if (!memberId) {
+      return res.status(400).json({ status: 'error', message: '請先完成基本資料' });
+    }
+    const meta = await getIdPhotoMetaForMember(memberId);
+    const status = await buildOnboardingStatus(req.onboarding);
+    res.json({
+      status: 'success',
+      data: { ...meta, idPhotosReady: status.idPhotosReady, nextStep: status.nextStep },
+    });
+  } catch (error) {
+    res.status(error.statusCode || 500).json({
+      status: 'error',
+      message: error.message || '讀取證件狀態失敗',
+    });
+  }
+});
+
 // POST /api/onboarding/bind-device { deviceId }
 router.post('/bind-device', requireOnboarding, async (req, res) => {
   try {
@@ -718,12 +1227,18 @@ router.post('/bind-device', requireOnboarding, async (req, res) => {
     }
 
     const statusBefore = await buildOnboardingStatus(req.onboarding);
-    if (!statusBefore.allContractsSigned || statusBefore.nextStep === 'CHOOSE_FACE') {
+    if (
+      !statusBefore.allContractsSigned ||
+      statusBefore.nextStep === 'CHOOSE_FACE' ||
+      statusBefore.nextStep === 'UPLOAD_ID_PHOTOS'
+    ) {
       return res.status(400).json({
         status: 'error',
         message: statusBefore.missingNewMemberContract
           ? '尚未設定啟用中的「新會員」入會契約，請洽櫃檯／總部建立後再繼續'
-          : '請先選擇是否使用生物辨識並完成會員契約簽署',
+          : statusBefore.nextStep === 'UPLOAD_ID_PHOTOS'
+            ? '請先上傳證件正／反面後再綁定裝置'
+            : '請先選擇是否使用生物辨識並完成會員契約簽署',
       });
     }
 
@@ -732,13 +1247,6 @@ router.post('/bind-device', requireOnboarding, async (req, res) => {
       return res.status(404).json({ status: 'error', message: '找不到會員' });
     }
     await assertMemberReadyToBind(member);
-    if (!member.lineId) {
-      return res.status(400).json({
-        status: 'error',
-        message: '請先綁定 LINE（綁定 LINE 時會一併綁定本機裝置）',
-        data: { nextStep: 'BIND_LINE' },
-      });
-    }
     if (member.deviceId && member.deviceId !== deviceId) {
       return res.status(403).json({
         status: 'error',
@@ -746,7 +1254,7 @@ router.post('/bind-device', requireOnboarding, async (req, res) => {
       });
     }
 
-    const bindPatch = deviceBindUpdateIfChanged(member.deviceId, deviceId);
+    const bindPatch = deviceBindUpdateIfChanged(member.deviceId, deviceId, memberId);
     const updated = bindPatch
       ? await prisma.member.update({
           where: { id: memberId },
@@ -759,9 +1267,9 @@ router.post('/bind-device', requireOnboarding, async (req, res) => {
       memberId: updated.id,
     });
 
-    // LINE + 裝置皆完成 → 發會員 JWT（內嵌目前裝置碼，改綁後舊票失效）
+    // 契約完成＋本機裝置 → 發會員 JWT（LINE 選用，外國客可略過）
     let memberToken = null;
-    if (updated.lineId && updated.deviceId) {
+    if (updated.deviceId) {
       memberToken = issueMemberToken(updated.id, memberTokenDeviceOpts(updated));
     }
 
@@ -790,12 +1298,18 @@ router.get('/line-login-url', requireOnboarding, async (req, res) => {
       return res.status(400).json({ status: 'error', message: '請先完成基本資料' });
     }
     const status = await buildOnboardingStatus(req.onboarding);
-    if (!status.allContractsSigned || status.nextStep === 'CHOOSE_FACE') {
+    if (
+      !status.allContractsSigned ||
+      status.nextStep === 'CHOOSE_FACE' ||
+      status.nextStep === 'UPLOAD_ID_PHOTOS'
+    ) {
       return res.status(400).json({
         status: 'error',
         message: status.missingNewMemberContract
           ? '尚未設定啟用中的「新會員」入會契約，請洽櫃檯／總部建立後再繼續'
-          : '請先選擇是否使用生物辨識並完成會員契約簽署',
+          : status.nextStep === 'UPLOAD_ID_PHOTOS'
+            ? '請先上傳證件正／反面後再綁定 LINE'
+            : '請先選擇是否使用生物辨識並完成會員契約簽署',
       });
     }
 
@@ -808,6 +1322,7 @@ router.get('/line-login-url', requireOnboarding, async (req, res) => {
     const state = issueLineBindState({
       memberId,
       phone: req.onboarding.phone,
+      email: req.onboarding.email,
     });
     const url =
       `https://access.line.me/oauth2/v2.1/authorize?response_type=code` +

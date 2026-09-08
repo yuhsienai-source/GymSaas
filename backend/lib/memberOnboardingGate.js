@@ -62,35 +62,37 @@ export function hasFacePreference(member) {
   return false;
 }
 
+/** 新會員必傳證件正／反面（Member 標記欄或現行檔） */
+export function hasIdPhotosReady(member) {
+  if (!member) return false;
+  return Boolean(member.idPhotoUrl) && Boolean(member.idPhotoBackUrl);
+}
+
 /**
- * 評估會員是否可進入綁定／發 JWT（一律：人臉偏好 → 必簽契約 → 綁定）
- * @returns {{
- *   faceEnabled: boolean,
- *   facePreferenceReady: boolean,
- *   contracts: object[],
- *   needContracts: boolean,
- *   allContractsSigned: boolean,
- *   missingNewMemberContract: boolean,
- *   nextStep: string,
- *   canBind: boolean,
- * }}
+ * 評估會員是否可進入綁定／發 JWT
+ * 一律：人臉偏好 → 必簽契約 → 證件正／反面 → 綁裝置（LINE 選用）
  */
 export async function evaluateMemberOnboardingGate(member, db = prisma) {
   if (!member) {
     return {
       faceEnabled: false,
       facePreferenceReady: false,
+      idPhotosReady: false,
       contracts: [],
       needContracts: false,
       allContractsSigned: false,
       missingNewMemberContract: false,
       nextStep: 'REGISTER_PROFILE',
       canBind: false,
+      hasLineBound: false,
+      lineOptional: true,
     };
   }
 
   const faceEnabled = Boolean(member.faceEnabled);
   const facePreferenceReady = hasFacePreference(member);
+  /** 新註冊必傳正／反面；已綁裝置之舊會員豁免，避免鎖死既有帳號 */
+  const idPhotosReady = hasIdPhotosReady(member) || Boolean(member.deviceId);
   const contracts = await loadOnboardingContracts(
     { includeBiometrics: facePreferenceReady && faceEnabled },
     db,
@@ -128,29 +130,32 @@ export async function evaluateMemberOnboardingGate(member, db = prisma) {
   const allContractsSigned =
     contractsStatus.length > 0 && contractsStatus.every((c) => c.signed);
 
-  const mustBindLine = !member.lineId;
+  // LINE 選用；契約＋證件完成後綁本機裝置
   let nextStep = 'DONE';
   if (!facePreferenceReady) {
     nextStep = 'CHOOSE_FACE';
   } else if (!allContractsSigned) {
     nextStep = 'SIGN_CONTRACTS';
-  } else if (mustBindLine) {
-    nextStep = 'BIND_LINE';
+  } else if (!idPhotosReady) {
+    nextStep = 'UPLOAD_ID_PHOTOS';
   } else if (!member.deviceId) {
     nextStep = 'BIND_DEVICE';
   }
 
-  const canBind = facePreferenceReady && allContractsSigned;
+  const canBind = facePreferenceReady && allContractsSigned && idPhotosReady;
 
   return {
     faceEnabled,
     facePreferenceReady,
+    idPhotosReady,
     contracts: contractsStatus,
     needContracts,
     allContractsSigned,
     missingNewMemberContract,
     nextStep,
     canBind,
+    hasLineBound: Boolean(member.lineId),
+    lineOptional: true,
   };
 }
 
@@ -160,10 +165,12 @@ export async function assertMemberReadyToBind(member, db = prisma) {
   if (!gate.canBind) {
     const err = new Error(
       gate.nextStep === 'CHOOSE_FACE'
-        ? '請先選擇是否使用生物辨識功能，並完成會員契約簽署後再綁定'
-        : gate.missingNewMemberContract
-          ? '尚未設定啟用中的「新會員」入會契約，請洽櫃檯／總部建立後再繼續'
-          : '請先完成會員契約簽署後再綁定 LINE／裝置',
+        ? '請先選擇是否使用生物辨識功能，並完成會員契約簽署與證件上傳後再綁定'
+        : gate.nextStep === 'UPLOAD_ID_PHOTOS'
+          ? '請先上傳證件正／反面後再綁定裝置'
+          : gate.missingNewMemberContract
+            ? '尚未設定啟用中的「新會員」入會契約，請洽櫃檯／總部建立後再繼續'
+            : '請先完成會員契約簽署與證件上傳後再綁定 LINE／裝置',
     );
     err.statusCode = 400;
     err.gate = gate;
@@ -173,7 +180,7 @@ export async function assertMemberReadyToBind(member, db = prisma) {
 }
 
 /**
- * LINE 登入發 JWT 前：契約未完成則拒絕（須改走手機驗證完成簽署）
+ * LINE 登入發 JWT 前：契約未完成則拒絕（須改走 Email OTP 完成簽署）
  * 僅缺裝置時仍可登入（needDevice）
  */
 export async function assertMemberReadyForLineLogin(member, db = prisma) {
@@ -181,9 +188,15 @@ export async function assertMemberReadyForLineLogin(member, db = prisma) {
   if (gate.nextStep === 'CHOOSE_FACE' || gate.nextStep === 'SIGN_CONTRACTS') {
     const err = new Error(
       gate.nextStep === 'CHOOSE_FACE'
-        ? '請先以手機號碼驗證，選擇是否使用生物辨識並完成會員契約簽署後，再使用 LINE 登入'
-        : '請先以手機號碼驗證並完成會員契約簽署後，再使用 LINE 登入',
+        ? '請先以 Email 驗證，選擇是否使用生物辨識並完成會員契約簽署後，再使用 LINE 登入'
+        : '請先以 Email 驗證並完成會員契約簽署後，再使用 LINE 登入',
     );
+    err.statusCode = 403;
+    err.gate = gate;
+    throw err;
+  }
+  if (gate.nextStep === 'UPLOAD_ID_PHOTOS') {
+    const err = new Error('請先上傳證件正／反面後，再使用 LINE 登入');
     err.statusCode = 403;
     err.gate = gate;
     throw err;
