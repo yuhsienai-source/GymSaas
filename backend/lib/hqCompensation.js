@@ -9,6 +9,8 @@ import {
 } from './promotion.js';
 import { isCompensationCoursePlan } from './coursePlan.js';
 import { staffBranchLabel } from './branchLabel.js';
+import { isManagerTrainer } from './orgStructure.js';
+import { WALLET_MODE, WALLET_TX, mutateMemberWallet } from './walletMutation.js';
 
 export const HQ_COMPENSATION_ACTIONS = ['BONUS', 'EXPIRE', 'CLEAR_ALERT', 'COURSE'];
 
@@ -165,11 +167,18 @@ export async function grantCompensationBonus({
       throw httpError('客訴補償專案 bonusGiven 必須大於 0');
     }
 
-    const updatedMember = await tx.member.update({
-      where: { id: mid },
-      data: { bonusWallet: { increment: bonusAdded } },
-      select: memberSelect,
+    await mutateMemberWallet(tx, {
+      memberId: mid,
+      txType: WALLET_TX.HQ_COMPENSATION,
+      mode: WALLET_MODE.CREDIT_BUCKETS,
+      cashDelta: 0,
+      bonusDelta: bonusAdded,
+      reason: `總部客訴補償 ${promotion.name}：${reasonText}`,
+      refType: 'HQ_COMPENSATION',
+      refId: pid,
+      staffId: actorStaffId,
     });
+    const updatedMember = await tx.member.findUnique({ where: { id: mid }, select: memberSelect });
 
     const log = await writeLog(tx, {
       action: 'BONUS',
@@ -374,7 +383,7 @@ export async function grantCompensationCourse({
       throw httpError('找不到此教練或教練已停用', 404);
     }
     const trainerBranchIds = new Set(trainer.branches.map((b) => b.branchId));
-    if (trainer.role !== 'MANAGER' && !trainerBranchIds.has(plan.branchId)) {
+    if (!isManagerTrainer(trainer) && !trainerBranchIds.has(plan.branchId)) {
       throw httpError(
         `教練無權承接分店「${staffBranchLabel(plan.branch) || plan.branchId}」的補償課程`,
         403,

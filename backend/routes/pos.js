@@ -5,14 +5,12 @@ import { verifyStaff, requirePermission } from '../middleware/jwtAuth.js';
 import { assertBranchAccess, branchListWhere } from '../lib/staffAccess.js';
 import { coercePaymentsFromBody, POS_PAY_METHODS } from '../lib/compositePay.js';
 import { normalizeInvoiceOptions } from '../lib/ezpay.js';
-import {
-  buildPosLines,
-  deductSaleStock,
-  generateSaleId,
-  tryIssueSaleInvoice,
-  abortPaidSaleAfterInvoiceFailure,
-} from '../lib/inventory.js';
+import { buildPosLines, deductSaleStock, generateSaleId, effectivePrice } from '../lib/inventory.js';
+import { issueSaleInvoice, saveInvoiceRequest } from '../lib/einvoice.js';
+import { resolveBranchLegalEntity } from '../lib/legalEntity.js';
 import { staffBranchLabel } from '../lib/branchLabel.js';
+import { lockOpenShiftForSale } from '../lib/shiftHandover.js';
+import { payWithCashWallet } from '../lib/walletMutation.js';
 
 const router = express.Router();
 router.use(verifyStaff, requirePermission('ops'));
@@ -45,20 +43,25 @@ router.get('/products', async (req, res) => {
 
     assertBranchAccess(req, branchId);
 
-    const products = await prisma.product.findMany({
-      where: { branchId, isActive: true },
-      select: {
-        id: true,
-        sku: true,
-        name: true,
-        price: true,
-        stockQty: true,
-        productKind: true,
-        branchId: true,
-      },
-      orderBy: { id: 'asc' },
+    const stocks = await prisma.branchStock.findMany({
+      where: { branchId, isListed: true, product: { isActive: true } },
+      include: { product: true },
+      orderBy: { productId: 'asc' },
     });
-    res.json({ status: 'success', data: products });
+    res.json({
+      status: 'success',
+      data: stocks.map((s) => ({
+        id: s.product.id,
+        sku: s.product.sku,
+        barcode: s.product.barcode,
+        name: s.product.name,
+        price: effectivePrice(s, s.product),
+        stockQty: s.onHand,
+        productKind: s.product.productKind,
+        taxType: s.product.taxType,
+        branchId: s.branchId,
+      })),
+    });
   } catch (error) {
     console.error(error);
     res.status(500).json({ status: 'error', message: '讀取可售商品失敗' });
@@ -244,6 +247,7 @@ router.post('/pos/checkout', async (req, res) => {
     }
 
     const result = await prisma.$transaction(async (tx) => {
+      await lockOpenShiftForSale(tx, parsedBranchId);
       const built = await buildPosLines(tx, parsedBranchId, lineDraft);
       let parsedMemberId = null;
       let member = null;
@@ -263,27 +267,25 @@ router.post('/pos/checkout', async (req, res) => {
         }
       }
 
+      const saleId = generateSaleId();
       if (pay.walletAmount > 0) {
         if (!member) {
           const err = new Error('零錢包付款必須指定會員');
           err.statusCode = 400;
           throw err;
         }
-        if (member.cashWallet < pay.walletAmount) {
-          const err = new Error(
-            `零錢包（本金）不足（餘額 $${member.cashWallet}，應付 $${pay.walletAmount}）；運動金不可折抵`,
-          );
-          err.statusCode = 400;
-          throw err;
-        }
-        await tx.member.update({
-          where: { id: member.id },
-          data: { cashWallet: { decrement: pay.walletAmount } },
+        await payWithCashWallet(tx, {
+          memberId: member.id,
+          amount: pay.walletAmount,
+          refType: 'SALE',
+          refId: saleId,
+          staffId,
+          branchId: parsedBranchId,
         });
       }
 
       const status = pay.needsOnlinePay ? 'PENDING' : 'PAID';
-      const saleId = generateSaleId();
+      const entity = await resolveBranchLegalEntity(parsedBranchId, tx);
       const sale = await tx.saleOrder.create({
         data: {
           id: saleId,
@@ -300,9 +302,7 @@ router.post('/pos/checkout', async (req, res) => {
           status,
           amount: built.amount,
           itemDesc: built.itemDesc,
-          carrierNum: invoiceOpts.carrierNum,
-          buyerUbn: invoiceOpts.buyerUbn,
-          loveCode: invoiceOpts.loveCode,
+          legalEntityId: entity.id,
           staffId,
           items: {
             create: built.lines.map((l) => ({
@@ -311,6 +311,7 @@ router.post('/pos/checkout', async (req, res) => {
               unitPrice: l.unitPrice,
               qty: l.qty,
               lineTotal: l.lineTotal,
+              taxType: l.taxType,
             })),
           },
         },
@@ -318,6 +319,13 @@ router.post('/pos/checkout', async (req, res) => {
           items: true,
           member: { select: { id: true, name: true, cashWallet: true } },
         },
+      });
+
+      await saveInvoiceRequest(tx, {
+        refType: 'SALE',
+        refId: saleId,
+        buyerName: member?.name || null,
+        ...invoiceOpts,
       });
 
       // 含乙禾／線上待付時庫存等確認；純現金／錢包／抵用券當場扣庫
@@ -357,18 +365,20 @@ router.post('/pos/checkout', async (req, res) => {
       });
     }
 
-    let invoiceNumber = null;
-    try {
-      invoiceNumber = await tryIssueSaleInvoice(result, result.member?.name);
-    } catch (invErr) {
-      await abortPaidSaleAfterInvoiceFailure(result.id, staffId, invErr.message);
-      throw invErr;
-    }
+    // 已收款：開票失敗只入佇列，不沖回
+    const inv = await issueSaleInvoice(result.id);
+    const invoiceNumber = inv.invoiceNumber;
 
     res.json({
       status: 'success',
-      message: `結帳成功（${pay.payMethodLabel}）`,
+      ...(inv.code === 'PARTIAL_INVOICE' ? { code: 'PARTIAL_INVOICE' } : {}),
+      message:
+        inv.code === 'PARTIAL_INVOICE'
+          ? `結帳成功（${pay.payMethodLabel}），但電子發票開立失敗，已排入自動補開：${inv.message || ''}`
+          : `結帳成功（${pay.payMethodLabel}）`,
       data: {
+        invoiceOutcome: inv.code,
+        invoices: inv.invoices,
         saleId: result.id,
         amount: result.amount,
         payMethod: pay.payMethodLabel,
@@ -376,15 +386,19 @@ router.post('/pos/checkout', async (req, res) => {
         voucherCode: pay.voucherCode,
         invoiceNumber,
         carrierNum: invoiceOpts.carrierNum,
-          buyerUbn: invoiceOpts.buyerUbn,
-          loveCode: invoiceOpts.loveCode,
+        buyerUbn: invoiceOpts.buyerUbn,
+        loveCode: invoiceOpts.loveCode,
         member: result.member,
         items: result.items,
       },
     });
   } catch (error) {
     if (error.statusCode) {
-      return res.status(error.statusCode).json({ status: 'error', message: error.message });
+      return res.status(error.statusCode).json({
+        status: 'error',
+        ...(error.code ? { code: error.code } : {}),
+        message: error.message,
+      });
     }
     console.error(error);
     res.status(500).json({ status: 'error', message: error.message || '結帳失敗' });

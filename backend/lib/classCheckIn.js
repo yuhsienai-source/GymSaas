@@ -47,6 +47,11 @@ export async function checkInWithToken(token, reservationId) {
     err.statusCode = 400;
     throw err;
   }
+  if (reservation.class.type === 'GROUP' && reservation.status !== 'CONFIRMED') {
+    const err = new Error('團課報名尚未完成付款，不可簽到');
+    err.statusCode = 409;
+    throw err;
+  }
 
   const existing = await prisma.classAttendance.findUnique({
     where: { reservationId: reservation.id },
@@ -64,29 +69,6 @@ export async function checkInWithToken(token, reservationId) {
         method: 'QR',
       },
     });
-
-    // 團課點數課：簽到扣 1 點（吃到飽 UNLIMITED_PASS 只記錄）
-    if (reservation.class.type === 'GROUP' && reservation.memberId) {
-      const deductPoints = 1;
-      const member = await tx.member.findUnique({ where: { id: reservation.memberId } });
-      if (member && member.pointsBalance >= deductPoints) {
-        const balance = member.pointsBalance - deductPoints;
-        await tx.member.update({
-          where: { id: member.id },
-          data: { pointsBalance: balance },
-        });
-        await tx.memberPointsLedger.create({
-          data: {
-            memberId: member.id,
-            delta: -deductPoints,
-            balance,
-            reason: '團課簽到扣點',
-            refType: 'CLASS',
-            refId: String(reservation.classId),
-          },
-        });
-      }
-    }
 
     await tx.reservation.update({
       where: { id: reservation.id },

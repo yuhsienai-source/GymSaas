@@ -13,11 +13,13 @@ import TrainerBookPanel from '../../components/staff/trainer/TrainerBookPanel';
 import TrainerCheckInPanel from '../../components/staff/trainer/TrainerCheckInPanel';
 import TrainerHistoryPanel from '../../components/staff/trainer/TrainerHistoryPanel';
 import TrainerInboxList from '../../components/staff/trainer/TrainerInboxList';
+import TrainerPerformanceCard from '../../components/staff/trainer/TrainerPerformanceCard';
 import TrainerScheduleList from '../../components/staff/trainer/TrainerScheduleList';
 import TrainerStudentsPanel from '../../components/staff/trainer/TrainerStudentsPanel';
 import TrainerTimeOffPanel from '../../components/staff/trainer/TrainerTimeOffPanel';
 import TrainerWeekCalendar from '../../components/staff/trainer/TrainerWeekCalendar';
-import { isTodayClass } from '../../components/staff/trainer/trainerFormat';
+import { formatTimeRange, isTodayClass } from '../../components/staff/trainer/trainerFormat';
+import { TRAINER_ROLE_LABELS, trainerRoleOf } from '../../lib/orgStructure';
 
 type TabKey = 'home' | 'schedule' | 'book' | 'students' | 'history' | 'inbox' | 'timeoff';
 
@@ -32,7 +34,7 @@ const TABS: {
   { key: 'schedule', label: '課表', short: '課表', icon: '📅', badgeKey: 'today' },
   { key: 'book', label: '代約', short: '代約', icon: '✍️' },
   { key: 'students', label: '學員', short: '學員', icon: '👥' },
-  { key: 'timeoff', label: '排休', short: '排休', icon: '🌴', badgeKey: 'timeoff' },
+  { key: 'timeoff', label: '工時／不開放', short: '工時', icon: '🕘', badgeKey: 'timeoff' },
   { key: 'history', label: '課程紀錄', short: '紀錄', icon: '📋' },
   { key: 'inbox', label: '訊息', short: '訊息', icon: '🔔', badgeKey: 'inbox' },
 ];
@@ -144,7 +146,8 @@ export default function TrainerDashboardPage() {
   const ptContracts = data?.ptContracts || [];
   const inbox: TrainerInboxItem[] = useMemo(() => data?.inbox || [], [data?.inbox]);
   const timeOffs = data?.timeOffs || [];
-  const timeOffReasons = data?.timeOffReasons || ['休假', '外出', '私人', '其他'];
+  const timeOffReasons = data?.timeOffReasons || ['行政作業', '備課', '外出公務', '其他'];
+  const workSlots = data?.workSlots || [];
 
   const stats = useMemo(
     () => ({
@@ -248,7 +251,7 @@ export default function TrainerDashboardPage() {
             </h2>
             <p className="coach-desk__meta coach-desk__meta--desktop">
               {profile
-                ? `${profile.role === 'MANAGER' ? '主管教練' : '一般教練'}${
+                ? `${TRAINER_ROLE_LABELS[trainerRoleOf(profile)]}${
                     profile.branches?.length
                       ? ` · ${(profile.branches || []).map((b) => staffBranchLabel(b.branch)).join('、')}`
                       : ''
@@ -331,6 +334,11 @@ export default function TrainerDashboardPage() {
         <Alert tone="info">請先於上方選擇教練，即可檢視其服務台。</Alert>
       ) : (
         <>
+          {data?.employed === false && (
+            <Alert tone="warning">
+              此教練未綁定在職員工帳號（僱傭關係），不得開課或受預約。請總部於「員工管理」建立員工帳號並連結教練檔案。
+            </Alert>
+          )}
           <div className="coach-desk__stats">
             <button type="button" className="coach-stat" onClick={() => switchTab('schedule')}>
               <span>今日</span>
@@ -403,6 +411,14 @@ export default function TrainerDashboardPage() {
                     onViewAll={() => switchTab('inbox')}
                   />
                 </PageSection>
+
+                {data?.profile && (
+                  <PageSection title="業績獎金（試算）" desc="底薪另計 · 實發以薪資單為準">
+                    <TrainerPerformanceCard
+                      viewAsTrainerId={viewAsTrainerId === '' ? undefined : Number(viewAsTrainerId)}
+                    />
+                  </PageSection>
+                )}
               </div>
             )}
 
@@ -484,7 +500,32 @@ export default function TrainerDashboardPage() {
             )}
 
             {tab === 'timeoff' && (
-              <PageSection title="排休" desc="登錄後排課會封鎖；會員可查詢避開">
+              <PageSection
+                title="出勤時段與不開放預約"
+                desc="可預約＝已核准週班表 − 請假 − 不開放預約時段；週班表請至「我的排班」提報"
+              >
+                <div className="form-stack">
+                  {workSlots.length === 0 ? (
+                    <EmptyState
+                      icon="🗓"
+                      title="未來 14 日沒有已核准的出勤時段"
+                      desc="未核准週次不開放開課與預約，請至「我的排班」提報週班表並經 FM 或店長核准"
+                    />
+                  ) : (
+                    <ul className="roster__requests">
+                      {workSlots.map((w) => (
+                        <li key={w.id}>
+                          <strong>{formatTimeRange(w.startAt, w.endAt)}</strong>
+                          {w.branchId ? (
+                            <span className="text-muted text-sm">
+                              {branchOptions.find((b) => b.id === w.branchId)?.name ?? ''}
+                            </span>
+                          ) : null}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
                 <TrainerTimeOffPanel
                   items={timeOffs}
                   reasons={timeOffReasons}

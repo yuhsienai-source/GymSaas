@@ -1,8 +1,12 @@
-// routes/coachExt.js — 教練延伸（QR 簽到、訓練紀錄、場地預約、拆帳）
+// routes/coachExt.js — 教練延伸（QR 簽到、訓練紀錄、場地預約）＋總部教練業績獎金規則
 import express from 'express';
 import prisma from '../lib/prisma.js';
 import { verifyStaff, requireAdmin, requirePermission } from '../middleware/jwtAuth.js';
 import { isAdminUser } from '../lib/staffAccess.js';
+import { coachPerformanceBetween, normalizeRuleInput, serializeRule } from '../lib/coachPerformance.js';
+import { taipeiDateKey } from '../lib/laborLaw.js';
+import { monthRange } from '../lib/payrollExport.js';
+import { getPayrollConfig } from '../lib/payrollService.js';
 import {
   assertOwnsTrainerOrAdmin,
   resolveTrainerWorkspace,
@@ -27,7 +31,7 @@ function parseDate(value, fieldName) {
 
 function sendErr(res, error, fallback = '操作失敗') {
   if (error.statusCode) {
-    return res.status(error.statusCode).json({ status: 'error', message: error.message });
+    return res.status(error.statusCode).json({ status: 'error', code: error.code || undefined, message: error.message });
   }
   console.error(error);
   return res.status(500).json({ status: 'error', message: fallback });
@@ -35,23 +39,6 @@ function sendErr(res, error, fallback = '操作失敗') {
 
 function overlapWhere(startAt, endAt) {
   return { startAt: { lt: endAt }, endAt: { gt: startAt } };
-}
-
-function generateCommissionLedgerId() {
-  const dateStr = new Date().toISOString().replace(/[-:T.Z]/g, '').slice(0, 8);
-  const randomStr = Math.floor(100000 + Math.random() * 900000).toString();
-  return `CCL${dateStr}${randomStr}`;
-}
-
-function pickTierRate(tierRates, gross) {
-  const tiers = Array.isArray(tierRates) ? [...tierRates] : [{ minRevenue: 0, rate: 0.3 }];
-  tiers.sort((a, b) => (b.minRevenue || 0) - (a.minRevenue || 0));
-  for (const t of tiers) {
-    if (gross >= (Number(t.minRevenue) || 0)) {
-      return Number(t.rate) || 0;
-    }
-  }
-  return 0;
 }
 
 async function assertTrainerOwnsClass(req, classId, trainer) {
@@ -359,6 +346,7 @@ coachExtTrainerRouter.get('/consult-allocations', async (req, res) => {
 export const coachExtAdminRouter = express.Router();
 coachExtAdminRouter.use(verifyStaff, requireAdmin);
 
+// 業績獎金規則：GET 生效規則；PUT 新增／取代（同教練同課型僅一筆生效）；DELETE 停用
 coachExtAdminRouter.get('/commission-rules', async (req, res) => {
   try {
     const where = { isActive: true };
@@ -366,150 +354,108 @@ coachExtAdminRouter.get('/commission-rules', async (req, res) => {
     const rows = await prisma.coachCommissionRule.findMany({
       where,
       include: { trainer: { select: { id: true, name: true } } },
-      orderBy: { createdAt: 'desc' },
+      orderBy: [{ trainerId: 'asc' }, { courseKind: 'asc' }],
     });
-    res.json({ status: 'success', data: rows });
+    res.json({ status: 'success', data: rows.map(serializeRule) });
   } catch (error) {
-    sendErr(res, error, '讀取拆帳規則失敗');
+    sendErr(res, error, '讀取獎金規則失敗');
   }
 });
 
-coachExtAdminRouter.post('/commission-rules', async (req, res) => {
+coachExtAdminRouter.put('/commission-rules', async (req, res) => {
   try {
-    const row = await prisma.coachCommissionRule.create({
-      data: {
-        trainerId: req.body?.trainerId ? parseInt(req.body.trainerId, 10) : null,
-        courseKind: String(req.body?.courseKind || 'PRIVATE').toUpperCase(),
-        payModel: String(req.body?.payModel || 'PERFORMANCE').toUpperCase(),
-        baseSalary: Number(req.body?.baseSalary) || 0,
-        tierRates: req.body?.tierRates ?? null,
-        hourlyRate: req.body?.hourlyRate != null ? Number(req.body.hourlyRate) : null,
-        perHeadRate: req.body?.perHeadRate != null ? Number(req.body.perHeadRate) : null,
-        deductRates: req.body?.deductRates ?? null,
-        scoreFactor: req.body?.scoreFactor ?? null,
-      },
-    });
-    res.json({ status: 'success', message: '已建立拆帳規則', data: row });
-  } catch (error) {
-    sendErr(res, error, '建立拆帳規則失敗');
-  }
-});
-
-coachExtAdminRouter.patch('/commission-rules/:id', async (req, res) => {
-  try {
-    const id = parseInt(req.params.id, 10);
-    const data = {};
-    for (const key of [
-      'courseKind',
-      'payModel',
-      'baseSalary',
-      'tierRates',
-      'hourlyRate',
-      'perHeadRate',
-      'deductRates',
-      'scoreFactor',
-      'isActive',
-    ]) {
-      if (req.body?.[key] !== undefined) data[key] = req.body[key];
+    const data = normalizeRuleInput(req.body || {});
+    if (data.trainerId) {
+      const trainer = await prisma.trainer.findUnique({ where: { id: data.trainerId }, select: { id: true } });
+      if (!trainer) throw httpError('找不到教練', 404);
     }
-    const row = await prisma.coachCommissionRule.update({ where: { id }, data });
-    res.json({ status: 'success', message: '已更新拆帳規則', data: row });
+    const row = await prisma.$transaction(async (tx) => {
+      await tx.coachCommissionRule.updateMany({
+        where: { trainerId: data.trainerId, courseKind: data.courseKind, isActive: true },
+        data: { isActive: false },
+      });
+      return tx.coachCommissionRule.create({
+        data: { ...data, tierRates: data.tierRates ?? undefined },
+        include: { trainer: { select: { id: true, name: true } } },
+      });
+    });
+    res.json({ status: 'success', message: '已更新獎金規則', data: serializeRule(row) });
   } catch (error) {
-    if (error.code === 'P2025') {
-      return res.status(404).json({ status: 'error', message: '找不到規則' });
-    }
-    sendErr(res, error, '更新拆帳規則失敗');
+    sendErr(res, error, '更新獎金規則失敗');
   }
 });
 
-coachExtAdminRouter.get('/commission-ledger', async (req, res) => {
+coachExtAdminRouter.delete('/commission-rules/:id', async (req, res) => {
   try {
-    const where = {};
-    if (req.query.trainerId) where.trainerId = parseInt(req.query.trainerId, 10);
-    if (req.query.from) where.periodStart = { ...(where.periodStart || {}), gte: parseDate(req.query.from, 'from') };
-    if (req.query.to) where.periodEnd = { ...(where.periodEnd || {}), lte: parseDate(req.query.to, 'to') };
-    const rows = await prisma.coachCommissionLedger.findMany({
-      where,
-      include: { trainer: { select: { id: true, name: true } } },
-      orderBy: { periodStart: 'desc' },
-      take: Math.min(200, parseInt(req.query.take, 10) || 100),
+    const { count } = await prisma.coachCommissionRule.updateMany({
+      where: { id: parseInt(req.params.id, 10), isActive: true },
+      data: { isActive: false },
     });
-    res.json({ status: 'success', data: rows });
+    if (!count) return res.status(404).json({ status: 'error', message: '找不到生效中之規則' });
+    res.json({ status: 'success', message: '已停用獎金規則' });
   } catch (error) {
-    sendErr(res, error, '讀取拆帳帳冊失敗');
+    sendErr(res, error, '停用獎金規則失敗');
   }
 });
 
-coachExtAdminRouter.post('/commission-ledger/run', async (req, res) => {
+// 月度業績與僱傭合規檢視（獎金併入薪資批次；此處僅試算）
+coachExtAdminRouter.get('/performance', async (req, res) => {
   try {
-    const trainerId = parseInt(req.body?.trainerId, 10);
-    const periodStart = parseDate(req.body?.periodStart, 'periodStart');
-    const periodEnd = parseDate(req.body?.periodEnd, 'periodEnd');
-    if (periodEnd <= periodStart) throw httpError('periodEnd 須晚於 periodStart');
-
-    const rule = await prisma.coachCommissionRule.findFirst({
-      where: { trainerId, isActive: true, courseKind: 'PRIVATE' },
-    });
-    const tierRates = rule?.tierRates;
-
-    const ptContracts = await prisma.pTContract.findMany({
-      where: { trainerId, isActive: true, source: 'PURCHASE' },
-    });
-    const ptAttendances = await prisma.classAttendance.findMany({
-      where: {
-        checkedInAt: { gte: periodStart, lte: periodEnd },
-        class: { trainerId, type: 'PRIVATE' },
-      },
-      include: { class: true },
-    });
-
-    let ptGross = 0;
-    for (const att of ptAttendances) {
-      const contract = ptContracts.find((c) => c.memberId === att.memberId);
-      if (!contract || contract.totalSessions <= 0) continue;
-      ptGross += contract.pricePaid / contract.totalSessions;
-    }
-
-    const groupAttendances = await prisma.classAttendance.findMany({
-      where: {
-        checkedInAt: { gte: periodStart, lte: periodEnd },
-        class: { trainerId, type: 'GROUP' },
-      },
-    });
-    const groupRule = await prisma.coachCommissionRule.findFirst({
-      where: { trainerId, isActive: true, courseKind: 'GROUP' },
-    });
-    const perHead = Number(groupRule?.perHeadRate) || 0;
-    const groupGross = groupAttendances.length * perHead;
-
-    const grossAmount = Math.round((ptGross + groupGross) * 100) / 100;
-    const rate = pickTierRate(tierRates, ptGross);
-    const commission = Math.round(ptGross * rate * 100) / 100;
-    const baseSalary = Number(rule?.baseSalary) || 0;
-    const netAmount = Math.round((baseSalary + commission + groupGross) * 100) / 100;
-
-    const row = await prisma.coachCommissionLedger.create({
-      data: {
-        id: generateCommissionLedgerId(),
-        trainerId,
-        periodStart,
-        periodEnd,
-        grossAmount,
-        deductions: 0,
-        netAmount,
-        detail: {
-          ptGross,
-          groupGross,
-          tierRate: rate,
-          ptSessions: ptAttendances.length,
-          groupHeads: groupAttendances.length,
-          baseSalary,
+    const month = String(req.query.month || taipeiDateKey().slice(0, 7));
+    const { start, end } = monthRange(month);
+    const [trainers, config] = await Promise.all([
+      prisma.trainer.findMany({
+        where: { isActive: true },
+        select: {
+          id: true,
+          name: true,
+          level: true,
+          staff: {
+            select: {
+              id: true,
+              name: true,
+              role: true,
+              isActive: true,
+              employmentType: true,
+              weeklyHours: true,
+              laborActApplies: true,
+              payProfile: { select: { payType: true, monthlySalary: true, hourlyWage: true, laborInsuredSalary: true } },
+            },
+          },
         },
-      },
+        orderBy: { id: 'asc' },
+      }),
+      getPayrollConfig(),
+    ]);
+    const cfg = config.rates;
+    const perf = await coachPerformanceBetween({ trainerIds: trainers.map((t) => t.id), start, end });
+    const items = trainers.map((t) => {
+      const s = t.staff;
+      const profile = s?.payProfile ?? null;
+      const flags = [];
+      if (!s || !s.isActive) flags.push({ code: 'NOT_EMPLOYED', message: '未綁定在職員工帳號，不得排課' });
+      else {
+        if (!profile) flags.push({ code: 'NO_PAY_PROFILE', message: '未設定薪資（底薪）' });
+        else if (s.employmentType === 'FULL_TIME' && (profile.payType !== 'MONTHLY' || (profile.monthlySalary ?? 0) < cfg.minMonthlyWage)) {
+          flags.push({ code: 'COACH_BASE_PAY', message: `正職須月薪制且 ≥ ${cfg.minMonthlyWage}` });
+        } else if (profile.payType === 'HOURLY' && (profile.hourlyWage ?? 0) < cfg.minHourlyWage) {
+          flags.push({ code: 'COACH_BASE_PAY', message: `時薪須 ≥ ${cfg.minHourlyWage}` });
+        }
+        if (profile && !profile.laborInsuredSalary) flags.push({ code: 'NO_LABOR_INS', message: '未設定勞保投保薪資' });
+      }
+      return {
+        trainerId: t.id,
+        name: t.name,
+        level: t.level,
+        staff: s ? { id: s.id, name: s.name, employmentType: s.employmentType, isActive: s.isActive } : null,
+        basePay: profile ? { payType: profile.payType, monthlySalary: profile.monthlySalary, hourlyWage: profile.hourlyWage } : null,
+        performance: perf.get(t.id),
+        flags,
+      };
     });
-    res.json({ status: 'success', message: '拆帳試算完成', data: row });
+    res.json({ status: 'success', data: { month, items } });
   } catch (error) {
-    sendErr(res, error, '拆帳試算失敗');
+    sendErr(res, error, '讀取教練業績失敗');
   }
 });
 

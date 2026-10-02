@@ -5,9 +5,12 @@ import http from 'http';
 
 import gateRoutes from './routes/gate.js';
 import opsRoutes from './routes/ops.js';
+import opsTransactionsRoutes from './routes/opsTransactions.js';
+import opsRefundsRoutes from './routes/opsRefunds.js';
 import memberRoutes from './routes/member.js';
 import trainerRoutes from './routes/trainer.js';
 import hqRoutes from './routes/hq.js';
+import hqInventoryRoutes from './routes/hqInventory.js';
 import ptRoutes from './routes/pt.js';
 import authRoutes from './routes/auth.js';
 import adminRoutes from './routes/admin.js';
@@ -20,8 +23,17 @@ import onboardingRoutes from './routes/onboarding.js';
 import cmsRoutes from './routes/cms.js';
 import marketingRoutes from './routes/marketing.js';
 import { hrAdminRouter, hrSelfRouter } from './routes/hr.js';
+import { rosterRouter } from './routes/roster.js';
+import { weekPlanReviewRouter } from './routes/weekPlans.js';
+import { staffNotificationsRouter } from './routes/staffNotifications.js';
+import { payrollAdminRouter } from './routes/payroll.js';
+import { startRosterAckScheduler } from './lib/rosterService.js';
+import { startStaffNotificationScheduler } from './lib/staffNotificationScheduler.js';
 import { coachExtTrainerRouter, coachExtAdminRouter } from './routes/coachExt.js';
 import memberExtRoutes from './routes/memberExt.js';
+import memberGroupRoutes from './routes/memberGroup.js';
+import groupOpsRoutes from './routes/groupOps.js';
+import { startGroupClassScheduler } from './lib/groupClassService.js';
 import opsExtensionsRoutes from './routes/opsExtensions.js';
 import { attachOccupancyWebSocket } from './lib/occupancy.js';
 import { attachGateAlertWebSocket } from './lib/gateAlert.js';
@@ -29,7 +41,8 @@ import { backfillMissingMemberNos } from './lib/memberNo.js';
 import { startCardRecurringScheduler } from './lib/cardSubscription.js';
 import { purgeExpiredIdPhotos } from './lib/idPhoto.js';
 import { idPhotoStorageDriver } from './lib/idPhotoStorage.js';
-import { bootInvoiceQueue } from './lib/invoiceQueue.js';
+import { bootEInvoiceQueue } from './lib/einvoice.js';
+import { staffDutyGate } from './middleware/staffDutyGate.js';
 
 const app = express();
 const PORT = process.env.PORT || 8000;
@@ -162,14 +175,22 @@ app.get('/api/health', (req, res) => {
   });
 });
 
+// 班表值勤海關：非值勤員工（ADMIN 除外）禁止業務 API，須在所有業務路由之前
+app.use(staffDutyGate);
+
 app.use('/api/gate', gateRoutes);
 // 較長路徑須掛在 /api/ops 之前，否則會被 ops 中介層攔截
 app.use('/api/ops/inventory', inventoryOpsRoutes);
+app.use('/api/ops/group', groupOpsRoutes);
 // ops 須先於 opsExtensions：PayUNi／LinePay 公開回流在 verifyStaff 之前註冊；
 // 未匹配再 next() 到 opsExtensions（DUTY+ 延伸）
+// 交易異動路由逐條掛驗證（無 router.use），不影響 ops.js 之公開回流
+app.use('/api/ops', opsRefundsRoutes);
+app.use('/api/ops', opsTransactionsRoutes);
 app.use('/api/ops', opsRoutes);
 app.use('/api/ops', opsExtensionsRoutes);
 app.use('/api/ops', posRoutes);
+app.use('/api/member/group', memberGroupRoutes);
 app.use('/api/member', memberRoutes);
 app.use('/api/member', memberExtRoutes);
 app.use('/api/trainer', trainerRoutes);
@@ -178,9 +199,14 @@ app.use('/api/hq/reports', reportsRoutes);
 app.use('/api/hq/contracts', contractsRoutes);
 app.use('/api/hq/marketing', marketingRoutes);
 app.use('/api/hq/hr', hrAdminRouter);
+app.use('/api/hq/payroll', payrollAdminRouter);
 app.use('/api/hq/coach', coachExtAdminRouter);
+app.use('/api/hq', hqInventoryRoutes);
 app.use('/api/hq', hqRoutes);
 app.use('/api/staff/hr', hrSelfRouter);
+app.use('/api/staff/roster', rosterRouter);
+app.use('/api/staff/week-plans', weekPlanReviewRouter);
+app.use('/api/staff/notifications', staffNotificationsRouter);
 app.use('/api/trainer/ext', coachExtTrainerRouter);
 app.use('/api/pt', ptRoutes);
 app.use('/api/auth', authRoutes);
@@ -211,7 +237,10 @@ server.listen(PORT, () => {
     );
   }
   startCardRecurringScheduler();
-  bootInvoiceQueue().catch((err) => console.warn('[invoiceQueue] boot:', err.message));
+  startRosterAckScheduler();
+  startStaffNotificationScheduler();
+  startGroupClassScheduler();
+  bootEInvoiceQueue().catch((err) => console.warn('[einvoice] boot:', err.message));
   // 證件：歷史版 1 年／保存期 3 年到期硬刪（每 6 小時）
   const runIdPhotoPurge = () => {
     purgeExpiredIdPhotos()

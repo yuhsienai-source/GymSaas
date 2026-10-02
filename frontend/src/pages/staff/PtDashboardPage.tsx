@@ -1,5 +1,6 @@
 import { type FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import {
+  Alert,
   Badge,
   Button,
   Card,
@@ -12,7 +13,10 @@ import {
 import { useToast } from '../../contexts/ToastContext';
 import { staffBranchLabel } from '../../lib/branchLabel';
 import { fetchPtDashboard, getErrorMessage, scheduleGroupClass } from '../../lib/api';
-import type { Trainer, Venue } from '../../types/api';
+import type { GroupCoursePlanOption, Trainer, Venue } from '../../types/api';
+import { isManagerTrainer } from '../../lib/orgStructure';
+import { formatMoney } from '../../lib/hrFormat';
+import GroupSeriesAdminPanel from '../../components/staff/GroupSeriesAdminPanel';
 
 const WEEKDAYS: { value: number; label: string }[] = [
   { value: 1, label: '週一' },
@@ -36,23 +40,6 @@ type GroupClassRow = {
   stationName?: string | null;
   trainerName?: string | null;
   booked?: number;
-};
-
-type ClassSeriesRow = {
-  id: number;
-  title: string;
-  capacity: number;
-  startDate: string;
-  endDate: string;
-  weekdays: number[];
-  weekdaysLabel: string;
-  startTime: string;
-  endTime: string;
-  venueName?: string | null;
-  branchName?: string | null;
-  stationName?: string | null;
-  trainerName?: string | null;
-  classCount: number;
 };
 
 function todayYmd() {
@@ -83,15 +70,6 @@ function formatSession(isoStart: string, isoEnd: string) {
   return `${day} ${t0}–${t1}`;
 }
 
-function formatDateRange(startIso: string, endIso: string) {
-  const s = new Date(startIso);
-  const e = new Date(endIso);
-  if (Number.isNaN(s.getTime()) || Number.isNaN(e.getTime())) return '—';
-  const a = s.toLocaleDateString('zh-TW', { year: 'numeric', month: 'numeric', day: 'numeric' });
-  const b = e.toLocaleDateString('zh-TW', { year: 'numeric', month: 'numeric', day: 'numeric' });
-  return `${a}～${b}`;
-}
-
 /** 粗估堂數（前端預覽；實際以後端為準） */
 function estimateSessions(startDate: string, endDate: string, weekdays: number[]) {
   if (!startDate || !endDate || weekdays.length === 0 || endDate < startDate) return 0;
@@ -101,10 +79,9 @@ function estimateSessions(startDate: string, endDate: string, weekdays: number[]
   const cursor = new Date(sy, sm - 1, sd);
   const end = new Date(ey, em - 1, ed);
   const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   while (cursor <= end) {
-    if (weekdays.includes(cursor.getDay()) && cursor >= new Date(now.getFullYear(), now.getMonth(), now.getDate())) {
-      count += 1;
-    }
+    if (weekdays.includes(cursor.getDay()) && cursor >= today) count += 1;
     cursor.setDate(cursor.getDate() + 1);
     if (count > 80) return 80;
   }
@@ -116,10 +93,12 @@ export default function PtDashboardPage() {
   const [venues, setVenues] = useState<Venue[]>([]);
   const [trainers, setTrainers] = useState<Trainer[]>([]);
   const [upcoming, setUpcoming] = useState<GroupClassRow[]>([]);
-  const [seriesList, setSeriesList] = useState<ClassSeriesRow[]>([]);
+  const [groupPlans, setGroupPlans] = useState<GroupCoursePlanOption[]>([]);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
+  const [seriesReload, setSeriesReload] = useState(0);
 
+  const [coursePlanId, setCoursePlanId] = useState<number | ''>('');
   const [title, setTitle] = useState('');
   const [venueId, setVenueId] = useState<number | ''>('');
   const [stationId, setStationId] = useState<number | ''>('');
@@ -128,7 +107,8 @@ export default function PtDashboardPage() {
   const [weekdays, setWeekdays] = useState<number[]>([1]);
   const [startTime, setStartTime] = useState('19:00');
   const [endTime, setEndTime] = useState('20:00');
-  const [capacity, setCapacity] = useState('12');
+  const [capacity, setCapacity] = useState('');
+  const [enrollDeadline, setEnrollDeadline] = useState('');
   const [trainerId, setTrainerId] = useState<number | ''>('');
 
   const applyDashboard = useCallback(
@@ -136,12 +116,12 @@ export default function PtDashboardPage() {
       venues?: Venue[];
       trainers?: Trainer[];
       upcomingGroupClasses?: GroupClassRow[];
-      activeSeries?: ClassSeriesRow[];
+      groupCoursePlans?: GroupCoursePlanOption[];
     }) => {
       setVenues(data.venues || []);
       setTrainers(data.trainers || []);
       setUpcoming(data.upcomingGroupClasses || []);
-      setSeriesList(data.activeSeries || []);
+      setGroupPlans(data.groupCoursePlans || []);
     },
     [],
   );
@@ -197,7 +177,7 @@ export default function PtDashboardPage() {
     if (!venue) return trainers;
     return trainers.filter(
       (t) =>
-        t.role === 'MANAGER' ||
+        isManagerTrainer(t) ||
         (t.branches || []).some((b) => b.branchId === venue.branchId),
     );
   }, [trainers, venue]);
@@ -206,6 +186,20 @@ export default function PtDashboardPage() {
     trainerId !== '' && trainersForVenue.some((t) => t.id === trainerId)
       ? trainerId
       : (trainersForVenue[0]?.id ?? '');
+
+  /** 課程方案須屬場地分店或其上層健身房（後端強制） */
+  const plansForVenue = useMemo(() => {
+    if (!venue) return groupPlans;
+    return groupPlans.filter(
+      (p) => p.branchId === venue.branchId || (venue.branch?.parentId != null && p.branchId === venue.branch.parentId),
+    );
+  }, [groupPlans, venue]);
+
+  const effectivePlanId: number | '' =
+    coursePlanId !== '' && plansForVenue.some((p) => p.id === coursePlanId)
+      ? coursePlanId
+      : (plansForVenue[0]?.id ?? '');
+  const plan = plansForVenue.find((p) => p.id === effectivePlanId) || null;
 
   const previewCount = estimateSessions(startDate, endDate, weekdays);
 
@@ -217,8 +211,8 @@ export default function PtDashboardPage() {
 
   async function handleSchedule(e: FormEvent) {
     e.preventDefault();
-    if (!title.trim() || !effectiveVenueId || !effectiveTrainerId || !startTime || !endTime) {
-      toast('請填寫團課名稱、場地、教練與時段', 'error');
+    if (!effectivePlanId || !effectiveVenueId || !effectiveTrainerId || !startTime || !endTime) {
+      toast('請選擇課程方案、場地、教練與時段', 'error');
       return;
     }
     if (!startDate || !endDate) {
@@ -233,8 +227,8 @@ export default function PtDashboardPage() {
       toast('請選擇訓練站點', 'error');
       return;
     }
-    const cap = parseInt(capacity, 10);
-    if (!Number.isInteger(cap) || cap < 1) {
+    const cap = capacity.trim() ? parseInt(capacity, 10) : null;
+    if (cap !== null && (!Number.isInteger(cap) || cap < 1)) {
       toast('人數上限須為正整數', 'error');
       return;
     }
@@ -242,7 +236,8 @@ export default function PtDashboardPage() {
     setBusy(true);
     try {
       const result = await scheduleGroupClass({
-        title: title.trim(),
+        coursePlanId: Number(effectivePlanId),
+        ...(title.trim() ? { title: title.trim() } : {}),
         venueId: Number(effectiveVenueId),
         ...(stationResolved ? { stationId: Number(stationResolved) } : {}),
         startDate,
@@ -250,11 +245,13 @@ export default function PtDashboardPage() {
         weekdays,
         startTime,
         endTime,
-        capacity: cap,
+        ...(cap !== null ? { capacity: cap } : {}),
         trainerId: Number(effectiveTrainerId),
+        ...(enrollDeadline ? { enrollDeadline } : {}),
       });
       toast(result.message || '期班排課成功', 'success');
       setTitle('');
+      setSeriesReload((k) => k + 1);
       await loadData();
     } catch (err) {
       toast(getErrorMessage(err, '排課失敗'), 'error');
@@ -275,21 +272,13 @@ export default function PtDashboardPage() {
     <>
       <PageSection
         title="團課管理"
-        desc="期班排課 · 開始～結束日期 × 每週幾 × 上課時間 · 學員約課請至教練服務台"
+        desc="付費期班 · 綁定團體課程方案（整期價／堂數／單堂價／最低開班人數）· 學員於會員端或櫃檯 POS 付款報名"
       >
         <Card
           title="新增團課期班"
-          subtitle="依日期區間與每週上課日一次展開多堂，並做教練／場地／排休防衝堂"
+          subtitle="依日期區間與每週上課日一次展開多堂，堂數須等於方案每期堂數；並做教練班表／場地防衝堂"
         >
           <form onSubmit={handleSchedule} className="form-stack">
-            <Field label="團課名稱" hint="期班內各堂共用此名稱">
-              <Input
-                value={title}
-                onChange={(e) => setTitle(e.target.value)}
-                placeholder="例：核心循環訓練"
-                required
-              />
-            </Field>
             <Field label="使用場地">
               <Select
                 value={effectiveVenueId ? String(effectiveVenueId) : ''}
@@ -306,6 +295,37 @@ export default function PtDashboardPage() {
                   </option>
                 ))}
               </Select>
+            </Field>
+            <Field label="團體課程方案" hint="價格與堂數快照自方案，開班後不隨方案變動">
+              <Select
+                value={effectivePlanId ? String(effectivePlanId) : ''}
+                onChange={(e) => setCoursePlanId(e.target.value ? Number(e.target.value) : '')}
+                required
+              >
+                <option value="">— 請選擇 —</option>
+                {plansForVenue.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name} · {formatMoney(p.price)}／{p.sessions ?? '—'} 堂
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            {plansForVenue.length === 0 ? (
+              <Alert tone="warning">此場地分店尚無上架中的團體課程方案，請先至總部「課程方案」建立。</Alert>
+            ) : null}
+            {plan ? (
+              <p className="text-sm text-muted" style={{ margin: 0 }}>
+                整期 {formatMoney(plan.price)} · 每期 {plan.sessions ?? '—'} 堂 · 單堂{' '}
+                {plan.dropInPrice ? formatMoney(plan.dropInPrice) : '不開放'} · 人數上限 {plan.capacity ?? '—'} ·
+                最低開班 {plan.minEnrollment || '不設'}
+              </p>
+            ) : null}
+            <Field label="期班名稱（選填）" hint="留空＝沿用方案名稱">
+              <Input
+                value={title}
+                onChange={(e) => setTitle(e.target.value)}
+                placeholder={plan?.name || '例：核心循環訓練 10 月班'}
+              />
             </Field>
             {stations.length > 0 ? (
               <Field label="站點">
@@ -336,7 +356,7 @@ export default function PtDashboardPage() {
                 {trainersForVenue.map((t) => (
                   <option key={t.id} value={t.id}>
                     {t.name}
-                    {t.role === 'MANAGER' ? '（主管）' : ''}
+                    {isManagerTrainer(t) ? '（主管）' : ''}
                   </option>
                 ))}
               </Select>
@@ -395,18 +415,23 @@ export default function PtDashboardPage() {
               </Field>
             </div>
 
-            <Field label="人數上限">
-              <Input
-                type="number"
-                min={1}
-                value={capacity}
-                onChange={(e) => setCapacity(e.target.value)}
-                required
-              />
-            </Field>
+            <div className="coach-desk__time-row">
+              <Field label="人數上限（選填）" hint="留空＝沿用方案">
+                <Input
+                  type="number"
+                  min={1}
+                  value={capacity}
+                  placeholder={plan?.capacity ? String(plan.capacity) : ''}
+                  onChange={(e) => setCapacity(e.target.value)}
+                />
+              </Field>
+              <Field label="報名截止（選填）" hint="留空＝開課前 2 日">
+                <Input type="date" value={enrollDeadline} onChange={(e) => setEnrollDeadline(e.target.value)} />
+              </Field>
+            </div>
 
             {previewCount > 0 ? (
-              <AlertPreview count={previewCount} />
+              <AlertPreview count={previewCount} planSessions={plan?.sessions ?? null} />
             ) : (
               <p className="text-sm text-muted">請設定日期區間與每週幾以預覽堂數</p>
             )}
@@ -415,7 +440,7 @@ export default function PtDashboardPage() {
               type="submit"
               loading={busy}
               disabled={
-                !title.trim() ||
+                !effectivePlanId ||
                 !effectiveVenueId ||
                 !effectiveTrainerId ||
                 weekdays.length === 0 ||
@@ -428,47 +453,7 @@ export default function PtDashboardPage() {
         </Card>
       </PageSection>
 
-      <PageSection title="進行中的期班" desc="結束日尚未過的期班規則">
-        {seriesList.length === 0 ? (
-          <EmptyState icon="📅" title="尚無期班" desc="請於上方建立期班排程" />
-        ) : (
-          <div className="table-wrap">
-            <table className="data-table">
-              <thead>
-                <tr>
-                  <th>期班</th>
-                  <th>日期區間</th>
-                  <th>每週／時間</th>
-                  <th>場地</th>
-                  <th>教練</th>
-                  <th>堂數</th>
-                </tr>
-              </thead>
-              <tbody>
-                {seriesList.map((s) => (
-                  <tr key={s.id}>
-                    <td>
-                      <strong>{s.title}</strong>
-                    </td>
-                    <td className="text-sm">{formatDateRange(s.startDate, s.endDate)}</td>
-                    <td className="text-sm">
-                      {s.weekdaysLabel} · {s.startTime}–{s.endTime}
-                    </td>
-                    <td>
-                      {s.branchName || '—'} {s.venueName || ''}
-                      {s.stationName ? `／${s.stationName}` : ''}
-                    </td>
-                    <td>{s.trainerName || '—'}</td>
-                    <td>
-                      <Badge tone="info">{s.classCount} 堂</Badge>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </PageSection>
+      <GroupSeriesAdminPanel reloadSignal={seriesReload} />
 
       <PageSection title="即將到來的團課堂次" desc="未來單堂 · 依開始時間排序">
         {upcoming.length === 0 ? (
@@ -516,10 +501,13 @@ export default function PtDashboardPage() {
   );
 }
 
-function AlertPreview({ count }: { count: number }) {
+function AlertPreview({ count, planSessions }: { count: number; planSessions: number | null }) {
+  const mismatch = planSessions != null && planSessions !== count;
   return (
-    <p className="text-sm" style={{ color: 'var(--text-muted)' }}>
-      預估將產生約 <strong>{count}</strong> 堂（已過時段略過；實際以後端為準）
+    <p className="text-sm" style={{ color: mismatch ? 'var(--danger, #b42318)' : 'var(--text-muted)' }}>
+      預估將產生約 <strong>{count}</strong> 堂
+      {planSessions != null ? `；方案每期 ${planSessions} 堂${mismatch ? '，須一致才能開班' : ''}` : ''}
+      （實際以後端為準）
     </p>
   );
 }

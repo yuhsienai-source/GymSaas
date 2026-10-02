@@ -2,22 +2,31 @@
 import express from 'express';
 import prisma from '../lib/prisma.js';
 import { verifyStaff, requirePermission, requireDutyOrAbove } from '../middleware/jwtAuth.js';
-import { assertBranchAccess, hasManagerRankOrAbove, promotionListWhere, isAdminUser, hasDutyRankOrAbove } from '../lib/staffAccess.js';
+import {
+  assertBranchAccess,
+  hasManagerRankOrAbove,
+  promotionListWhere,
+  isCrossBranchUser,
+  staffBranchIds,
+  canAccessBranch,
+} from '../lib/staffAccess.js';
 import { coercePaymentsFromBody, TOPUP_PAY_METHODS } from '../lib/compositePay.js';
+import { payWithCashWallet, restoreHeldCashWallet } from '../lib/walletMutation.js';
 import {
   assertPromotionSellable,
   promotionSellablePrismaWhere,
   fulfillPromotionPurchase,
+  fulfillmentGrantData,
   buildTopupItemDesc,
   isUnlimitedTopupOrder,
   parseTopupQtyFromItemDesc,
   computeTopupAmount,
   isUnlimitedPromotion,
+  TOPUP_NO_WALLET_MESSAGE,
   resolvePromotionRecurringAmount,
   resolveRecurringPeriodDays,
   remainingExpireDays,
   buildRecurringInvoiceItemDesc,
-  UNLIMITED_MEMBER_PLAN,
 } from '../lib/promotion.js';
 import {
   assertMemberSignedPromotionContracts,
@@ -90,26 +99,18 @@ import {
   shiftSlotLabel,
   normalizePayMixColumns,
   PAY_METHOD_COLUMNS,
+  lockOpenShiftForSale,
+  previousShiftEnd,
 } from '../lib/shiftHandover.js';
+import { normalizeInvoiceOptions } from '../lib/ezpay.js';
 import {
-  savePrintableAllowanceSlip,
-  toPrintableAllowance,
-  normalizeBuyerEmail,
-  normalizeInvoiceNumberInput,
-  resolveInvoiceSellerHeader,
-  resolveBranchIdForOrder,
-} from '../lib/invoiceAllowance.js';
-import { issueInvoice, normalizeInvoiceOptions } from '../lib/ezpay.js';
-import {
-  appendInvoiceReverseNote,
-  assertRealInvoiceForAllowance,
-  executeInvoiceReverse,
-  resolveOrderInvoiceReverse,
-  resolveSaleInvoiceReverse,
-  syncCheckoutInvoiceAfterReverse,
-  reevaluateCheckoutSessionStatus,
-  prorateCheckoutWalletCash,
-} from '../lib/ezpayReverse.js';
+  issueOrderInvoice,
+  saveInvoiceRequest,
+  listEInvoices,
+  retryEInvoice,
+  attachInvoiceSummary,
+  issuedInvoiceFor,
+} from '../lib/einvoice.js';
 import { allocateUniqueMemberNo, isValidMemberNo } from '../lib/memberNo.js';
 import { registerFace } from '../lib/papago.js';
 import {
@@ -119,7 +120,7 @@ import {
   toCounterMemberView,
 } from '../lib/memberIdentify.js';
 import { setMemberBranches, listMemberBranches } from '../lib/memberBranch.js';
-import { deviceBindUpdateData, deviceBindUpdateIfChanged } from '../lib/memberDevice.js';
+import { deviceBindUpdateIfChanged } from '../lib/memberDevice.js';
 import { opsResetMemberDevice } from '../lib/deviceReset.js';
 import {
   clientIp,
@@ -128,21 +129,23 @@ import {
 import { normalizeEmail } from '../lib/emailOtp.js';
 import { assertRequiredIdNumber } from '../lib/deviceReset.js';
 import { posPayReturnRedirect, topupPayReturnRedirect, checkoutPayReturnRedirect, payReturnRedirect } from '../lib/frontendUrl.js';
-import { fulfillCardSaleOrder, restockSaleStock } from '../lib/inventory.js';
+import { fulfillCardSaleOrder } from '../lib/inventory.js';
 import { confirmLinePayPayment, payLinePayPosWithOneTimeKey } from '../lib/linepay.js';
-import { broadcastOccupancy } from '../lib/occupancy.js';
 import {
   processCheckOut,
   broadcastCheckOut,
   checkOutSuccessPayload,
 } from '../lib/gateCheckout.js';
 import { fulfillCheckoutSession, runOpsCheckout } from '../lib/checkout.js';
+import {
+  fulfillGroupOnlineOrder,
+  releaseEnrollmentHold,
+  processWaitlist,
+} from '../lib/groupClassService.js';
 import { confirmYipayCheckout, confirmYipayOrder, confirmYipaySale } from '../lib/yipay.js';
 import { reconcileYipayDay } from '../lib/yipayCapture.js';
-import { listInvoiceJobs, retryInvoiceJob } from '../lib/invoiceQueue.js';
 import { resolveTopupOrderId } from '../lib/orderIds.js';
-import { formatGateAccessNo, resolveGateLogId } from '../lib/gateAccessNo.js';
-import { cancelPtPurchase } from '../lib/ptCancel.js';
+import { formatGateAccessNo } from '../lib/gateAccessNo.js';
 import {
   getIdPhotoMetaForMember,
   normalizeIdPhotoSide,
@@ -398,6 +401,17 @@ router.post('/payuni/webhook', async (req, res) => {
         return res.status(200).send('OK');
       }
 
+      // 3b-2. 團課報名（GRP…）：報名生效＋開票，禁止入帳錢包
+      if (String(orderId || '').startsWith('GRP')) {
+        try {
+          const r = await fulfillGroupOnlineOrder(orderId, tradeData.TradeNo || null);
+          if (r?.activated) console.log(`✅ 團課訂單 ${orderId} 刷卡入帳，報名 #${r.enrollmentId} 生效`);
+        } catch (grpErr) {
+          console.error(`❌ 團課訂單 ${orderId} 入帳失敗（刷卡款請人工核對）：`, grpErr.message);
+        }
+        return res.status(200).send('OK');
+      }
+
       // 3c. 儲值／購案 Order（CRS／TYK…）
       const order = await prisma.order.findUnique({ 
         where: { id: orderId },
@@ -469,6 +483,7 @@ router.post('/payuni/webhook', async (req, res) => {
               await fulfillPromotionPurchase(tx, order.memberId, promotion, {
                 qty,
                 durationDaysOverride: durationDaysOverride ?? undefined,
+                orderId: order.id,
               });
             }
           }
@@ -491,67 +506,8 @@ router.post('/payuni/webhook', async (req, res) => {
           }
         }
 
-        // 開立電子發票；失敗則沖回履約並標 FAILED（刷卡款須人工退）
-        try {
-          await tryIssueOrderInvoice(order, order.member.name);
-        } catch (invoiceError) {
-          console.error(`❌ 訂單 ${orderId} 發票失敗，沖回交易:`, invoiceError.message);
-          try {
-            const promoMatch = (order.itemDesc || '').match(/商品#(\d+)/);
-            const promotionId = promoMatch ? parseInt(promoMatch[1], 10) : null;
-            await prisma.$transaction(async (tx) => {
-              const paid = await tx.order.findUnique({ where: { id: orderId } });
-              if (!paid || paid.status !== 'PAID') return;
-              if (promotionId) {
-                const promotion = await tx.promotion.findUnique({ where: { id: promotionId } });
-                const member = await tx.member.findUnique({ where: { id: paid.memberId } });
-                if (promotion && member) {
-                  if (isUnlimitedPromotion(promotion)) {
-                    const days = promotion.durationDays || 0;
-                    let nextExpire = member.expireDate ? new Date(member.expireDate) : null;
-                    if (nextExpire && days > 0) nextExpire.setDate(nextExpire.getDate() - days);
-                    const stillValid = nextExpire && nextExpire.getTime() > Date.now();
-                    await tx.member.update({
-                      where: { id: member.id },
-                      data: {
-                        expireDate: stillValid ? nextExpire : null,
-                        plan: stillValid ? member.plan || UNLIMITED_MEMBER_PLAN : '計時會員',
-                      },
-                    });
-          } else {
-                    const qty = parseTopupQtyFromItemDesc(paid.itemDesc) || 1;
-                    const cash = promotion.price * qty;
-                    const bonus = promotion.bonusGiven * qty;
-                    await tx.member.update({
-                      where: { id: member.id },
-                      data: {
-                        cashWallet: {
-                          decrement: Math.min(cash, Number(member.cashWallet) || 0),
-                        },
-                        bonusWallet: {
-                          decrement: Math.min(bonus, Number(member.bonusWallet) || 0),
-                        },
-                      },
-                    });
-                  }
-                }
-              }
-              await tx.order.update({
-                where: { id: orderId },
-                data: {
-                  status: 'FAILED',
-                  invoiceNumber: null,
-                  itemDesc: `${paid.itemDesc || ''}｜電子發票開立失敗，交易取消`.slice(0, 500),
-                },
-              });
-            });
-            console.error(
-              `⚠️ 訂單 ${orderId} 因開票失敗已標 FAILED；PayUNi 刷卡款請人工退款（TradeNo=${tradeData.TradeNo}）`,
-            );
-          } catch (abortErr) {
-            console.error(`訂單 ${orderId} 開票失敗後沖回例外:`, abortErr.message);
-          }
-        }
+        // 開立電子發票；失敗入佇列補開（禁止沖回已收款）
+        await tryIssueOrderInvoice(order, order.member.name);
       } else if (
         order &&
         order.status === 'PAID' &&
@@ -598,15 +554,12 @@ function extractMerTradeNoFromPayuniReturn(body = {}, query = {}) {
     };
   }
 
-  let tradeData = null;
+  let tradeData;
   let note = 'ok';
   try {
-    if (hashInfo && verifyWebhookHash(encryptInfo, hashInfo)) {
-      tradeData = decryptInfo(encryptInfo);
-    } else {
-      tradeData = decryptInfo(encryptInfo);
-      note = hashInfo ? 'hash_mismatch' : 'no_hash';
-    }
+    const hashOk = Boolean(hashInfo) && verifyWebhookHash(encryptInfo, hashInfo);
+    tradeData = decryptInfo(encryptInfo);
+    if (!hashOk) note = hashInfo ? 'hash_mismatch' : 'no_hash';
   } catch (err) {
     return {
       merTradeNo: null,
@@ -631,24 +584,7 @@ function extractMerTradeNoFromPayuniReturn(body = {}, query = {}) {
 }
 
 function sendPayuniBrowserBounce(res, targetUrl) {
-  const safe = String(targetUrl).replace(/&/g, '&amp;').replace(/"/g, '&quot;');
-  const jsUrl = JSON.stringify(String(targetUrl));
-  res
-    .status(200)
-    .type('html')
-    .send(`<!doctype html>
-<html lang="zh-Hant">
-<head>
-  <meta charset="utf-8" />
-  <meta http-equiv="refresh" content="0;url=${safe}" />
-  <title>返回系統</title>
-</head>
-<body>
-  <p>付款流程結束，正在返回系統…</p>
-  <p><a href="${safe}">若未自動跳轉，請點此返回</a></p>
-  <script>window.location.replace(${jsUrl});</script>
-</body>
-</html>`);
+  res.redirect(302, targetUrl);
 }
 
 function handlePayuniBrowserReturn(req, res) {
@@ -664,6 +600,9 @@ function handlePayuniBrowserReturn(req, res) {
     if (merTradeNo.startsWith('CHK')) checkoutId = merTradeNo;
     else if (merTradeNo.startsWith('SAL')) saleId = merTradeNo;
     else if (merTradeNo.startsWith('TYK') || merTradeNo.startsWith('CRS')) orderId = merTradeNo;
+    else if (merTradeNo.startsWith('GRP')) {
+      return sendPayuniBrowserBounce(res, payReturnRedirect({ orderId: merTradeNo, kind: 'group' }));
+    }
 
     console.log(
       '🪃 PayUNi ReturnURL → 前端',
@@ -732,6 +671,16 @@ async function handleLinePayConfirm(req, res) {
       await confirmLinePayPayment({ transactionId, amount });
       await fulfillCardSaleOrder(orderId, `LP:${transactionId}`, null, null);
       redirectTarget = posPayReturnRedirect({ saleId: orderId });
+    } else if (orderId.startsWith('GRP')) {
+      const order = await prisma.order.findUnique({ where: { id: orderId } });
+      if (!order) {
+        return res.status(404).json({ status: 'error', message: '找不到訂單' });
+      }
+      if (order.status !== 'PAID') {
+        await confirmLinePayPayment({ transactionId, amount: Math.round(Number(order.amount)) });
+        await fulfillGroupOnlineOrder(orderId, `LP:${transactionId}`);
+      }
+      redirectTarget = payReturnRedirect({ orderId, kind: 'group' });
     } else {
       const order = await prisma.order.findUnique({ where: { id: orderId } });
       if (!order) {
@@ -753,7 +702,7 @@ async function handleLinePayConfirm(req, res) {
             const promotion = await tx.promotion.findUnique({ where: { id: promotionId } });
             if (promotion) {
               const qty = parseTopupQtyFromItemDesc(order.itemDesc);
-              await fulfillPromotionPurchase(tx, order.memberId, promotion, { qty });
+              await fulfillPromotionPurchase(tx, order.memberId, promotion, { qty, orderId: order.id });
             }
           }
         });
@@ -788,7 +737,14 @@ async function handleLinePayCancel(req, res) {
   const client = String(q.client || '').toLowerCase();
   try {
     let target;
-    if (client === 'member') {
+    if (orderId.startsWith('GRP')) {
+      const enrollment = await prisma.groupEnrollment.findUnique({ where: { orderId } });
+      if (enrollment?.status === 'PENDING') {
+        await prisma.$transaction((tx) => releaseEnrollmentHold(tx, enrollment.id, 'CANCELLED'));
+        processWaitlist(enrollment.seriesId).catch(() => {});
+      }
+      target = payReturnRedirect({ orderId, kind: 'group' });
+    } else if (client === 'member') {
       target = payReturnRedirect(orderId ? { orderId } : {});
     } else if (orderId.startsWith('CHK')) {
       target = checkoutPayReturnRedirect({ checkoutId: orderId });
@@ -839,191 +795,56 @@ router.get('/id-photo-access/:token', async (req, res) => {
 });
 
 // 所有 ops.js 內的路由，強制通過員工海關驗證
-// 交易異動（退費／取消／訂閱請假）限 DUTY 以上；其餘限櫃檯模組
+// 訂閱／請假限 DUTY 以上；其餘限櫃檯模組（退費／取消／折讓單在 routes/opsTransactions.js）
 router.use(verifyStaff);
 router.use((req, res, next) => {
-  const txExact = new Set([
-    '/refund',
-    '/refund-lookup',
-    '/cancel-sale',
-    '/cancel-pt-purchase',
-    '/allowances',
-  ]);
   const isTxPath =
-    txExact.has(req.path) ||
-    req.path.startsWith('/allowances/') ||
     req.path.startsWith('/card-subscriptions') ||
     req.path.startsWith('/member-leaves');
-  // cancel-gate：在場取消開放 ops；已出場退費仍於 handler 內要求 DUTY+
-  if (req.path === '/cancel-gate') {
-    return requirePermission('ops')(req, res, next);
-  }
   if (isTxPath) {
     return requireDutyOrAbove(req, res, next);
   }
   return requirePermission('ops')(req, res, next);
 });
 
-/**
- * 從 Order 追溯當初儲值的本金 (price) 與贈送運動金 (bonusGiven)
- * 必須優先讀 itemDesc 當下快照（防 Promotion 事後改價導致退費算錯）
- */
-async function resolveTopupMetaFromOrder(order, tx) {
-  if (isUnlimitedTopupOrder(order.itemDesc)) {
-    const promoMatch = (order.itemDesc || '').match(/商品#(\d+)/);
-    const promotionId = promoMatch ? parseInt(promoMatch[1], 10) : null;
-    return {
-      usageType: 'UNLIMITED',
-      price: order.amount,
-      bonusGiven: 0,
-      promotionId,
-      promotionName: order.itemDesc,
-      source: 'itemDesc',
-    };
-  }
-
-  const cashMatch = (order.itemDesc || '').match(/現金\+(\d+(?:\.\d+)?)/);
-  const bonusMatch = (order.itemDesc || '').match(/運動金\+(\d+(?:\.\d+)?)/);
-  const promoMatch = (order.itemDesc || '').match(/商品#(\d+)/);
-  const promotionId = promoMatch ? parseInt(promoMatch[1], 10) : null;
-
-  // ① 訂單寫入當下的配發快照（權威）
-  if (cashMatch && bonusMatch) {
-    return {
-      price: parseFloat(cashMatch[1]),
-      bonusGiven: parseFloat(bonusMatch[1]),
-      promotionId,
-      promotionName: order.itemDesc,
-      source: 'itemDesc',
-    };
-  }
-
-  // ② 備援：查 Promotion 表（舊訂單可能沒寫快照數字）
-  if (promotionId) {
-    const promotion = await tx.promotion.findUnique({ where: { id: promotionId } });
-    if (promotion) {
-      return {
-        price: promotion.price,
-        bonusGiven: promotion.bonusGiven,
-        promotionId: promotion.id,
-        promotionName: promotion.name,
-        source: 'promotion',
-      };
-    }
-  }
-
-  return {
-    price: order.amount,
-    bonusGiven: 0,
-    promotionId,
-    promotionName: order.itemDesc,
-    source: 'order.amount',
-  };
+/** 單據發票摘要（invoiceNumber／invoiceStatus／invoices），來源 EInvoice */
+async function invoiceFieldsOf(refId, opts = {}) {
+  const { invoiceNumber, invoiceStatus, invoices } = await attachInvoiceSummary({ id: refId }, opts);
+  return { invoiceNumber, invoiceStatus, invoices };
 }
 
-function roundMoney(n) {
-  return parseFloat(Number(n).toFixed(2));
-}
-
-/** 計時儲值退費手續費（新台幣） */
-const TIMED_TOPUP_REFUND_FEE = 100;
-
-/**
- * 計時儲值退費：
- * 退費金額 = 實付金額 − 實際使用額度 − 手續費$100
- * - 實付＝方案本金（訂單配發現金）
- * - 實際使用＝已用本金 + 已消耗運動金
- * - 手續費固定 100
- */
-function computeTimedTopupRefund({
-  cashWallet,
-  bonusWallet,
-  originalPrice,
-  originalBonus,
-}) {
-  const paidAmount = roundMoney(originalPrice);
-  const recoveredBonus = roundMoney(Math.min(Number(bonusWallet) || 0, originalBonus));
-  const shortfall = roundMoney(originalBonus - recoveredBonus);
-  const remainingPrincipal = roundMoney(
-    Math.min(Number(cashWallet) || 0, originalPrice),
-  );
-  const usedPrincipal = roundMoney(originalPrice - remainingPrincipal);
-  const usedAmount = roundMoney(usedPrincipal + shortfall);
-  const beforeFee = roundMoney(paidAmount - usedAmount);
-  const refundFee = TIMED_TOPUP_REFUND_FEE;
-  const refundCash = roundMoney(beforeFee - refundFee);
-  return {
-    paidAmount,
-    recoveredBonus,
-    shortfall,
-    remainingPrincipal,
-    usedPrincipal,
-    usedAmount,
-    beforeFee,
-    refundFee,
-    refundCash,
-  };
-}
-
-/** 臨櫃回傳用的會員摘要（共用 lib） */
-// toCounterMemberView / normalizePhone 自 memberIdentify 匯入
-
-
+/** 已收款訂單開票；失敗入佇列（不沖回已收款），回傳發票號或 null */
 async function tryIssueOrderInvoice(order, buyerName) {
-  try {
-    const isRecurringInvoice = String(order.cardMode || '').toUpperCase() === 'RECURRING';
-    let invoiceItemDesc = order.itemDesc;
-    if (isRecurringInvoice) {
-      const promoMatch = String(order.itemDesc || '').match(/\| ([^|]+) \| UNLIMITED/);
-      const promoName =
-        promoMatch?.[1]?.trim() ||
-        String(order.itemDesc || '')
-          .split('|')[1]
-          ?.trim() ||
-        '月卡';
-      invoiceItemDesc = buildRecurringInvoiceItemDesc(promoName, { periodIndex: 1 });
-    }
-    const invoiceResult = await issueInvoice({
-      id: order.id,
-      amount: order.amount,
-      itemDesc: invoiceItemDesc,
-      buyerName: buyerName || '體育客顧客',
-      carrierNum: order.carrierNum || null,
-      buyerUbn: order.buyerUbn || null,
-      loveCode: order.loveCode || null,
-    });
-
-    if (invoiceResult.Status === 'SUCCESS') {
-      const invoiceData = JSON.parse(invoiceResult.Result);
-      await prisma.order.update({
-        where: { id: order.id },
-        data: { invoiceNumber: invoiceData.InvoiceNumber },
-      });
-      console.log(`🧾 訂單 ${order.id} 發票：${invoiceData.InvoiceNumber}`);
-      return invoiceData.InvoiceNumber;
-    }
-    const message = invoiceResult.Message || String(invoiceResult);
-    console.error(`❌ 訂單 ${order.id} 發票失敗:`, message);
-    const err = new Error(`電子發票開立失敗：${message}`);
-    err.statusCode = 502;
-    throw err;
-  } catch (error) {
-    if (error.statusCode) throw error;
-    console.error(`❌ 訂單 ${order.id} 發票例外:`, error.message);
-    const err = new Error(`電子發票開立失敗：${error.message}`);
-    err.statusCode = 502;
-    throw err;
+  let itemName = null;
+  if (String(order.cardMode || '').toUpperCase() === 'RECURRING') {
+    const promoMatch = String(order.itemDesc || '').match(/\| ([^|]+) \| UNLIMITED/);
+    const promoName =
+      promoMatch?.[1]?.trim() ||
+      String(order.itemDesc || '')
+        .split('|')[1]
+        ?.trim() ||
+      '月卡';
+    itemName = buildRecurringInvoiceItemDesc(promoName, { periodIndex: 1 });
   }
+  const inv = await issueOrderInvoice(order.id, { buyerName, itemName });
+  return inv.invoiceNumber || null;
 }
 
 // ==========================================
 // 信用卡定期定額訂閱管理
 // ==========================================
 
+/** 非跨店員工綁會員分店：僅保留自身範圍（本店＋隸屬分店），全不符則退回本店 */
+function scopeMemberBranchIds(req, requested) {
+  const scope = staffBranchIds(req.user);
+  const kept = requested.filter((id) => scope.includes(id));
+  return kept.length > 0 ? kept : [req.user.branchId];
+}
+
 function assertSubscriptionBranchAccess(req, sub) {
   const branchId = sub?.promotion?.branchId ?? sub?.coursePlan?.branchId ?? null;
   if (branchId == null) {
-    if (isAdminUser(req.user)) return;
+    if (isCrossBranchUser(req.user)) return;
     const err = new Error('⛔ 訂閱缺少分店綁定，請洽管理員');
     err.statusCode = 403;
     throw err;
@@ -1084,7 +905,6 @@ async function resolveSubscriptionByRef(ref, { include } = {}) {
         status: true,
         memberId: true,
         amount: true,
-        invoiceNumber: true,
         payMethod: true,
         creditHash: true,
         recurringAmount: true,
@@ -1283,8 +1103,8 @@ router.get('/card-subscriptions', async (req, res) => {
     const filtered = rows.filter((r) => {
       const branchId = r.promotion?.branchId ?? r.coursePlan?.branchId ?? null;
       if (branchId == null) {
-        // 無分店綁定：ADMIN 可見；一般員工略過（避免誤放行）
-        return isAdminUser(req.user);
+        // 無分店綁定：跨店職位可見；一般員工略過（避免誤放行）
+        return isCrossBranchUser(req.user);
       }
       try {
         assertBranchAccess(req, branchId);
@@ -1352,6 +1172,7 @@ router.post('/card-subscriptions/:id/cancel', async (req, res) => {
         reason: req.body?.reason,
         expirePolicy: policy,
         doAllowance: req.body?.doAllowance,
+        staffId: req.user?.id ?? null,
       });
       const inv =
         result.invoice?.action === 'allowance'
@@ -1363,28 +1184,10 @@ router.post('/card-subscriptions/:id/cancel', async (req, res) => {
         result.expirePolicy === 'KEEP'
           ? `效期保留（剩餘約 ${result.unusedDays} 天）`
           : `效期已截斷（原剩餘 ${result.unusedDays} 天）`;
-      let allowanceSlip = null;
-      if (result.invoice?.action === 'allowance') {
-        const branchId =
-          (await resolveBranchIdForOrder(unlimitedOrder)) || req.user?.branchId || null;
-        const sellerHeader = await resolveInvoiceSellerHeader(branchId);
-        allowanceSlip = await savePrintableAllowanceSlip({
-          reverseResult: result.invoice,
-          orderId: unlimitedOrder.id,
-          memberId: unlimitedOrder.memberId,
-          memberName: result.member?.name || unlimitedOrder.member?.name,
-          itemDesc: unlimitedOrder.itemDesc,
-          merchantOrderNo: result.invoice.merchantOrderNo || unlimitedOrder.id,
-          amount: result.invoice.allowanceAmt || result.allowance?.allowanceAmt,
-          source: 'SUB_CANCEL',
-          staffId: req.user?.id ?? null,
-          sellerHeader,
-        });
-      }
       return res.json({
         status: 'success',
         message: `月卡購案已取消；${exp}${inv}`,
-        data: { ...result, orderId: unlimitedOrder.id, allowanceSlip },
+        data: { ...result, orderId: unlimitedOrder.id, allowanceSlip: result.invoice?.slip || null },
       });
     }
 
@@ -1399,6 +1202,7 @@ router.post('/card-subscriptions/:id/cancel', async (req, res) => {
         expirePolicy,
         doAllowance: req.body?.doAllowance,
         forceLocalOnly,
+        staffId: req.user?.id ?? null,
       });
       const inv =
         result.invoice?.action === 'allowance'
@@ -1410,27 +1214,7 @@ router.post('/card-subscriptions/:id/cancel', async (req, res) => {
         result.expirePolicy === 'KEEP'
           ? `效期保留（剩餘約 ${result.unusedDays} 天）`
           : `效期已截斷（原剩餘 ${result.unusedDays} 天）`;
-      let allowanceSlip = null;
-      if (result.invoice?.action === 'allowance') {
-        const order = result.order || (sub.originOrderId
-          ? await prisma.order.findUnique({ where: { id: sub.originOrderId } })
-          : null);
-        const sellerHeader = await resolveInvoiceSellerHeader(
-          sub.promotion?.branchId ?? sub.coursePlan?.branchId ?? null,
-        );
-        allowanceSlip = await savePrintableAllowanceSlip({
-          reverseResult: result.invoice,
-          orderId: order?.id || sub.originOrderId || null,
-          memberId: sub.memberId,
-          memberName: result.member?.name || null,
-          itemDesc: order?.itemDesc || null,
-          merchantOrderNo: result.invoice.merchantOrderNo || order?.id,
-          amount: result.invoice.allowanceAmt || result.allowance?.allowanceAmt,
-          source: 'SUB_CANCEL',
-          staffId: req.user?.id ?? null,
-          sellerHeader,
-        });
-      }
+      const allowanceSlip = result.invoice?.slip || null;
       return res.json({
         status: 'success',
         message: `訂閱已取消；${exp}${inv}${
@@ -1574,7 +1358,7 @@ router.get('/card-subscriptions/:id/cancel-preview', async (req, res) => {
           ? {
               id: latest.order.id,
               amount: latest.order.amount,
-              invoiceNumber: latest.order.invoiceNumber,
+              invoiceNumber: (await issuedInvoiceFor(latest.order.id))?.invoiceNumber || null,
               status: latest.order.status,
               periodIndex: latest.periodIndex,
             }
@@ -2013,6 +1797,7 @@ router.get('/shift/current', async (req, res) => {
         branchId,
         from: open.startedAt,
         to: new Date(),
+        carryFrom: await previousShiftEnd(open),
       });
     }
     const preview = open ? null : await getShiftOpenPreview(branchId);
@@ -2027,7 +1812,9 @@ router.get('/shift/current', async (req, res) => {
           : null,
         liveSummary,
         expectedCash: open
-          ? Math.round(((open.openingFloat || 0) + (liveSummary?.cashIn || 0)) * 100) / 100
+          ? Math.round(
+              ((open.openingFloat || 0) + (liveSummary?.cashIn || 0) - (liveSummary?.cashRefund || 0)) * 100,
+            ) / 100
           : null,
         openPreview: preview,
         payMethodColumns: PAY_METHOD_COLUMNS,
@@ -2191,10 +1978,11 @@ router.get('/yipay/reconcile', async (req, res) => {
 
 router.get('/invoice-jobs', async (req, res) => {
   try {
-    const items = await listInvoiceJobs({
+    const items = await listEInvoices({
       status: req.query.status,
       take: req.query.take,
       checkoutId: req.query.checkoutId,
+      branchIds: isCrossBranchUser(req.user) ? null : staffBranchIds(req.user),
     });
     return res.json({ status: 'success', data: { items } });
   } catch (error) {
@@ -2205,7 +1993,11 @@ router.get('/invoice-jobs', async (req, res) => {
 
 router.post('/invoice-jobs/:id/retry', async (req, res) => {
   try {
-    const job = await retryInvoiceJob(req.params.id);
+    const row = await prisma.eInvoice.findUnique({ where: { id: String(req.params.id) }, select: { branchId: true } });
+    if (row?.branchId && !canAccessBranch(req.user, row.branchId)) {
+      return res.status(403).json({ status: 'error', message: '⛔ 無權補開其他分店發票' });
+    }
+    const job = await retryEInvoice(req.params.id, { staffId: req.user?.id ?? null });
     return res.json({ status: 'success', message: '已重新排隊開票', data: job });
   } catch (error) {
     if (error.statusCode) {
@@ -2232,7 +2024,11 @@ router.post('/checkout', async (req, res) => {
     });
   } catch (error) {
     if (error.statusCode) {
-      return res.status(error.statusCode).json({ status: 'error', message: error.message });
+      return res.status(error.statusCode).json({
+        status: 'error',
+        ...(error.code ? { code: error.code } : {}),
+        message: error.message,
+      });
     }
     console.error(error);
     return res.status(500).json({ status: 'error', message: error.message || '合併結帳失敗' });
@@ -2318,7 +2114,6 @@ router.get('/checkout/:id', async (req, res) => {
           cardAmount: true,
           cardMode: true,
           merchantNo: true,
-          invoiceNumber: true,
           orderId: true,
           saleOrderId: true,
           ptFulfilled: true,
@@ -2341,7 +2136,7 @@ router.get('/checkout/:id', async (req, res) => {
           cardAmount: session.cardAmount,
           cardMode: session.cardMode,
           merchantNo: session.merchantNo,
-          invoiceNumber: session.invoiceNumber,
+          ...(await invoiceFieldsOf(session.id, { bySession: true })),
           ptFulfilled: session.ptFulfilled,
           hasCreditHash: Boolean(session.creditHash),
           updatedAt: session.updatedAt,
@@ -2358,7 +2153,6 @@ router.get('/checkout/:id', async (req, res) => {
         cardAmount: true,
         cardMode: true,
         merchantNo: true,
-        invoiceNumber: true,
         checkoutSessionId: true,
         creditHash: true,
         updatedAt: true,
@@ -2379,7 +2173,7 @@ router.get('/checkout/:id', async (req, res) => {
         cardAmount: order.cardAmount,
         cardMode: order.cardMode,
         merchantNo: order.merchantNo,
-        invoiceNumber: order.invoiceNumber,
+        ...(await invoiceFieldsOf(order.id)),
         ptFulfilled: null,
         hasCreditHash: Boolean(order.creditHash),
         updatedAt: order.updatedAt,
@@ -2489,6 +2283,10 @@ router.post(['/topup', '/deposit'], async (req, res) => {
 
     const amount = computeTopupAmount(promotion, parsedQty);
     const itemDesc = buildTopupItemDesc(promotion, '臨櫃', parsedQty);
+    // 開票營業人＝方案所屬分店；全店通用方案歸櫃檯所在分店
+    const topupBranchId = promotion.branchId ?? req.user?.branchId ?? null;
+    const saveTopupInvoiceRequest = (tx, orderId) =>
+      saveInvoiceRequest(tx, { refType: 'ORDER', refId: orderId, buyerName: member.name, ...invoiceOpts });
 
     let pay;
     try {
@@ -2499,6 +2297,9 @@ router.post(['/topup', '/deposit'], async (req, res) => {
       );
     } catch (error) {
       return res.status(error.statusCode || 400).json({ status: 'error', message: error.message });
+    }
+    if (pay.walletAmount > 0 && !isUnlimitedPromotion(promotion)) {
+      return res.status(400).json({ status: 'error', code: 'TOPUP_NO_WALLET', message: TOPUP_NO_WALLET_MESSAGE });
     }
 
     let cardOpts = { cardMode: 'LUMP', cardInst: null, periodType: null, periodTimes: null };
@@ -2541,24 +2342,22 @@ router.post(['/topup', '/deposit'], async (req, res) => {
     // 乙禾現場刷卡：PENDING，端末成功後 POST /ops/confirm-yipay
     if (pay.needsYipay) {
       const order = await prisma.$transaction(async (tx) => {
+        await lockOpenShiftForSale(tx, topupBranchId);
+        const orderId = resolveTopupOrderId({ promotion });
         if (pay.walletAmount > 0) {
-          const m = await tx.member.findUnique({ where: { id: parsedMemberId } });
-          if (!m || m.cashWallet < pay.walletAmount) {
-            const err = new Error(
-              `零錢包（本金）不足（餘額 $${m?.cashWallet ?? 0}，應付 $${pay.walletAmount}）；運動金不可折抵`,
-            );
-        err.statusCode = 400;
-        throw err;
-          }
-          await tx.member.update({
-            where: { id: parsedMemberId },
-            data: { cashWallet: { decrement: pay.walletAmount } },
+          await payWithCashWallet(tx, {
+            memberId: parsedMemberId,
+            amount: pay.walletAmount,
+            refType: 'ORDER',
+            refId: orderId,
+            staffId: req.user?.id,
+            branchId: topupBranchId,
           });
         }
 
-        return tx.order.create({
+        const created = await tx.order.create({
           data: {
-            id: resolveTopupOrderId({ promotion }),
+            id: orderId,
             memberId: parsedMemberId,
             amount,
             itemDesc,
@@ -2566,12 +2365,12 @@ router.post(['/topup', '/deposit'], async (req, res) => {
             payBreakdown: pay.breakdown,
             voucherCode: pay.voucherCode,
             cardAmount: pay.yipayAmount,
-            carrierNum: invoiceOpts.carrierNum,
-            buyerUbn: invoiceOpts.buyerUbn,
-            loveCode: invoiceOpts.loveCode,
+            branchId: topupBranchId,
             status: 'PENDING',
           },
         });
+        await saveTopupInvoiceRequest(tx, created.id);
+        return created;
       });
 
       return res.json({
@@ -2596,27 +2395,22 @@ router.post(['/topup', '/deposit'], async (req, res) => {
     // 含刷卡：PENDING，刷卡成功後再入帳（避免未付完先配發）
     if (pay.needsCard) {
       const order = await prisma.$transaction(async (tx) => {
+        await lockOpenShiftForSale(tx, topupBranchId);
+        const orderId = resolveTopupOrderId({ cardMode: cardOpts.cardMode, promotion });
         if (pay.walletAmount > 0) {
-          const m = await tx.member.findUnique({ where: { id: parsedMemberId } });
-          if (!m || m.cashWallet < pay.walletAmount) {
-            const err = new Error(
-              `零錢包（本金）不足（餘額 $${m?.cashWallet ?? 0}，應付 $${pay.walletAmount}）；運動金不可折抵`,
-            );
-            err.statusCode = 400;
-            throw err;
-          }
-          await tx.member.update({
-        where: { id: parsedMemberId },
-            data: { cashWallet: { decrement: pay.walletAmount } },
+          await payWithCashWallet(tx, {
+            memberId: parsedMemberId,
+            amount: pay.walletAmount,
+            refType: 'ORDER',
+            refId: orderId,
+            staffId: req.user?.id,
+            branchId: topupBranchId,
           });
         }
 
-        return tx.order.create({
+        const created = await tx.order.create({
           data: {
-            id: resolveTopupOrderId({
-              cardMode: cardOpts.cardMode,
-              promotion,
-            }),
+            id: orderId,
             memberId: parsedMemberId,
             amount,
             itemDesc,
@@ -2629,12 +2423,12 @@ router.post(['/topup', '/deposit'], async (req, res) => {
             periodType: cardOpts.periodType,
             periodTimes: cardOpts.periodTimes,
             recurringAmount,
-            carrierNum: invoiceOpts.carrierNum,
-            buyerUbn: invoiceOpts.buyerUbn,
-            loveCode: invoiceOpts.loveCode,
+            branchId: topupBranchId,
             status: 'PENDING',
           },
         });
+        await saveTopupInvoiceRequest(tx, created.id);
+        return created;
       });
 
       const { actionUrl, payload: payuniPayload } = buildCardCheckoutRequest({
@@ -2693,24 +2487,22 @@ router.post(['/topup', '/deposit'], async (req, res) => {
       }
 
       const pendingOrder = await prisma.$transaction(async (tx) => {
+        await lockOpenShiftForSale(tx, topupBranchId);
+        const orderId = resolveTopupOrderId({ promotion });
         if (pay.walletAmount > 0) {
-          const m = await tx.member.findUnique({ where: { id: parsedMemberId } });
-          if (!m || m.cashWallet < pay.walletAmount) {
-            const err = new Error(
-              `零錢包（本金）不足（餘額 $${m?.cashWallet ?? 0}，應付 $${pay.walletAmount}）；運動金不可折抵`,
-            );
-            err.statusCode = 400;
-        throw err;
-          }
-          await tx.member.update({
-            where: { id: parsedMemberId },
-            data: { cashWallet: { decrement: pay.walletAmount } },
+          await payWithCashWallet(tx, {
+            memberId: parsedMemberId,
+            amount: pay.walletAmount,
+            refType: 'ORDER',
+            refId: orderId,
+            staffId: req.user?.id,
+            branchId: topupBranchId,
           });
         }
 
-        return tx.order.create({
+        const created = await tx.order.create({
           data: {
-            id: resolveTopupOrderId({ promotion }),
+            id: orderId,
             memberId: parsedMemberId,
             amount,
             itemDesc,
@@ -2718,12 +2510,12 @@ router.post(['/topup', '/deposit'], async (req, res) => {
             payBreakdown: pay.breakdown,
             voucherCode: pay.voucherCode,
             cardAmount: 0,
-            carrierNum: invoiceOpts.carrierNum,
-            buyerUbn: invoiceOpts.buyerUbn,
-            loveCode: invoiceOpts.loveCode,
+            branchId: topupBranchId,
             status: 'PENDING',
           },
         });
+        await saveTopupInvoiceRequest(tx, created.id);
+        return created;
       });
 
       let branchName = null;
@@ -2747,14 +2539,18 @@ router.post(['/topup', '/deposit'], async (req, res) => {
         });
       } catch (lpErr) {
         await prisma.$transaction(async (tx) => {
-          await tx.order.update({
-            where: { id: pendingOrder.id },
+          const claimed = await tx.order.updateMany({
+            where: { id: pendingOrder.id, status: 'PENDING' },
             data: { status: 'CANCELLED' },
           });
-          if (pay.walletAmount > 0) {
-            await tx.member.update({
-        where: { id: parsedMemberId },
-              data: { cashWallet: { increment: pay.walletAmount } },
+          if (claimed.count && pay.walletAmount > 0) {
+            await restoreHeldCashWallet(tx, {
+              memberId: parsedMemberId,
+              refType: 'ORDER',
+              refId: pendingOrder.id,
+              staffId: req.user?.id,
+              branchId: topupBranchId,
+              reason: `臨櫃 LINE Pay 扣款失敗，退回零錢包 ${pendingOrder.id}`,
             });
           }
         });
@@ -2766,7 +2562,7 @@ router.post(['/topup', '/deposit'], async (req, res) => {
           tx,
           parsedMemberId,
           promotion,
-          { qty: parsedQty },
+          { qty: parsedQty, orderId: pendingOrder.id },
         );
         const order = await tx.order.update({
           where: { id: pendingOrder.id },
@@ -2780,69 +2576,8 @@ router.post(['/topup', '/deposit'], async (req, res) => {
         return { updatedMember, order, promotion, fulfillment };
       });
 
-      const invoiceNumber = await tryIssueOrderInvoice(result.order, result.updatedMember.name).catch(
-        async (invErr) => {
-          await prisma.$transaction(async (tx) => {
-            const paid = await tx.order.findUnique({ where: { id: result.order.id } });
-            if (!paid || paid.status !== 'PAID') return;
-            const member = await tx.member.findUnique({ where: { id: paid.memberId } });
-            if (member && result.promotion) {
-              if (isUnlimitedPromotion(result.promotion)) {
-                const days = result.promotion.durationDays || 0;
-                let nextExpire = member.expireDate ? new Date(member.expireDate) : null;
-                if (nextExpire && days > 0) nextExpire.setDate(nextExpire.getDate() - days);
-                const stillValid = nextExpire && nextExpire.getTime() > Date.now();
-                await tx.member.update({
-                  where: { id: member.id },
-                  data: {
-                    expireDate: stillValid ? nextExpire : null,
-                    plan: stillValid ? member.plan || UNLIMITED_MEMBER_PLAN : '計時會員',
-                  },
-                });
-              } else {
-                const cash =
-                  result.fulfillment?.cashAdded ??
-                  result.promotion.price * (result.fulfillment?.qty || 1);
-                const bonus =
-                  result.fulfillment?.bonusAdded ??
-                  result.promotion.bonusGiven * (result.fulfillment?.qty || 1);
-                await tx.member.update({
-                  where: { id: member.id },
-                  data: {
-                    cashWallet: { decrement: Math.min(cash, Number(member.cashWallet) || 0) },
-                    bonusWallet: { decrement: Math.min(bonus, Number(member.bonusWallet) || 0) },
-                  },
-                });
-              }
-            }
-            if (pay.walletAmount > 0) {
-              await tx.member.update({
-                where: { id: parsedMemberId },
-                data: { cashWallet: { increment: pay.walletAmount } },
-              });
-            }
-            await tx.order.update({
-              where: { id: result.order.id },
-              data: {
-                status: 'FAILED',
-                invoiceNumber: null,
-                itemDesc: `${paid.itemDesc || ''}｜電子發票開立失敗，交易取消`.slice(0, 500),
-              },
-            });
-          });
-          try {
-            const { refundLinePayPayment } = await import('../lib/linepay.js');
-            await refundLinePayPayment({
-              transactionId: lp.transactionId,
-              refundAmount: pay.linePayAmount,
-            });
-          } catch (refundErr) {
-            console.error('Topup 開票失敗後 LinePay 退款失敗:', refundErr.message);
-            invErr.message = `${invErr.message}；LinePay 自動退款失敗請人工處理：${refundErr.message}`;
-          }
-          throw invErr;
-        },
-      );
+      // 已收款：開票失敗只入佇列補開，不沖回
+      const invoiceNumber = await tryIssueOrderInvoice(result.order, result.updatedMember.name);
       const successMessage =
         result.fulfillment.type === 'UNLIMITED'
           ? `【體育客】會員 [${result.updatedMember.name}] 購案成功：${result.promotion.name}（效期至 ${new Date(result.fulfillment.expireDate).toLocaleDateString('zh-TW')}）`
@@ -2875,18 +2610,16 @@ router.post(['/topup', '/deposit'], async (req, res) => {
 
     // 無刷卡／無 LinePay：當場入帳 + 開發票（可含零錢包折抵）
     const result = await prisma.$transaction(async (tx) => {
+      await lockOpenShiftForSale(tx, topupBranchId);
+      const orderId = resolveTopupOrderId({ promotion });
       if (pay.walletAmount > 0) {
-        const m = await tx.member.findUnique({ where: { id: parsedMemberId } });
-        if (!m || m.cashWallet < pay.walletAmount) {
-          const err = new Error(
-            `零錢包（本金）不足（餘額 $${m?.cashWallet ?? 0}，應付 $${pay.walletAmount}）；運動金不可折抵`,
-          );
-          err.statusCode = 400;
-          throw err;
-        }
-        await tx.member.update({
-          where: { id: parsedMemberId },
-          data: { cashWallet: { decrement: pay.walletAmount } },
+        await payWithCashWallet(tx, {
+          memberId: parsedMemberId,
+          amount: pay.walletAmount,
+          refType: 'ORDER',
+          refId: orderId,
+          staffId: req.user?.id,
+          branchId: topupBranchId,
         });
       }
 
@@ -2894,12 +2627,12 @@ router.post(['/topup', '/deposit'], async (req, res) => {
         tx,
         parsedMemberId,
         promotion,
-        { qty: parsedQty },
+        { qty: parsedQty, ledgerRefId: orderId, staffId: req.user?.id, branchId: topupBranchId },
       );
 
       const order = await tx.order.create({
         data: {
-          id: resolveTopupOrderId({ promotion }),
+          id: orderId,
           memberId: parsedMemberId,
           amount: fulfillment.amount,
           itemDesc: buildTopupItemDesc(promotion, '臨櫃', fulfillment.qty),
@@ -2907,69 +2640,18 @@ router.post(['/topup', '/deposit'], async (req, res) => {
           payBreakdown: pay.breakdown,
           voucherCode: pay.voucherCode,
           cardAmount: 0,
-          carrierNum: invoiceOpts.carrierNum,
-            buyerUbn: invoiceOpts.buyerUbn,
-            loveCode: invoiceOpts.loveCode,
+          branchId: topupBranchId,
           status: 'PAID',
+          ...fulfillmentGrantData(fulfillment),
         },
       });
+      await saveTopupInvoiceRequest(tx, order.id);
 
       return { updatedMember, order, promotion, fulfillment };
     });
 
-    const invoiceNumber = await tryIssueOrderInvoice(result.order, result.updatedMember.name).catch(
-      async (invErr) => {
-        await prisma.$transaction(async (tx) => {
-          const paid = await tx.order.findUnique({ where: { id: result.order.id } });
-          if (!paid || paid.status !== 'PAID') return;
-          const member = await tx.member.findUnique({ where: { id: paid.memberId } });
-          if (member && result.promotion) {
-            if (isUnlimitedPromotion(result.promotion)) {
-              const days = result.promotion.durationDays || 0;
-              let nextExpire = member.expireDate ? new Date(member.expireDate) : null;
-              if (nextExpire && days > 0) nextExpire.setDate(nextExpire.getDate() - days);
-              const stillValid = nextExpire && nextExpire.getTime() > Date.now();
-              await tx.member.update({
-                where: { id: member.id },
-                data: {
-                  expireDate: stillValid ? nextExpire : null,
-                  plan: stillValid ? member.plan || UNLIMITED_MEMBER_PLAN : '計時會員',
-                },
-              });
-            } else {
-              const cash =
-                result.fulfillment?.cashAdded ??
-                result.promotion.price * (result.fulfillment?.qty || 1);
-              const bonus =
-                result.fulfillment?.bonusAdded ??
-                result.promotion.bonusGiven * (result.fulfillment?.qty || 1);
-              await tx.member.update({
-                where: { id: member.id },
-                data: {
-                  cashWallet: { decrement: Math.min(cash, Number(member.cashWallet) || 0) },
-                  bonusWallet: { decrement: Math.min(bonus, Number(member.bonusWallet) || 0) },
-                },
-              });
-            }
-          }
-          if (pay.walletAmount > 0) {
-            await tx.member.update({
-              where: { id: parsedMemberId },
-              data: { cashWallet: { increment: pay.walletAmount } },
-            });
-          }
-          await tx.order.update({
-            where: { id: result.order.id },
-            data: {
-              status: 'FAILED',
-              invoiceNumber: null,
-              itemDesc: `${paid.itemDesc || ''}｜電子發票開立失敗，交易取消`.slice(0, 500),
-            },
-          });
-        });
-        throw invErr;
-      },
-    );
+    // 已收款：開票失敗只入佇列補開，不沖回
+    const invoiceNumber = await tryIssueOrderInvoice(result.order, result.updatedMember.name);
 
     const successMessage =
       result.fulfillment.type === 'UNLIMITED'
@@ -2987,8 +2669,8 @@ router.post(['/topup', '/deposit'], async (req, res) => {
         voucherCode: pay.voucherCode,
         invoiceNumber,
         carrierNum: invoiceOpts.carrierNum,
-            buyerUbn: invoiceOpts.buyerUbn,
-            loveCode: invoiceOpts.loveCode,
+        buyerUbn: invoiceOpts.buyerUbn,
+        loveCode: invoiceOpts.loveCode,
         promotion: {
           id: result.promotion.id,
           name: result.promotion.name,
@@ -3010,10 +2692,14 @@ router.post(['/topup', '/deposit'], async (req, res) => {
       },
     });
   } catch (error) {
-    console.error('儲值失敗:', error);
     if (error.statusCode) {
-      return res.status(error.statusCode).json({ status: 'error', message: error.message });
+      return res.status(error.statusCode).json({
+        status: 'error',
+        ...(error.code ? { code: error.code } : {}),
+        message: error.message,
+      });
     }
+    console.error('儲值失敗:', error);
     res.status(500).json({ status: 'error', message: '儲值失敗' });
   }
 });
@@ -3097,8 +2783,8 @@ router.post('/members', async (req, res) => {
   let resolvedBranchIds = Array.isArray(branchIds)
     ? branchIds.map((x) => parseInt(x, 10)).filter((n) => Number.isInteger(n) && n > 0)
     : [];
-  if (!isAdminUser(req.user) && req.user?.branchId) {
-    resolvedBranchIds = [req.user.branchId];
+  if (!isCrossBranchUser(req.user) && req.user?.branchId) {
+    resolvedBranchIds = scopeMemberBranchIds(req, resolvedBranchIds);
   }
   if (resolvedBranchIds.length === 0) {
     return res.status(400).json({
@@ -3286,8 +2972,8 @@ router.patch('/members/:id', async (req, res) => {
       try {
         data.idNumber = assertRequiredIdNumber(req.body.idNumber);
       } catch (e) {
-        return res.status(400).json({
-          status: 'error',
+    return res.status(400).json({
+      status: 'error',
           message: e.message || '證件號為必填（身分證／居留證／護照）',
         });
       }
@@ -3338,8 +3024,8 @@ router.patch('/members/:id', async (req, res) => {
     resolvedBranchIds = Array.isArray(req.body.branchIds)
       ? req.body.branchIds.map((x) => parseInt(x, 10)).filter((n) => Number.isInteger(n) && n > 0)
       : [];
-    if (!isAdminUser(req.user) && req.user?.branchId) {
-      resolvedBranchIds = [req.user.branchId];
+    if (!isCrossBranchUser(req.user) && req.user?.branchId) {
+      resolvedBranchIds = scopeMemberBranchIds(req, resolvedBranchIds);
     }
     if (resolvedBranchIds.length === 0) {
     return res.status(400).json({
@@ -3702,980 +3388,6 @@ router.post('/members/:id/bind-phone', async (req, res) => {
 });
 
 // ==========================================
-// 0.05 【退費折讓】強制回收贈送運動金 + ezPay 折讓單
-// 網址：POST /api/ops/refund
-// Payload：{ orderId?, invoiceNumber?, buyerEmail? }（至少 orderId 或 invoiceNumber）
-// 有發票時固定開立折讓（產出可列印折讓單）；不作廢
-// ==========================================
-router.post('/refund', async (req, res) => {
-  const { orderId: orderIdRaw, invoiceNumber: invoiceNumberRaw, buyerEmail: buyerEmailRaw, ...illegalFields } =
-    req.body || {};
-
-  if (Object.keys(illegalFields).length > 0) {
-    return res.status(400).json({
-      status: 'error',
-      message: `⛔ 非法參數：退費 API 只允許 orderId、invoiceNumber、buyerEmail，已拒絕 [${Object.keys(illegalFields).join(', ')}]`,
-    });
-  }
-
-  let buyerEmail;
-  let invoiceNumberInput;
-  try {
-    buyerEmail = normalizeBuyerEmail(buyerEmailRaw);
-    invoiceNumberInput = normalizeInvoiceNumberInput(invoiceNumberRaw);
-  } catch (normErr) {
-    return res.status(normErr.statusCode || 400).json({
-      status: 'error',
-      message: normErr.message,
-    });
-  }
-
-  let orderId = orderIdRaw ? String(orderIdRaw).trim() : '';
-  if (!orderId && !invoiceNumberInput) {
-    return res.status(400).json({
-      status: 'error',
-      message: '參數錯誤：請提供 orderId 或 invoiceNumber',
-    });
-  }
-
-  try {
-    if (!orderId && invoiceNumberInput) {
-      const byInv = await prisma.order.findFirst({
-        where: { invoiceNumber: invoiceNumberInput, status: 'PAID' },
-        orderBy: { createdAt: 'desc' },
-      });
-      if (!byInv) {
-        return res.status(404).json({
-          status: 'error',
-          message: `找不到發票 ${invoiceNumberInput} 對應的已付款訂單`,
-        });
-      }
-      orderId = byInv.id;
-    }
-
-    // ① 預覽計算（唯讀）→ ② ezPay 折讓 → ③ 錢包交易
-    const preview = await prisma.$transaction(async (tx) => {
-      const order = await tx.order.findUnique({ where: { id: orderId } });
-
-      if (!order) {
-        const err = new Error('找不到此訂單');
-        err.statusCode = 404;
-        throw err;
-      }
-
-      if (order.status !== 'PAID') {
-        const err = new Error(`⛔ 訂單狀態為 [${order.status}]，僅已付款 (PAID) 訂單可退費`);
-        err.statusCode = 400;
-        throw err;
-      }
-
-      if (invoiceNumberInput) {
-        const orderInv = order.invoiceNumber
-          ? String(order.invoiceNumber).trim().toUpperCase()
-          : '';
-        if (orderInv && orderInv !== invoiceNumberInput) {
-          const err = new Error(
-            `發票號碼不符：訂單 ${order.id} 發票為 ${orderInv}，輸入為 ${invoiceNumberInput}`,
-          );
-          err.statusCode = 400;
-          throw err;
-        }
-      }
-
-      const meta = await resolveTopupMetaFromOrder(order, tx);
-      if (meta.usageType === 'UNLIMITED') {
-        const err = new Error('⛔ 無限使用方案購案訂單不支援自動退費，請改用「月卡訂閱／請假」取消結算');
-        err.statusCode = 400;
-        throw err;
-      }
-
-      const originalPrice = roundMoney(meta.price);
-      const originalBonus = roundMoney(meta.bonusGiven);
-
-      const member = await tx.member.findUnique({ where: { id: order.memberId } });
-      if (!member) {
-        const err = new Error('找不到此會員');
-        err.statusCode = 404;
-        throw err;
-      }
-
-      const calc = computeTimedTopupRefund({
-        cashWallet: member.cashWallet,
-        bonusWallet: member.bonusWallet,
-        originalPrice,
-        originalBonus,
-      });
-
-      if (calc.beforeFee < 0) {
-        const err = new Error(
-          `⛔ 退費阻擋：運動金已消耗且本金殘值不足以折讓。` +
-            `實付 $${calc.paidAmount} − 實際使用 $${calc.usedAmount} = $${calc.beforeFee}。` +
-            `請人工處理，禁止套利退費。`,
-        );
-        err.statusCode = 403;
-        throw err;
-      }
-      if (calc.refundCash < 0) {
-        const err = new Error(
-          `⛔ 退費阻擋：扣除實際使用後餘額不足手續費 $${calc.refundFee}。` +
-            `實付 $${calc.paidAmount} − 實際使用 $${calc.usedAmount} − 手續費 $${calc.refundFee} = $${calc.refundCash}。`,
-        );
-        err.statusCode = 403;
-        throw err;
-      }
-
-      const {
-        recoveredBonus,
-        shortfall,
-        remainingPrincipal,
-        usedAmount,
-        refundFee,
-        refundCash,
-        paidAmount,
-      } = calc;
-
-      const invoiceCtx = await resolveOrderInvoiceReverse(order, { refundCash, tx });
-      // 退費折讓：必須有已開立成功的真實發票，且應退現金 > 0
-      const pickRealInvoice = (n) => {
-        const s = String(n || '').trim();
-        if (!s || s.startsWith('SPLIT:') || s.includes(',')) return null;
-        return s;
-      };
-      const resolvedInv =
-        pickRealInvoice(invoiceCtx.invoiceNumber) || pickRealInvoice(invoiceNumberInput);
-
-      if (refundCash > 0) {
-        if (!resolvedInv) {
-          const err = new Error(
-            '退費折讓須在開票成功後才能辦理（此訂單尚無有效發票號碼）',
-          );
-          err.statusCode = 400;
-          throw err;
-        }
-        invoiceCtx.invoiceNumber = resolvedInv;
-        invoiceCtx.prefer = 'allowance';
-        invoiceCtx.skip = false;
-        invoiceCtx.amount = roundMoney(
-          invoiceCtx.amount > 0 ? invoiceCtx.amount : refundCash,
-        );
-      } else {
-        invoiceCtx.invoiceNumber = resolvedInv;
-        invoiceCtx.skip = true;
-        invoiceCtx.amount = 0;
-        if (!invoiceCtx.skipReason) {
-          invoiceCtx.skipReason = '應退現金為 0，無需折讓／作廢';
-        }
-      }
-
-      return {
-        order,
-        member,
-        meta,
-        originalPrice,
-        originalBonus,
-        paidAmount,
-        recoveredBonus,
-        shortfall,
-        remainingPrincipal,
-        usedAmount,
-        refundFee,
-        refundCash,
-        invoiceCtx,
-      };
-    });
-
-    let invoiceReverse = { action: 'none', invoiceNumber: null };
-    try {
-      invoiceReverse = await executeInvoiceReverse(preview.invoiceCtx, {
-        reason: '退費折讓',
-        buyerEmail,
-        prefer: 'allowance',
-      });
-    } catch (ezErr) {
-      console.error(`退費 ${orderId} ezPay 折讓失敗:`, ezErr);
-      return res.status(ezErr.statusCode || 502).json({
-        status: 'error',
-        message: ezErr.message || 'ezPay 折讓失敗，退費已中止（錢包未異動）',
-      });
-    }
-
-    const result = await prisma.$transaction(async (tx) => {
-      const order = await tx.order.findUnique({ where: { id: orderId } });
-      if (!order) {
-        const err = new Error('找不到此訂單');
-        err.statusCode = 404;
-        throw err;
-      }
-      if (order.status === 'REFUNDED') {
-        const member = await tx.member.findUnique({ where: { id: order.memberId } });
-        return {
-          alreadyRefunded: true,
-          member,
-          order,
-          refundCash: preview.refundCash,
-          recoveredBonus: preview.recoveredBonus,
-          shortfall: preview.shortfall,
-          remainingPrincipal: preview.remainingPrincipal,
-          usedAmount: preview.usedAmount,
-          refundFee: preview.refundFee,
-          paidAmount: preview.paidAmount,
-        };
-      }
-      if (order.status !== 'PAID') {
-        const err = new Error('訂單狀態已變更，請重新查詢後再退費（若折讓已開立請人工核對）');
-        err.statusCode = 409;
-        throw err;
-      }
-
-      const member = await tx.member.findUnique({ where: { id: order.memberId } });
-      if (!member) {
-        const err = new Error('找不到此會員');
-        err.statusCode = 404;
-        throw err;
-      }
-
-      const calc = computeTimedTopupRefund({
-        cashWallet: member.cashWallet,
-        bonusWallet: member.bonusWallet,
-        originalPrice: preview.originalPrice,
-        originalBonus: preview.originalBonus,
-      });
-      if (calc.beforeFee < 0 || calc.refundCash < 0) {
-        const err = new Error(
-          '⛔ 退費阻擋：錢包狀態已變更，餘額不足以依公式退費。若折讓已開立請人工核對。',
-        );
-        err.statusCode = 409;
-        throw err;
-      }
-      if (
-        calc.refundCash !== preview.refundCash ||
-        calc.remainingPrincipal !== preview.remainingPrincipal
-      ) {
-        console.warn(
-          `退費 ${orderId} 寫入時金額與預覽不一致：preview=$${preview.refundCash} now=$${calc.refundCash}`,
-        );
-      }
-
-      const {
-        recoveredBonus,
-        shortfall,
-        remainingPrincipal,
-        usedAmount,
-        refundFee,
-        refundCash,
-        paidAmount,
-      } = calc;
-
-      const updatedMember = await tx.member.update({
-        where: { id: member.id },
-        data: {
-          bonusWallet: { decrement: recoveredBonus },
-          cashWallet: { decrement: remainingPrincipal },
-        },
-      });
-
-      const clawbackNote =
-        `退費折讓：實付$${paidAmount} − 實際使用$${usedAmount} − 手續費$${refundFee}` +
-        ` = 應退$${refundCash}` +
-        `（回收運動金$${recoveredBonus}／本金殘值$${remainingPrincipal}）`;
-
-      const statusUpdated = await tx.order.updateMany({
-        where: { id: order.id, status: 'PAID' },
-        data: {
-          status: 'REFUNDED',
-          itemDesc: appendInvoiceReverseNote(
-            `${order.itemDesc} | ${clawbackNote}`,
-            invoiceReverse,
-          ),
-        },
-      });
-      if (statusUpdated.count === 0) {
-        const err = new Error('訂單狀態已變更，請重新查詢（若折讓已開立請人工核對）');
-        err.statusCode = 409;
-        throw err;
-      }
-
-      const refundedOrder = await tx.order.findUnique({ where: { id: order.id } });
-
-      await syncCheckoutInvoiceAfterReverse(
-        tx,
-        preview.invoiceCtx.checkoutSessionId,
-        invoiceReverse,
-      );
-      await reevaluateCheckoutSessionStatus(
-        tx,
-        preview.invoiceCtx.checkoutSessionId,
-      );
-
-      return {
-        member: updatedMember,
-        order: refundedOrder,
-        refundCash,
-        recoveredBonus,
-        shortfall,
-        remainingPrincipal,
-        usedAmount,
-        refundFee,
-        paidAmount,
-      };
-    });
-
-    let allowanceSlip = null;
-    if (invoiceReverse.action === 'allowance') {
-      const branchId =
-        (await resolveBranchIdForOrder(preview.order)) ||
-        req.user?.branchId ||
-        null;
-      const sellerHeader = await resolveInvoiceSellerHeader(branchId);
-      allowanceSlip = await savePrintableAllowanceSlip({
-        reverseResult: invoiceReverse,
-        orderId: result.order.id,
-        memberId: result.member.id,
-        memberName: result.member.name,
-        itemDesc: preview.order.itemDesc,
-        buyerEmail,
-        merchantOrderNo: preview.invoiceCtx.merchantOrderNo,
-        amount: invoiceReverse.allowanceAmt || preview.invoiceCtx.amount,
-        source: 'REFUND',
-        staffId: req.user?.id ?? null,
-        sellerHeader,
-      });
-    }
-
-    const invMsg =
-      invoiceReverse.action === 'allowance'
-        ? `，已開立折讓單 ${invoiceReverse.allowanceNo}（發票 ${invoiceReverse.invoiceNumber}／$${invoiceReverse.allowanceAmt}）`
-        : invoiceReverse.action === 'void'
-          ? `，發票 ${invoiceReverse.invoiceNumber} 已作廢`
-          : preview.invoiceCtx?.skipReason
-            ? `（${preview.invoiceCtx.skipReason}）`
-            : '';
-
-    res.json({
-      status: 'success',
-      message: result.alreadyRefunded
-        ? `訂單 ${orderId} 已是退費狀態`
-        : `【體育客】訂單 ${orderId} 退費折讓完成，應退現金 $${result.refundCash}${invMsg}`,
-      data: {
-        orderId: result.order.id,
-        memberId: result.member.id,
-        memberName: result.member.name,
-        clawback: {
-          originalPrice: preview.originalPrice,
-          originalBonus: preview.originalBonus,
-          paidAmount: result.paidAmount ?? preview.paidAmount,
-          usedAmount: result.usedAmount ?? preview.usedAmount,
-          refundFee: result.refundFee ?? preview.refundFee,
-          recoveredBonus: result.recoveredBonus,
-          spentBonus: result.shortfall,
-          remainingPrincipal: result.remainingPrincipal,
-          refundCash: result.refundCash,
-        },
-        wallet: {
-          cash: result.member.cashWallet,
-          bonus: result.member.bonusWallet,
-        },
-        invoice: invoiceReverse,
-        allowanceSlip,
-        buyerEmail: buyerEmail || null,
-        invoiceNumber: invoiceReverse.invoiceNumber || preview.order.invoiceNumber || invoiceNumberInput,
-      },
-    });
-  } catch (error) {
-    console.error('退費失敗:', error);
-    if (error.statusCode) {
-      return res.status(error.statusCode).json({ status: 'error', message: error.message });
-    }
-    res.status(500).json({ status: 'error', message: '退費失敗' });
-  }
-});
-
-/** 依發票號碼查詢可退費訂單（帶出訂單／發票） */
-router.get('/refund-lookup', async (req, res) => {
-  try {
-    const invoiceNumber = normalizeInvoiceNumberInput(req.query.invoiceNumber);
-    const orderId = req.query.orderId ? String(req.query.orderId).trim() : '';
-    if (!invoiceNumber && !orderId) {
-      return res.status(400).json({
-        status: 'error',
-        message: '請提供 invoiceNumber 或 orderId',
-      });
-    }
-    const order = orderId
-      ? await prisma.order.findUnique({
-          where: { id: orderId },
-          include: { member: { select: { id: true, name: true, memberNo: true, phone: true } } },
-        })
-      : await prisma.order.findFirst({
-          where: { invoiceNumber, status: { in: ['PAID', 'REFUNDED'] } },
-          orderBy: { createdAt: 'desc' },
-          include: { member: { select: { id: true, name: true, memberNo: true, phone: true } } },
-        });
-    if (!order) {
-      return res.status(404).json({ status: 'error', message: '找不到訂單' });
-    }
-    const allowances = await prisma.invoiceAllowance.findMany({
-      where: {
-        OR: [
-          { orderId: order.id },
-          ...(order.invoiceNumber ? [{ invoiceNumber: order.invoiceNumber }] : []),
-        ],
-      },
-      orderBy: { createdAt: 'desc' },
-      take: 5,
-    });
-    res.json({
-      status: 'success',
-      data: {
-        order: {
-          id: order.id,
-          status: order.status,
-          amount: order.amount,
-          invoiceNumber: order.invoiceNumber,
-          itemDesc: order.itemDesc,
-          createdAt: order.createdAt,
-        },
-        member: order.member,
-        allowances: allowances.map((a) => toPrintableAllowance(a)),
-      },
-    });
-  } catch (error) {
-    if (error.statusCode) {
-      return res.status(error.statusCode).json({ status: 'error', message: error.message });
-    }
-    console.error(error);
-    res.status(500).json({ status: 'error', message: '查詢失敗' });
-  }
-});
-
-/** 折讓單列印資料 */
-router.get('/allowances/:allowanceNo', async (req, res) => {
-  try {
-    const no = String(req.params.allowanceNo || '').trim();
-    const row = await prisma.invoiceAllowance.findUnique({ where: { allowanceNo: no } });
-    if (!row) {
-      return res.status(404).json({ status: 'error', message: '找不到折讓單' });
-    }
-    res.json({ status: 'success', data: toPrintableAllowance(row) });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ status: 'error', message: '讀取折讓單失敗' });
-  }
-});
-
-router.get('/allowances', async (req, res) => {
-  try {
-    const take = Math.min(50, parseInt(req.query.take, 10) || 20);
-    const orderId = req.query.orderId ? String(req.query.orderId).trim() : null;
-    const invoiceNumber = req.query.invoiceNumber
-      ? normalizeInvoiceNumberInput(req.query.invoiceNumber)
-      : null;
-    const rows = await prisma.invoiceAllowance.findMany({
-      where: {
-        ...(orderId ? { orderId } : {}),
-        ...(invoiceNumber ? { invoiceNumber } : {}),
-      },
-      orderBy: { createdAt: 'desc' },
-      take,
-    });
-    res.json({ status: 'success', data: rows.map((r) => toPrintableAllowance(r)) });
-  } catch (error) {
-    if (error.statusCode) {
-      return res.status(error.statusCode).json({ status: 'error', message: error.message });
-    }
-    console.error(error);
-    res.status(500).json({ status: 'error', message: '讀取折讓單失敗' });
-  }
-});
-
-function parsePayBreakdown(raw) {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
-  return raw;
-}
-
-// ==========================================
-// 0.06 【取消商品銷售】PAID／PENDING → CANCELLED；已扣庫則回補；零錢包退回
-// 有發票時先呼叫 ezPay 作廢（失敗則全額／部分折讓），成功後才改單據
-// POST /api/ops/cancel-sale  { saleId, reason? }
-// ==========================================
-router.post('/cancel-sale', async (req, res) => {
-  const { saleId, reason, prefer, ...illegal } = req.body || {};
-  if (Object.keys(illegal).length > 0) {
-    return res.status(400).json({
-      status: 'error',
-      message: `⛔ 非法參數：只允許 saleId、reason、prefer，已拒絕 [${Object.keys(illegal).join(', ')}]`,
-    });
-  }
-  const id = String(saleId || '').trim();
-  if (!id) {
-    return res.status(400).json({ status: 'error', message: '請提供銷貨單號 saleId（SAL…）' });
-  }
-  const preferMode =
-    prefer === 'allowance' || prefer === 'void' ? prefer : null;
-
-  try {
-    const sale = await prisma.saleOrder.findUnique({
-      where: { id },
-      include: { items: true, member: { select: { id: true, name: true } } },
-    });
-    if (!sale) {
-      return res.status(404).json({ status: 'error', message: '找不到此銷貨單' });
-    }
-    if (sale.status === 'CANCELLED') {
-      return res.status(400).json({ status: 'error', message: '此銷貨單已取消' });
-    }
-    if (sale.status !== 'PAID' && sale.status !== 'PENDING') {
-      return res.status(400).json({
-        status: 'error',
-        message: `⛔ 狀態 [${sale.status}] 不可取消`,
-      });
-    }
-
-    assertBranchAccess(req, sale.branchId);
-
-    const wasPaid = sale.status === 'PAID';
-    const invoiceCtx = wasPaid
-      ? await resolveSaleInvoiceReverse(sale)
-      : {
-          invoiceNumber: null,
-          merchantOrderNo: sale.id,
-          amount: 0,
-          itemDesc: sale.itemDesc,
-          prefer: 'void',
-          checkoutSessionId: sale.checkoutSessionId || null,
-          sharedInvoice: false,
-          skip: true,
-        };
-
-    if (preferMode === 'allowance') {
-      try {
-        assertRealInvoiceForAllowance(
-          invoiceCtx.invoiceNumber || sale.invoiceNumber,
-          '取消銷貨退費折讓',
-        );
-      } catch (invErr) {
-        return res.status(invErr.statusCode || 400).json({
-          status: 'error',
-          message: invErr.message,
-        });
-      }
-      invoiceCtx.prefer = 'allowance';
-      invoiceCtx.skip = false;
-    } else if (preferMode === 'void' && !invoiceCtx.sharedInvoice) {
-      invoiceCtx.prefer = 'void';
-    } else if (invoiceCtx.prefer === 'allowance' && wasPaid && !invoiceCtx.skip) {
-      // 舊合併發票僅准折讓：同樣須有真實發票號
-      try {
-        assertRealInvoiceForAllowance(
-          invoiceCtx.invoiceNumber || sale.invoiceNumber,
-          '取消銷貨退費折讓',
-        );
-      } catch (invErr) {
-        return res.status(invErr.statusCode || 400).json({
-          status: 'error',
-          message: invErr.message,
-        });
-      }
-    }
-
-    let invoiceReverse = { action: 'none', invoiceNumber: null };
-    if (wasPaid && invoiceCtx.invoiceNumber && !invoiceCtx.skip) {
-      try {
-        invoiceReverse = await executeInvoiceReverse(invoiceCtx, {
-          reason: reason || '取消銷貨',
-          prefer: invoiceCtx.prefer,
-        });
-      } catch (ezErr) {
-        console.error(`取消銷貨 ${id} ezPay 反向失敗:`, ezErr);
-        return res.status(ezErr.statusCode || 502).json({
-          status: 'error',
-          message: ezErr.message || 'ezPay 發票作廢／折讓失敗，取消已中止（庫存／錢包未異動）',
-        });
-      }
-    }
-
-    const result = await prisma.$transaction(async (tx) => {
-      const fresh = await tx.saleOrder.findUnique({
-        where: { id },
-        include: { items: true, member: { select: { id: true, name: true } } },
-      });
-      if (!fresh) {
-        const err = new Error('找不到此銷貨單');
-        err.statusCode = 404;
-        throw err;
-      }
-      if (fresh.status === 'CANCELLED') {
-        return {
-          alreadyCancelled: true,
-          sale: fresh,
-          wasPaid: false,
-          restocked: false,
-          walletRefunded: 0,
-          memberName: fresh.member?.name || null,
-          memberWallet: null,
-          invoiceNumber: fresh.invoiceNumber,
-          payMethod: fresh.payMethod,
-        };
-      }
-      if (fresh.status !== 'PAID' && fresh.status !== 'PENDING') {
-        const err = new Error(
-          '銷貨單狀態已變更，請重新查詢（若發票已作廢／折讓請人工核對）',
-        );
-        err.statusCode = 409;
-        throw err;
-      }
-
-      const paidNow = fresh.status === 'PAID';
-      if (paidNow) {
-        await restockSaleStock(tx, fresh, req.user?.id ?? null);
-      }
-
-      const breakdown = parsePayBreakdown(fresh.payBreakdown);
-      let walletRefunded = 0;
-      let memberWallet = null;
-      if (paidNow) {
-        let sessionAmount = fresh.amount;
-        if (fresh.checkoutSessionId) {
-          const sess = await tx.checkoutSession.findUnique({
-            where: { id: fresh.checkoutSessionId },
-            select: { amount: true },
-          });
-          if (sess?.amount) sessionAmount = sess.amount;
-        }
-        const walletCash = prorateCheckoutWalletCash({
-          payBreakdown: breakdown,
-          legAmount: fresh.amount,
-          sessionAmount,
-        });
-        if (walletCash > 0) {
-          if (!fresh.memberId) {
-            const err = new Error('銷貨含零錢包扣款但無會員，無法自動退回');
-            err.statusCode = 400;
-            throw err;
-          }
-          const member = await tx.member.update({
-            where: { id: fresh.memberId },
-            data: { cashWallet: { increment: walletCash } },
-          });
-          walletRefunded = walletCash;
-          memberWallet = { cash: member.cashWallet, bonus: member.bonusWallet };
-        }
-      }
-
-      const note = String(reason || '').trim();
-      const descBase = `${fresh.itemDesc || ''}｜已取消${note ? `：${note}` : ''}`;
-      const cancelUpdated = await tx.saleOrder.updateMany({
-        where: { id, status: { in: ['PAID', 'PENDING'] } },
-      data: {
-          status: 'CANCELLED',
-          itemDesc: appendInvoiceReverseNote(descBase, invoiceReverse),
-      },
-    });
-      if (cancelUpdated.count === 0) {
-        const err = new Error(
-          '銷貨單狀態已變更，請重新查詢（若發票已作廢／折讓請人工核對）',
-        );
-        err.statusCode = 409;
-        throw err;
-      }
-
-      const updated = await tx.saleOrder.findUnique({ where: { id } });
-
-      await syncCheckoutInvoiceAfterReverse(
-        tx,
-        invoiceCtx.checkoutSessionId,
-        invoiceReverse,
-      );
-      await reevaluateCheckoutSessionStatus(tx, invoiceCtx.checkoutSessionId);
-
-      return {
-        sale: updated,
-        wasPaid: paidNow,
-        restocked: paidNow,
-        walletRefunded,
-        memberName: fresh.member?.name || null,
-        memberWallet,
-        invoiceNumber: invoiceCtx.invoiceNumber || fresh.invoiceNumber,
-        payMethod: fresh.payMethod,
-        amount: fresh.amount,
-        invoice: invoiceReverse,
-        sharedInvoice: Boolean(invoiceCtx.sharedInvoice),
-      };
-    });
-
-    const invMsg =
-      result.invoice?.action === 'void'
-        ? `，發票 ${result.invoice.invoiceNumber} 已作廢`
-        : result.invoice?.action === 'allowance'
-          ? `，發票 ${result.invoice.invoiceNumber} 已開立折讓 ${result.invoice.allowanceNo}${
-              result.sharedInvoice ? '（合併結帳部分折讓）' : ''
-            }`
-          : '';
-
-    let allowanceSlip = null;
-    if (result.invoice?.action === 'allowance') {
-      const sellerHeader = await resolveInvoiceSellerHeader(sale.branchId);
-      allowanceSlip = await savePrintableAllowanceSlip({
-        reverseResult: result.invoice,
-        saleOrderId: id,
-        memberId: sale.memberId,
-        memberName: result.memberName,
-        itemDesc: sale.itemDesc,
-        merchantOrderNo: result.invoice.merchantOrderNo || id,
-        amount: result.invoice.allowanceAmt || sale.amount,
-        source: 'CANCEL_SALE',
-        staffId: req.user?.id ?? null,
-        sellerHeader,
-      });
-    }
-
-    res.json({
-      status: 'success',
-      message: result.alreadyCancelled
-        ? `銷貨 [${id}] 已是取消狀態`
-        : result.wasPaid
-        ? `銷貨 [${id}] 已取消並回補庫存${
-            result.walletRefunded > 0 ? `，零錢包退回 $${result.walletRefunded}` : ''
-          }；現金／刷卡／抵用券請人工處理${invMsg}`
-        : `銷貨 [${id}]（待付款）已取消，尚未扣庫無需回補`,
-      data: { ...result, allowanceSlip },
-    });
-  } catch (error) {
-    if (error.statusCode) {
-      return res.status(error.statusCode).json({ status: 'error', message: error.message });
-    }
-    console.error(error);
-    res.status(500).json({ status: 'error', message: '取消銷貨失敗' });
-  }
-});
-
-// ==========================================
-// 0.06b 【取消私教課程購買】CHK… 或獨立私教 Order
-// POST /api/ops/cancel-pt-purchase  { checkoutId?, orderId?, reason?, prefer? }
-// prefer: void＝取消沖回｜allowance＝退費折讓
-// ==========================================
-router.post('/cancel-pt-purchase', async (req, res) => {
-  const { checkoutId, orderId, reason, prefer, ...illegal } = req.body || {};
-  if (Object.keys(illegal).length > 0) {
-    return res.status(400).json({
-      status: 'error',
-      message: `⛔ 非法參數：只允許 checkoutId、orderId、reason、prefer，已拒絕 [${Object.keys(illegal).join(', ')}]`,
-    });
-  }
-  try {
-    const chk = checkoutId ? String(checkoutId).trim().toUpperCase() : '';
-    const oid = orderId ? String(orderId).trim().toUpperCase() : '';
-    if (chk) {
-      const session = await prisma.checkoutSession.findUnique({
-        where: { id: chk },
-        select: { branchId: true },
-      });
-      if (!session) {
-        return res.status(404).json({ status: 'error', message: '找不到此結帳編號' });
-      }
-      if (session.branchId != null) assertBranchAccess(req, session.branchId);
-    } else if (oid) {
-      const order = await prisma.order.findUnique({
-        where: { id: oid },
-        select: { checkoutSessionId: true, itemDesc: true },
-      });
-      if (!order) {
-        return res.status(404).json({ status: 'error', message: '找不到此訂單' });
-      }
-      if (order.checkoutSessionId) {
-        const session = await prisma.checkoutSession.findUnique({
-          where: { id: order.checkoutSessionId },
-          select: { branchId: true },
-        });
-        if (session?.branchId != null) assertBranchAccess(req, session.branchId);
-      }
-    }
-
-    const mode = String(prefer || 'void').toLowerCase() === 'allowance' ? 'allowance' : 'void';
-    const result = await cancelPtPurchase({
-      checkoutId: chk || undefined,
-      orderId: oid || undefined,
-      reason,
-      prefer: mode,
-      staffId: req.user?.id ?? null,
-    });
-    const invMsg =
-      result.invoice?.action === 'void'
-        ? `，發票 ${result.invoice.invoiceNumber} 已作廢`
-        : result.invoice?.action === 'allowance'
-          ? `，發票已開立折讓 ${result.invoice.allowanceNo}`
-          : '';
-
-    let allowanceSlip = null;
-    if (result.invoice?.action === 'allowance') {
-      let branchId = req.user?.branchId || null;
-      let memberId = null;
-      let memberName = null;
-      let itemDesc = null;
-      const primaryOrderId = result.orderIds?.[0] || oid || null;
-      if (primaryOrderId) {
-        const order = await prisma.order.findUnique({
-          where: { id: primaryOrderId },
-          include: { member: { select: { id: true, name: true } } },
-        });
-        memberId = order?.memberId ?? null;
-        memberName = order?.member?.name || null;
-        itemDesc = order?.itemDesc || null;
-        branchId =
-          (await resolveBranchIdForOrder(order)) || branchId;
-      } else if (result.checkoutId) {
-        const session = await prisma.checkoutSession.findUnique({
-          where: { id: result.checkoutId },
-          include: { member: { select: { id: true, name: true } } },
-        });
-        branchId = session?.branchId || branchId;
-        memberId = session?.memberId ?? null;
-        memberName = session?.member?.name || null;
-        itemDesc = session?.itemDesc || null;
-      }
-      const sellerHeader = await resolveInvoiceSellerHeader(branchId);
-      allowanceSlip = await savePrintableAllowanceSlip({
-        reverseResult: result.invoice,
-        orderId: primaryOrderId,
-        memberId,
-        memberName,
-        itemDesc,
-        merchantOrderNo: result.invoice.merchantOrderNo || primaryOrderId,
-        amount: result.invoice.allowanceAmt || result.amount,
-        source: 'CANCEL_PT',
-        staffId: req.user?.id ?? null,
-        sellerHeader,
-      });
-    }
-
-    res.json({
-      status: 'success',
-      message:
-        mode === 'allowance'
-          ? `私教購案已退費折讓${result.walletRefunded > 0 ? `，零錢包退回 $${result.walletRefunded}` : ''}${invMsg}`
-          : `私教購案已取消沖回${result.walletRefunded > 0 ? `，零錢包退回 $${result.walletRefunded}` : ''}${invMsg}`,
-      data: { ...result, allowanceSlip },
-    });
-  } catch (error) {
-    if (error.statusCode) {
-      return res.status(error.statusCode).json({ status: 'error', message: error.message });
-    }
-    console.error(error);
-    res.status(500).json({ status: 'error', message: '取消私教購案失敗' });
-  }
-});
-
-// ==========================================
-// 0.07 【取消進出場】依 CheckInLog id
-// - 在場中：直接取消進場（不扣費）— ops 可操作
-// - 已出場：費用退回零錢包 — 限 DUTY+
-// POST /api/ops/cancel-gate  { logId, reason? }
-// ==========================================
-router.post('/cancel-gate', async (req, res) => {
-  const { logId, reason, ...illegal } = req.body || {};
-  if (Object.keys(illegal).length > 0) {
-    return res.status(400).json({
-      status: 'error',
-      message: `⛔ 非法參數：只允許 logId、reason，已拒絕 [${Object.keys(illegal).join(', ')}]`,
-    });
-  }
-
-  try {
-    const id = await resolveGateLogId(logId, prisma);
-    if (!id) {
-      return res.status(400).json({
-        status: 'error',
-        message: '請提供有效的進出場單號（ACC＋日期時間 或數字 id）',
-      });
-    }
-
-    const result = await prisma.$transaction(async (tx) => {
-      const log = await tx.checkInLog.findUnique({
-        where: { id },
-        include: { member: { select: { id: true, name: true, phone: true } } },
-      });
-      if (!log) {
-        const err = new Error('找不到此進出場紀錄');
-        err.statusCode = 404;
-        throw err;
-      }
-      if (log.status === 'CANCELLED') {
-        const err = new Error('此進出場紀錄已取消');
-        err.statusCode = 400;
-        throw err;
-      }
-
-      if (log.branchId) {
-        assertBranchAccess(req, log.branchId);
-      }
-
-      const fee = roundMoney(Number(log.fee) || 0);
-      const wasCheckedOut = Boolean(log.checkOutAt);
-
-      if (wasCheckedOut && !hasDutyRankOrAbove(req.user)) {
-        const err = new Error('⛔ 已出場紀錄取消退費僅限 DUTY（值星）以上');
-        err.statusCode = 403;
-        throw err;
-      }
-
-      let refundedFee = 0;
-      let memberWallet = null;
-
-      if (wasCheckedOut && fee > 0) {
-        const member = await tx.member.update({
-          where: { id: log.memberId },
-          data: { cashWallet: { increment: fee } },
-        });
-        refundedFee = fee;
-        memberWallet = { cash: member.cashWallet, bonus: member.bonusWallet };
-      }
-
-      const note = String(reason || '').trim() || null;
-      const updated = await tx.checkInLog.update({
-        where: { id },
-      data: {
-          status: 'CANCELLED',
-          cancelledAt: new Date(),
-          cancelReason: note,
-          cancelledByStaffId: req.user?.id ?? null,
-          // 在場中取消：視同結束在場狀態，避免佔用防卡單
-          checkOutAt: log.checkOutAt || new Date(),
-        },
-      });
-
-      return {
-        logId: updated.id,
-        gateAccessNo: formatGateAccessNo(log.checkInAt),
-        memberId: log.memberId,
-        memberName: log.member?.name,
-        wasCheckedOut,
-        originalFee: fee,
-        refundedFee,
-        memberWallet,
-        billingMode: log.billingMode,
-      };
-    });
-
-    broadcastOccupancy({ type: 'gate-cancel', memberId: result.memberId }).catch(() => {});
-
-    const accessLabel = result.gateAccessNo || `#${result.logId}`;
-    res.json({
-      status: 'success',
-      message: result.wasCheckedOut
-        ? `進出場 ${accessLabel} 已取消${result.refundedFee > 0 ? `，費用 $${result.refundedFee} 已退回零錢包` : '（原無計費）'}`
-        : `進出場 ${accessLabel} 進場已取消（會員改為離場）`,
-      data: result,
-    });
-  } catch (error) {
-    if (error.statusCode) {
-      return res.status(error.statusCode).json({ status: 'error', message: error.message });
-    }
-    console.error(error);
-    res.status(500).json({ status: 'error', message: '取消進出場失敗' });
-  }
-});
-
-// ==========================================
 // 進場會員列表（在場中）
 // GET /api/ops/check-ins/active?branchId=
 // ==========================================
@@ -4689,7 +3401,7 @@ router.get('/check-ins/active', async (req, res) => {
         return res.status(400).json({ status: 'error', message: 'branchId 無效' });
       }
       assertBranchAccess(req, branchId);
-    } else if (!isAdminUser(req.user)) {
+    } else if (!isCrossBranchUser(req.user)) {
       if (!req.user?.branchId) {
         return res.status(403).json({ status: 'error', message: '⛔ 帳號未綁定分店' });
       }
@@ -5321,6 +4033,54 @@ router.get('/contracts', async (req, res) => {
   }
 });
 
+// POST /api/ops/contracts/:id/refund — 消保法 7 日無條件解約
+router.post('/contracts/:id/refund', async (req, res) => {
+  const signId = parseInt(req.params.id, 10);
+  if (!signId) return res.status(400).json({ status: 'error', message: '無效參數' });
+  
+  try {
+    // 檢查合約是否存在
+    const signature = await prisma.memberContractSignature.findUnique({
+      where: { id: signId }
+    });
+    if (!signature) {
+      return res.status(404).json({ status: 'error', message: '找不到合約' });
+    }
+
+    // 檢查是否簽約 7 日內
+    const signedAt = signature.signedAt || signature.createdAt;
+    const daysSince = (new Date() - new Date(signedAt)) / (1000 * 60 * 60 * 24);
+    if (daysSince > 7) {
+      return res.status(400).json({ status: 'error', message: '超過 7 日，不適用無條件解約' });
+    }
+
+    // 檢查是否已使用服務 (有無進場紀錄)
+    const checkins = await prisma.checkInLog.count({
+      where: { 
+        memberId: signature.memberId, 
+        checkInAt: { gte: signedAt }
+      }
+    });
+    if (checkins > 0) {
+      return res.status(400).json({ status: 'error', message: '已使用服務（有進場紀錄），無法無條件解約' });
+    }
+
+    // 將合約狀態標記為作廢
+    await prisma.memberContractSignature.update({
+      where: { id: signId },
+      data: { status: 'VOIDED' }
+    });
+
+    return res.json({
+      status: 'success',
+      message: '符合 7 日無條件解約，100% 全額無息退還',
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ status: 'error', message: '解約退費處理失敗' });
+  }
+});
+
 // ==========================================
 // 1. 建立交易訂單 (準備導向統一金流 UPP) — 同樣綁定 promotionId
 // 網址：POST /api/ops/orders
@@ -5412,6 +4172,7 @@ router.post('/orders', async (req, res) => {
         amount: promotion.price,
         itemDesc: buildTopupItemDesc(promotion, '線上'),
         payMethod: 'CARD',
+        branchId: promotion.branchId ?? null,
         cardAmount: promotion.price,
         cardMode: cardOpts.cardMode,
         cardInst: cardOpts.cardInst,

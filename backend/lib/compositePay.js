@@ -50,6 +50,11 @@ export function parseCompositePayments(payments, totalAmount, opts = {}) {
       err.statusCode = 400;
       throw err;
     }
+    if (!Number.isInteger(amount)) {
+      const err = new Error(`${method} 分攤金額須為整數元`);
+      err.statusCode = 400;
+      throw err;
+    }
 
     let voucherCode = null;
     if (method === 'VOUCHER') {

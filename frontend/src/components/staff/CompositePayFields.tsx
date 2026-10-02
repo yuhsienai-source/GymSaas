@@ -150,6 +150,7 @@ export default function CompositePayFields({
     (selected.includes('CARD') ||
       (allowYipayPayuniRecurring && selected.includes('YIPAY'))) &&
     Boolean(onCardOptionsChange);
+  const selectedKey = selected.join(',');
 
   useEffect(() => {
     if (selected.length === 1) {
@@ -159,7 +160,7 @@ export default function CompositePayFields({
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selected.join(','), totalAmount]);
+  }, [selectedKey, totalAmount]);
 
   // 月卡定期定額：CARD 僅約定標記，金額固定 0；首期全放乙禾
   useEffect(() => {
@@ -192,12 +193,7 @@ export default function CompositePayFields({
       });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [
-    allowYipayPayuniRecurring,
-    selected.join(','),
-    totalAmount,
-    allowCardRecurring,
-  ]);
+  }, [allowYipayPayuniRecurring, selectedKey, totalAmount, allowCardRecurring]);
 
   useEffect(() => {
     if (!showCardOpts) return;

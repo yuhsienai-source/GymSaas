@@ -58,8 +58,9 @@ export function resolveSafetyStock(raw, productKind) {
   return n;
 }
 
-export function isLowStock(product) {
+/** @param {{ onHand, safetyStock }} stock BranchStock；@param product 商品主檔 */
+export function isLowStock(stock, product) {
   if (!tracksInventory(product)) return false;
-  if (product.safetyStock == null) return false;
-  return Number(product.stockQty) <= Number(product.safetyStock);
+  if (stock?.safetyStock == null) return false;
+  return Number(stock.onHand) <= Number(stock.safetyStock);
 }

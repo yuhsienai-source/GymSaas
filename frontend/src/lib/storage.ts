@@ -89,11 +89,21 @@ export function clearStaffToken(): void {
 /** API interceptor 與 AuthContext 同步：登入票失效時派發 */
 export const MEMBER_AUTH_LOST_EVENT = 'gymsaas:member-auth-lost';
 export const STAFF_AUTH_LOST_EVENT = 'gymsaas:staff-auth-lost';
+/** 業務 API 回 403 OFF_DUTY（非班表值勤）時派發，detail.duty＝後端值勤狀態；不登出 */
+export const STAFF_OFF_DUTY_EVENT = 'gymsaas:staff-off-duty';
 
 export type StaffPermission = 'ops' | 'pt' | 'trainer';
 
-/** 職位：STAFF < DUTY < MANAGER < ADMIN；交易異動限 DUTY 以上 */
-export type StaffRole = 'STAFF' | 'DUTY' | 'MANAGER' | 'ADMIN';
+/** 職位代碼（定義與階級見 lib/orgStructure.ts；MANAGER 為舊制＝STORE_MANAGER） */
+export type StaffRole =
+  | 'ADMIN'
+  | 'GM'
+  | 'FM'
+  | 'STORE_MANAGER'
+  | 'DUTY'
+  | 'STAFF'
+  | 'TRAINER'
+  | 'MANAGER';
 
 export interface StaffInfo {
   id: number;
@@ -103,10 +113,14 @@ export interface StaffInfo {
   displayName?: string;
   role: StaffRole;
   branchId: number | null;
+  /** 可操作分店：本店＋隸屬分店（跨店職位為空陣列） */
+  branchIds?: number[];
   branchName: string | null;
   permissions: StaffPermission[];
   /** 綁定的教練檔案；教練端個人工作區用 */
   trainerId?: number | null;
+  /** 頭像版本（null＝無照片） */
+  photoUpdatedAt?: string | null;
 }
 
 export function getStaffInfo(): StaffInfo | null {

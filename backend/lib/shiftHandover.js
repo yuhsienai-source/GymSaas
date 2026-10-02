@@ -1,5 +1,6 @@
-// lib/shiftHandover.js — 櫃檯交接班：早／中／晚班次＋少輸入對帳
+// lib/shiftHandover.js — 櫃檯交接班：早／晚兩班次＋少輸入對帳
 import prisma from './prisma.js';
+import { positionLabel } from './orgStructure.js';
 
 function roundMoney(n) {
   return Math.round((Number(n) || 0) * 100) / 100;
@@ -11,15 +12,20 @@ function generateShiftId() {
   return `SHF${dateStr}${randomStr}`;
 }
 
-/** @typedef {'MORNING'|'MIDDAY'|'EVENING'} ShiftSlot */
+/** @typedef {'MORNING'|'EVENING'|'MIDDAY'} ShiftSlot */
 
+/** 可開班班別（兩班制） */
 export const SHIFT_SLOTS = [
-  { key: 'MORNING', label: '早班', short: '早', hint: '約 05:00–13:00' },
-  { key: 'MIDDAY', label: '中班', short: '中', hint: '約 13:00–18:00' },
-  { key: 'EVENING', label: '晚班', short: '晚', hint: '約 18:00–隔日 05:00' },
+  { key: 'MORNING', label: '早班', short: '早', hint: '07:00–15:30' },
+  { key: 'EVENING', label: '晚班', short: '晚', hint: '15:30–00:00' },
 ];
 
-const SLOT_KEYS = new Set(SHIFT_SLOTS.map((s) => s.key));
+/** 歷史中班紀錄仍可顯示標籤 */
+const LEGACY_SLOT_LABELS = {
+  MIDDAY: { key: 'MIDDAY', label: '中班（舊）', short: '中', hint: '歷史班別' },
+};
+
+const SLOT_KEYS = new Set(['MORNING', 'EVENING']);
 
 /** 支付方式顯示順序與中文標籤（分欄固定，金額 0 也列出） */
 export const PAY_METHOD_COLUMNS = [
@@ -62,17 +68,9 @@ export function normalizeCloseChecklist(raw) {
   return out;
 }
 
-export const STAFF_ROLE_LABELS_ZH = {
-  STAFF: '櫃檯',
-  DUTY: '值星',
-  MANAGER: '店長',
-  ADMIN: '總部',
-};
-
 export function formatShiftOperator(name, role) {
   const n = String(name || '員工').trim() || '員工';
-  const roleKey = String(role || '').toUpperCase();
-  const roleZh = STAFF_ROLE_LABELS_ZH[roleKey] || roleKey || '員工';
+  const roleZh = positionLabel(role) || '員工';
   return `${n}（${roleZh}）`.slice(0, 80);
 }
 
@@ -98,7 +96,7 @@ export function normalizeShiftSlot(raw) {
     .trim()
     .toUpperCase();
   if (!SLOT_KEYS.has(v)) {
-    const err = new Error('請選擇班別：早班／中班／晚班（MORNING｜MIDDAY｜EVENING）');
+    const err = new Error('請選擇班別：早班／晚班（MORNING｜EVENING）');
     err.statusCode = 400;
     throw err;
   }
@@ -106,7 +104,8 @@ export function normalizeShiftSlot(raw) {
 }
 
 export function shiftSlotLabel(slot) {
-  const found = SHIFT_SLOTS.find((s) => s.key === slot);
+  const key = String(slot || '').toUpperCase();
+  const found = SHIFT_SLOTS.find((s) => s.key === key) || LEGACY_SLOT_LABELS[key];
   return found?.label || slot || '—';
 }
 
@@ -127,16 +126,20 @@ export function taipeiDayRange(ymd = taipeiYmd()) {
   return { start, end, ymd };
 }
 
+/** 依台北時間建議班別：早班 07:00–15:30；晚班 15:30–07:00（含午夜後） */
 export function suggestShiftSlot(now = new Date()) {
-  const hour = Number(
-    new Intl.DateTimeFormat('en-US', {
-      timeZone: 'Asia/Taipei',
-      hour: 'numeric',
-      hour12: false,
-    }).format(now),
-  );
-  if (hour >= 5 && hour < 13) return 'MORNING';
-  if (hour >= 13 && hour < 18) return 'MIDDAY';
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Taipei',
+    hour: 'numeric',
+    minute: 'numeric',
+    hour12: false,
+  }).formatToParts(now instanceof Date ? now : new Date(now));
+  const hour = Number(parts.find((p) => p.type === 'hour')?.value || 0);
+  const minute = Number(parts.find((p) => p.type === 'minute')?.value || 0);
+  const mins = hour * 60 + minute;
+  const morningStart = 7 * 60; // 07:00
+  const eveningStart = 15 * 60 + 30; // 15:30
+  if (mins >= morningStart && mins < eveningStart) return 'MORNING';
   return 'EVENING';
 }
 
@@ -156,8 +159,9 @@ export function accumulatePayBreakdown(target, breakdown, fallbackMethod, amount
 
 /**
  * 彙總分店時段內已付款交易（錢櫃對帳用）
+ * carryFrom＝上一班交班時間：上一班建立、交班後才完成付款（乙禾確認、線上刷卡回呼）之交易併入本班。
  */
-export async function buildShiftSummary({ branchId, from, to } = {}) {
+export async function buildShiftSummary({ branchId, from, to, carryFrom = null } = {}, db = prisma) {
   const bid = Number(branchId);
   if (!Number.isInteger(bid) || bid <= 0) {
     const err = new Error('請指定分店 branchId');
@@ -178,13 +182,23 @@ export async function buildShiftSummary({ branchId, from, to } = {}) {
   }
 
   const range = { gte: fromAt, lte: toAt };
+  const carryAt = carryFrom ? new Date(carryFrom) : null;
+  const paidInWindow =
+    carryAt && !Number.isNaN(carryAt.getTime()) && carryAt < fromAt
+      ? {
+          OR: [
+            { updatedAt: range },
+            { updatedAt: { gt: carryAt, lt: fromAt }, createdAt: { lte: carryAt } },
+          ],
+        }
+      : { updatedAt: range };
 
-  const [sessions, orphanSales, refundedOrders] = await Promise.all([
-    prisma.checkoutSession.findMany({
+  const [sessions, orphanSales, cashRefunds, orphanTopups] = await Promise.all([
+    db.checkoutSession.findMany({
       where: {
         branchId: bid,
         status: 'PAID',
-        updatedAt: range,
+        ...paidInWindow,
       },
       select: {
         id: true,
@@ -196,10 +210,11 @@ export async function buildShiftSummary({ branchId, from, to } = {}) {
         itemDesc: true,
       },
     }),
-    prisma.saleOrder.findMany({
+    // 退費單退貨之銷貨仍計入原收款班（退款另列 cashRefund 扣除）
+    db.saleOrder.findMany({
       where: {
         branchId: bid,
-        status: 'PAID',
+        OR: [{ status: 'PAID' }, { status: 'CANCELLED', refundedAmount: { gt: 0 } }],
         checkoutSessionId: null,
         createdAt: range,
       },
@@ -210,31 +225,36 @@ export async function buildShiftSummary({ branchId, from, to } = {}) {
         payBreakdown: true,
       },
     }),
-    prisma.order.findMany({
+    // 退費單之現金退款腿（交易內綁定進行中班次；依退款完成時間歸屬）
+    db.refundPayment.findMany({
       where: {
+        method: 'CASH',
         status: 'REFUNDED',
-        updatedAt: range,
+        refundedAt: range,
+        refund: { branchId: bid },
+      },
+      select: { id: true, amount: true, refundId: true },
+    }),
+    // 單獨臨櫃儲值／購案（POST /ops/topup，不經合併結帳）
+    db.order.findMany({
+      where: {
+        branchId: bid,
+        checkoutSessionId: null,
+        itemDesc: { startsWith: '臨櫃' },
         OR: [
-          { checkoutSessionId: { not: null } },
-          { itemDesc: { contains: '退費' } },
+          { status: 'PAID', ...paidInWindow },
+          { status: 'REFUNDED', refundedAmount: { gt: 0 }, createdAt: range },
         ],
       },
-      select: {
-        id: true,
-        amount: true,
-        itemDesc: true,
-        checkoutSessionId: true,
-      },
-      take: 200,
+      select: { id: true, amount: true, payMethod: true, payBreakdown: true },
     }),
   ]);
 
-  const sessionIds = new Set(sessions.map((s) => s.id));
   const linkedOrderIds = sessions.map((s) => s.orderId).filter(Boolean);
 
   let linkedOrders = [];
   if (linkedOrderIds.length) {
-    linkedOrders = await prisma.order.findMany({
+    linkedOrders = await db.order.findMany({
       where: { id: { in: linkedOrderIds }, status: 'PAID' },
       select: { id: true, amount: true, payMethod: true, payBreakdown: true },
     });
@@ -243,7 +263,6 @@ export async function buildShiftSummary({ branchId, from, to } = {}) {
   const payMix = {};
   let checkoutAmount = 0;
   let checkoutCount = 0;
-  let salesAmount = 0;
   let salesCount = 0;
   let topupAmount = 0;
   let topupCount = 0;
@@ -256,18 +275,28 @@ export async function buildShiftSummary({ branchId, from, to } = {}) {
     if (s.orderId) topupCount += 1;
   }
 
+  let orphanSaleAmount = 0;
   for (const sale of orphanSales) {
     salesCount += 1;
-    salesAmount = roundMoney(salesAmount + (Number(sale.amount) || 0));
+    orphanSaleAmount = roundMoney(orphanSaleAmount + (Number(sale.amount) || 0));
     accumulatePayBreakdown(payMix, sale.payBreakdown, sale.payMethod, sale.amount);
   }
+  let salesAmount = orphanSaleAmount;
 
   for (const o of linkedOrders) {
     topupAmount = roundMoney(topupAmount + (Number(o.amount) || 0));
   }
+
+  let orphanTopupAmount = 0;
+  for (const o of orphanTopups) {
+    topupCount += 1;
+    orphanTopupAmount = roundMoney(orphanTopupAmount + (Number(o.amount) || 0));
+    accumulatePayBreakdown(payMix, o.payBreakdown, o.payMethod, o.amount);
+  }
+  topupAmount = roundMoney(topupAmount + orphanTopupAmount);
   const sessionSaleIds = sessions.map((s) => s.saleOrderId).filter(Boolean);
   if (sessionSaleIds.length) {
-    const linkedSales = await prisma.saleOrder.findMany({
+    const linkedSales = await db.saleOrder.findMany({
       where: { id: { in: sessionSaleIds } },
       select: { amount: true },
     });
@@ -283,9 +312,7 @@ export async function buildShiftSummary({ branchId, from, to } = {}) {
   const voucherIn = roundMoney(payMix.VOUCHER || 0);
   const walletIn = roundMoney(payMix.WALLET_CASH || 0);
 
-  const refundHints = refundedOrders.filter(
-    (o) => o.checkoutSessionId && sessionIds.has(o.checkoutSessionId),
-  );
+  const cashRefund = roundMoney(cashRefunds.reduce((s, r) => s + (Number(r.amount) || 0), 0));
 
   const payMixFull = {
     CASH: cashIn,
@@ -308,6 +335,7 @@ export async function buildShiftSummary({ branchId, from, to } = {}) {
     payMix: payMixFull,
     payMixColumns: normalizePayMixColumns(payMixFull),
     cashIn,
+    cashRefund,
     totals: {
       checkoutCount,
       checkoutAmount: roundMoney(checkoutAmount),
@@ -315,12 +343,13 @@ export async function buildShiftSummary({ branchId, from, to } = {}) {
       salesAmount: roundMoney(salesAmount),
       topupCount,
       topupAmount: roundMoney(topupAmount),
-      paidTxnCount: checkoutCount + orphanSales.length,
-      paidTxnAmount: roundMoney(checkoutAmount + salesAmount),
+      paidTxnCount: checkoutCount + orphanSales.length + orphanTopups.length,
+      paidTxnAmount: roundMoney(checkoutAmount + orphanSaleAmount + orphanTopupAmount),
     },
     refunds: {
-      count: refundHints.length,
-      note: '退費現金請人工點交；系統僅提示關聯本店合併結帳之退費筆數',
+      count: cashRefunds.length,
+      cashOut: cashRefund,
+      note: '退費單現金退款已自應有現金扣除（線上／乙禾退款不經錢櫃）',
     },
     gateNote: '進出場費用由零錢包扣除，不計入錢櫃現金',
   };
@@ -331,6 +360,52 @@ export async function getOpenShift(branchId) {
     where: { branchId: Number(branchId), status: 'OPEN' },
     orderBy: { startedAt: 'desc' },
   });
+}
+
+export const SHIFT_NOT_OPEN_MESSAGE = '尚未開班：請先至「交接班結算」開班並確認備用金後再結帳';
+
+function shiftConflict(code, message) {
+  const err = new Error(message);
+  err.statusCode = 409;
+  err.code = code;
+  return err;
+}
+
+/**
+ * 臨櫃收款前置：須在建立訂單／銷貨之交易內呼叫。
+ * 以 FOR SHARE 鎖定分店進行中班次；交班以 FOR UPDATE 互斥，
+ * 收款不是在交班前提交（計入該班），就是等交班完成後因無進行中班次被拒。
+ * @param {import('@prisma/client').Prisma.TransactionClient} tx
+ */
+export async function lockOpenShiftForSale(tx, branchId) {
+  const bid = Number(branchId);
+  if (!Number.isInteger(bid) || bid <= 0) {
+    throw shiftConflict('SHIFT_BRANCH_REQUIRED', '無法判定收款分店，不能確認開班狀態；請指定分店後再結帳');
+  }
+  const rows = await tx.$queryRaw`
+    SELECT id FROM "ShiftHandover"
+    WHERE "branchId" = ${bid} AND status = 'OPEN'
+    ORDER BY "startedAt" DESC
+    LIMIT 1
+    FOR SHARE
+  `;
+  if (!rows[0]) throw shiftConflict('SHIFT_NOT_OPEN', SHIFT_NOT_OPEN_MESSAGE);
+  return rows[0].id;
+}
+
+/** 同分店上一班交班時間（本班開班前），供 buildShiftSummary carryFrom */
+export async function previousShiftEnd(shift, db = prisma) {
+  const prev = await db.shiftHandover.findFirst({
+    where: {
+      branchId: shift.branchId,
+      status: 'CLOSED',
+      id: { not: shift.id },
+      endedAt: { not: null, lte: shift.startedAt },
+    },
+    orderBy: { endedAt: 'desc' },
+    select: { endedAt: true },
+  });
+  return prev?.endedAt ?? null;
 }
 
 export async function getLastClosedShift(branchId) {
@@ -450,7 +525,44 @@ export async function closeShift({
   /** 呼叫端已確認為店長以上時傳 true；差額交班必填 */
   allowVariance = false,
 } = {}) {
-  const shift = await prisma.shiftHandover.findUnique({ where: { id: shiftId } });
+  return prisma.$transaction(
+    (tx) =>
+      closeShiftLocked(tx, {
+        shiftId,
+        staffId,
+        staffName,
+        staffRole,
+        countedCash,
+        matchExpected,
+        note,
+        cashDenominations,
+        closeChecklist,
+        now,
+        allowVariance,
+      }),
+    { timeout: 20000 },
+  );
+}
+
+async function closeShiftLocked(
+  tx,
+  {
+    shiftId,
+    staffId,
+    staffName,
+    staffRole,
+    countedCash,
+    matchExpected,
+    note,
+    cashDenominations,
+    closeChecklist,
+    now,
+    allowVariance,
+  },
+) {
+  // 等待進行中的收款交易（FOR SHARE）提交後才結算，避免漏計
+  await tx.$queryRaw`SELECT id FROM "ShiftHandover" WHERE id = ${String(shiftId)} FOR UPDATE`;
+  const shift = await tx.shiftHandover.findUnique({ where: { id: shiftId } });
   if (!shift) {
     const err = new Error('找不到班次');
     err.statusCode = 404;
@@ -462,12 +574,15 @@ export async function closeShift({
     throw err;
   }
 
+  // 取得鎖後才定交班時間：等待中的收款可能晚於呼叫時間才寫入
+  const closeAt = new Date(Math.max(now.getTime(), Date.now()));
   const summary = await buildShiftSummary({
     branchId: shift.branchId,
     from: shift.startedAt,
-    to: now,
-  });
-  const expectedCash = roundMoney(shift.openingFloat + summary.cashIn);
+    to: closeAt,
+    carryFrom: await previousShiftEnd(shift, tx),
+  }, tx);
+  const expectedCash = roundMoney(shift.openingFloat + summary.cashIn - summary.cashRefund);
 
   const denom = cashDenominations != null ? normalizeCashDenominations(cashDenominations) : null;
   const checklist = normalizeCloseChecklist(closeChecklist);
@@ -513,11 +628,11 @@ export async function closeShift({
       ? shift.summarySnapshot
       : {};
 
-  return prisma.shiftHandover.update({
+  return tx.shiftHandover.update({
     where: { id: shift.id },
     data: {
       status: 'CLOSED',
-      endedAt: now,
+      endedAt: closeAt,
       closedByStaffId: staffId,
       closedByName: operator,
       expectedCash,
@@ -528,6 +643,7 @@ export async function closeShift({
         ...prevSnap,
         totals: summary.totals,
         cashIn: summary.cashIn,
+        cashRefund: summary.cashRefund,
         payMix: summary.payMix,
         payMixColumns: normalizePayMixColumns(summary.payMix),
         refunds: summary.refunds,
@@ -544,7 +660,7 @@ export async function closeShift({
           staffId,
           name: String(staffName || '').slice(0, 80),
           role: String(staffRole || '').toUpperCase() || null,
-          at: now.toISOString(),
+          at: closeAt.toISOString(),
           matchExpected: wantMatch,
           variance,
         },

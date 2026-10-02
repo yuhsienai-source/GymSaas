@@ -1,4 +1,4 @@
-import type { Branch, CoursePlan, Product, Promotion, StaffAccount, Trainer, Venue } from '../../../types/api';
+import type { Branch, BranchStockRow, CoursePlan, Promotion, StaffAccount, Trainer, Venue } from '../../../types/api';
 
 export type HqTab =
   | 'branches'
@@ -14,12 +14,13 @@ export type HqTab =
   | 'cms'
   | 'marketing'
   | 'hr'
+  | 'payroll'
   | 'coach'
   | 'crm';
 
 export const HQ_TABS: { key: HqTab; label: string }[] = [
   { key: 'branches', label: '分店場地' },
-  { key: 'inventory', label: '商品主檔' },
+  { key: 'inventory', label: '進銷存／發票' },
   { key: 'promotions', label: '儲值方案' },
   { key: 'coursePlans', label: '課程方案' },
   { key: 'groupClasses', label: '團課管理' },
@@ -29,7 +30,8 @@ export const HQ_TABS: { key: HqTab; label: string }[] = [
   { key: 'marketing', label: '行銷 CRM' },
   { key: 'crm', label: '團課 CRM' },
   { key: 'hr', label: '員工 HR' },
-  { key: 'coach', label: '教練拆帳' },
+  { key: 'payroll', label: '薪資' },
+  { key: 'coach', label: '教練業績' },
   { key: 'people', label: '員工管理' },
   { key: 'gateDevices', label: '進出場裝置' },
   { key: 'salesAnalytics', label: '銷售分析' },
@@ -40,11 +42,10 @@ export interface HqDataProps {
   venues: Venue[];
   promotions: Promotion[];
   coursePlans: CoursePlan[];
-  products: Product[];
+  /** 全分店庫存／上架列（課程方案加贈禮選單用） */
+  branchStocks: BranchStockRow[];
   staffList: StaffAccount[];
   trainers: Trainer[];
-  inventoryBranchId: number | '';
-  setInventoryBranchId: (id: number | '') => void;
   onReload: () => Promise<void>;
   onReloadInventory: () => Promise<void>;
 }

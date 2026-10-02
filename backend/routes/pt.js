@@ -7,7 +7,8 @@ import {
   assertCoursePlanSellable,
 } from '../lib/coursePlan.js';
 import { assertMemberSignedCoursePlanContracts } from '../lib/memberContract.js';
-import { issueInvoice, normalizeInvoiceOptions } from '../lib/ezpay.js';
+import { normalizeInvoiceOptions } from '../lib/ezpay.js';
+import { issueOrderInvoice, saveInvoiceRequest } from '../lib/einvoice.js';
 import {
   serializeVenue,
   serializeVenueStation,
@@ -15,7 +16,7 @@ import {
   venueWithStationsInclude,
 } from '../lib/venueStation.js';
 import { staffBranchLabel } from '../lib/branchLabel.js';
-import { assertTrainerNotOnTimeOff } from '../lib/trainerTimeOff.js';
+import { assertTrainerBookable } from '../lib/trainerTimeOff.js';
 import { assertPrivateVenueAllowed } from '../lib/branchShare.js';
 import { resolveDisplayName } from '../lib/displayName.js';
 import {
@@ -23,6 +24,14 @@ import {
   formatWeekdaysLabel,
   normalizeWeekdays,
 } from '../lib/groupClassSeries.js';
+import { isManagerTrainer } from '../lib/orgStructure.js';
+import { isAdminUser } from '../lib/staffAccess.js';
+import { resolveEnrollDeadline } from '../lib/groupClassRules.js';
+import {
+  listSeriesForAdmin,
+  getSeriesRoster,
+  cancelGroupSeries,
+} from '../lib/groupClassService.js';
 
 const router = express.Router();
 router.use(verifyStaff, requirePermission('pt'));
@@ -37,34 +46,6 @@ function generateOrderId() {
   const dateStr = new Date().toISOString().replace(/[-:T.Z]/g, '').slice(0, 8);
   const randomStr = Math.floor(100000 + Math.random() * 900000).toString();
   return `TYK${dateStr}${randomStr}`;
-}
-
-async function tryIssuePtOrderInvoice(order, buyerName) {
-  try {
-    const invoiceResult = await issueInvoice({
-      id: order.id,
-      amount: order.amount,
-      itemDesc: order.itemDesc,
-      buyerName: buyerName || '體育客顧客',
-      carrierNum: order.carrierNum || null,
-      buyerUbn: order.buyerUbn || null,
-      loveCode: order.loveCode || null,
-    });
-    if (invoiceResult.Status === 'SUCCESS') {
-      const invoiceData = JSON.parse(invoiceResult.Result);
-      await prisma.order.update({
-        where: { id: order.id },
-        data: { invoiceNumber: invoiceData.InvoiceNumber },
-      });
-      console.log(`🧾 私教訂單 ${order.id} 發票：${invoiceData.InvoiceNumber}`);
-      return invoiceData.InvoiceNumber;
-    }
-    console.error(`❌ 私教訂單 ${order.id} 發票失敗:`, invoiceResult.Message || invoiceResult);
-    return null;
-  } catch (error) {
-    console.error(`❌ 私教訂單 ${order.id} 發票例外:`, error.message);
-    return null;
-  }
 }
 
 /** 經典區間重疊：(新開始 < 舊結束) ∧ (新結束 > 舊開始) */
@@ -118,6 +99,13 @@ function serializeClassSeries(row) {
     trainerName: row.trainer?.name || null,
     classCount,
     isActive: row.isActive,
+    coursePlanId: row.coursePlanId ?? null,
+    termPrice: row.termPrice ?? null,
+    dropInPrice: row.dropInPrice ?? null,
+    sessionCount: row.sessionCount ?? null,
+    minEnrollment: row.minEnrollment ?? 0,
+    enrollDeadline: row.enrollDeadline ?? null,
+    status: row.status,
   };
 }
 
@@ -157,7 +145,7 @@ router.post('/members/identify', async (req, res) => {
 router.get('/dashboard-data', async (req, res) => {
   try {
     const now = new Date();
-    const [trainers, venues, upcomingGroupClasses, activeSeries] = await Promise.all([
+    const [trainers, venues, upcomingGroupClasses, activeSeries, groupCoursePlans] = await Promise.all([
       prisma.trainer.findMany({
         where: { isActive: true },
         select: {
@@ -198,6 +186,21 @@ router.get('/dashboard-data', async (req, res) => {
         orderBy: { startDate: 'asc' },
         take: 40,
       }),
+      prisma.coursePlan.findMany({
+        where: { planType: 'GROUP', kind: 'SALE', isActive: true },
+        select: {
+          id: true,
+          name: true,
+          branchId: true,
+          price: true,
+          dropInPrice: true,
+          sessions: true,
+          capacity: true,
+          minEnrollment: true,
+          branch: { select: { id: true, name: true, code: true } },
+        },
+        orderBy: [{ branchId: 'asc' }, { id: 'asc' }],
+      }),
     ]);
 
     res.json({
@@ -207,6 +210,11 @@ router.get('/dashboard-data', async (req, res) => {
         venues: venues.map(serializeVenue),
         upcomingGroupClasses: upcomingGroupClasses.map(serializeGroupClass),
         activeSeries: activeSeries.map(serializeClassSeries),
+        groupCoursePlans: groupCoursePlans.map((p) => ({
+          ...p,
+          branchName: staffBranchLabel(p.branch),
+          branch: undefined,
+        })),
       },
     });
   } catch (error) {
@@ -218,11 +226,13 @@ router.get('/dashboard-data', async (req, res) => {
 // ==========================================
 // 團課期班排課（GROUP）
 // POST /api/pt/schedule-group-class
-// Body: { title, venueId, stationId?, startDate, endDate, weekdays|weekday,
-//         startTime, endTime, capacity, trainerId }
+// Body: { coursePlanId, title?, venueId, stationId?, startDate, endDate, weekdays|weekday,
+//         startTime, endTime, capacity?, trainerId, enrollDeadline? }
+// 價格／堂數／最低開班人數快照自 GROUP 課程方案；展開堂數須等於方案堂數
 // ==========================================
 router.post('/schedule-group-class', async (req, res) => {
   const {
+    coursePlanId,
     title,
     venueId,
     stationId,
@@ -234,6 +244,7 @@ router.post('/schedule-group-class', async (req, res) => {
     endTime,
     capacity,
     trainerId,
+    enrollDeadline,
     ...illegal
   } = req.body || {};
 
@@ -244,8 +255,16 @@ router.post('/schedule-group-class', async (req, res) => {
     });
   }
 
-  if (!title || typeof title !== 'string' || !title.trim()) {
-    return res.status(400).json({ status: 'error', message: '請提供團課名稱' });
+  const parsedPlanId = parseInt(coursePlanId, 10);
+  if (!Number.isInteger(parsedPlanId) || parsedPlanId <= 0) {
+    return res.status(400).json({
+      status: 'error',
+      code: 'COURSE_PLAN_REQUIRED',
+      message: '團課為付費期班：請選擇團體課程方案（coursePlanId）',
+    });
+  }
+  if (title !== undefined && title !== null && typeof title !== 'string') {
+    return res.status(400).json({ status: 'error', message: '團課名稱格式錯誤' });
   }
   if (venueId === undefined || trainerId === undefined || !startDate || !endDate) {
     return res.status(400).json({
@@ -281,12 +300,36 @@ router.post('/schedule-group-class', async (req, res) => {
     if (parsedStationId !== null && !Number.isInteger(parsedStationId)) {
       return res.status(400).json({ status: 'error', message: 'stationId 無效' });
     }
-    const cap = parseInt(capacity, 10);
+    const plan = await prisma.coursePlan.findUnique({ where: { id: parsedPlanId } });
+    if (!plan || plan.planType !== 'GROUP' || plan.kind !== 'SALE' || !plan.isActive) {
+      return res.status(400).json({
+        status: 'error',
+        code: 'COURSE_PLAN_INVALID',
+        message: '課程方案須為上架中之團體課程（GROUP）',
+      });
+    }
+    if (!(plan.price > 0)) {
+      return res.status(400).json({ status: 'error', message: '團體課程方案售價須大於 0' });
+    }
+    if (plan.sessions && plan.sessions !== sessions.length) {
+      return res.status(400).json({
+        status: 'error',
+        code: 'SESSION_COUNT_MISMATCH',
+        message: `此日期區間展開 ${sessions.length} 堂，與課程方案每期 ${plan.sessions} 堂不符，請調整日期或上課日`,
+      });
+    }
+    const capRaw = capacity === undefined || capacity === null || capacity === '' ? plan.capacity : capacity;
+    const cap = parseInt(capRaw, 10);
     if (!Number.isInteger(cap) || cap < 1) {
       return res.status(400).json({ status: 'error', message: '人數上限須為正整數' });
     }
+    const minEnrollment = Math.max(0, parseInt(plan.minEnrollment, 10) || 0);
+    if (minEnrollment > cap) {
+      return res.status(400).json({ status: 'error', message: '最低開班人數不可大於人數上限' });
+    }
+    const deadline = resolveEnrollDeadline({ startDate: String(startDate).trim(), enrollDeadline });
 
-    const trimmedTitle = title.trim().slice(0, 100);
+    const trimmedTitle = (title && title.trim() ? title.trim() : plan.name).slice(0, 100);
     const startTimeStr = String(startTime).trim();
     const endTimeStr = String(endTime).trim();
 
@@ -304,6 +347,9 @@ router.post('/schedule-group-class', async (req, res) => {
         },
       });
       if (!venue) httpError('場地不存在', 404);
+      if (venue.branchId !== plan.branchId && venue.branch?.parentId !== plan.branchId) {
+        httpError('課程方案須屬於開課分店（或其上層健身房）', 400);
+      }
 
       if (parsedStationId != null) {
         if (!venue.stations.some((s) => s.id === parsedStationId)) {
@@ -313,7 +359,7 @@ router.post('/schedule-group-class', async (req, res) => {
         httpError('此場地已設定站點，請選擇訓練站點', 400);
       }
 
-      if (trainer.role !== 'MANAGER') {
+      if (!isManagerTrainer(trainer)) {
         const allowed = await tx.trainerBranch.findUnique({
           where: {
             trainerId_branchId: {
@@ -328,7 +374,7 @@ router.post('/schedule-group-class', async (req, res) => {
       }
 
       for (const slot of sessions) {
-        await assertTrainerNotOnTimeOff(tx, trainer.id, slot.startAt, slot.endAt);
+        await assertTrainerBookable(tx, trainer.id, slot.startAt, slot.endAt);
 
         const trainerConflict = await tx.class.findFirst({
           where: { trainerId: trainer.id, ...overlapWhere(slot.startAt, slot.endAt) },
@@ -367,6 +413,13 @@ router.post('/schedule-group-class', async (req, res) => {
           startTime: startTimeStr,
           endTime: endTimeStr,
           isActive: true,
+          coursePlanId: plan.id,
+          termPrice: plan.price,
+          dropInPrice: plan.dropInPrice && plan.dropInPrice > 0 ? plan.dropInPrice : null,
+          sessionCount: sessions.length,
+          minEnrollment,
+          enrollDeadline: deadline,
+          status: 'OPEN',
         },
       });
 
@@ -405,11 +458,64 @@ router.post('/schedule-group-class', async (req, res) => {
       },
     });
   } catch (error) {
-    if (error.statusCode) {
-      return res.status(error.statusCode).json({ status: 'error', message: error.message });
+    sendGroupErr(res, error, '團課期班排課失敗');
+  }
+});
+
+function sendGroupErr(res, error, fallback) {
+  if (error.statusCode) {
+    return res.status(error.statusCode).json({
+      status: 'error',
+      ...(error.code ? { code: error.code } : {}),
+      message: error.message,
+    });
+  }
+  console.error(error);
+  return res.status(500).json({ status: 'error', message: fallback });
+}
+
+// GET /api/pt/group-series?includeEnded=1 — 期班報名統計＋開班判定
+router.get('/group-series', async (req, res) => {
+  try {
+    const data = await listSeriesForAdmin({ includeEnded: String(req.query.includeEnded || '') === '1' });
+    res.json({ status: 'success', data });
+  } catch (error) {
+    sendGroupErr(res, error, '讀取期班失敗');
+  }
+});
+
+// GET /api/pt/group-series/:id/roster
+router.get('/group-series/:id/roster', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({ status: 'error', message: 'id 無效' });
     }
-    console.error(error);
-    res.status(500).json({ status: 'error', message: '團課期班排課失敗' });
+    res.json({ status: 'success', data: await getSeriesRoster(id) });
+  } catch (error) {
+    sendGroupErr(res, error, '讀取期班名單失敗');
+  }
+});
+
+// POST /api/pt/group-series/:id/cancel  Body: { reason } — 限 ADMIN；已報名者未履約部分全額退費
+router.post('/group-series/:id/cancel', async (req, res) => {
+  if (!isAdminUser(req.user)) {
+    return res.status(403).json({ status: 'error', message: '⛔ 取消期班（全額退費）限總部管理員' });
+  }
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({ status: 'error', message: 'id 無效' });
+    }
+    const r = await cancelGroupSeries({ seriesId: id, staffId: req.user?.id ?? null, reason: req.body?.reason });
+    const failNote = r.failed.length ? `；${r.failed.length} 筆退費需人工處理` : '';
+    res.json({
+      status: 'success',
+      message: `期班已取消：刪除 ${r.removedClasses} 堂未上課程、退費 ${r.refunded.length} 筆${failNote}`,
+      data: r,
+    });
+  } catch (error) {
+    sendGroupErr(res, error, '取消期班失敗');
   }
 });
 
@@ -506,7 +612,7 @@ router.post('/buy-contract', async (req, res) => {
         httpError('找不到此教練或教練已停用', 404);
       }
       const trainerBranchIds = new Set(trainer.branches.map((b) => b.branchId));
-      const isManager = trainer.role === 'MANAGER';
+      const isManager = isManagerTrainer(trainer);
 
       const created = [];
       for (const line of normalizedItems) {
@@ -528,11 +634,26 @@ router.post('/buy-contract', async (req, res) => {
           );
         }
         if (plan.requiresMemberContract) {
-          await assertMemberSignedCoursePlanContracts(parsedMemberId, plan.id);
+          await assertMemberSignedCoursePlanContracts(parsedMemberId, plan.id, tx);
         }
 
         const totalSessionsLine = plan.sessions * line.qty;
         const priceLine = plan.price * line.qty;
+
+        const order = await tx.order.create({
+          data: {
+            id: generateOrderId(),
+            memberId: parsedMemberId,
+            amount: priceLine,
+            itemDesc:
+              `私教購案 | ${plan.name} ×${line.qty}` +
+              ` | 方案#${plan.id} | ${trainer.name} × ${totalSessionsLine} 堂` +
+              ` | 學員 ${member.name}`,
+            payMethod: 'CASH',
+            branchId: plan.branchId ?? null,
+            status: 'PAID',
+          },
+        });
 
         const contract = await tx.pTContract.create({
           data: {
@@ -545,29 +666,14 @@ router.post('/buy-contract', async (req, res) => {
             source: 'PURCHASE',
             coursePlanId: plan.id,
             branchId: plan.branchId,
+            orderId: order.id,
           },
           include: {
             member: { select: { id: true, name: true } },
             trainer: { select: { id: true, name: true } },
           },
         });
-
-        const order = await tx.order.create({
-          data: {
-            id: generateOrderId(),
-            memberId: parsedMemberId,
-            amount: priceLine,
-            itemDesc:
-              `私教購案 | ${plan.name} ×${line.qty}` +
-              ` | 方案#${plan.id} | ${trainer.name} × ${totalSessionsLine} 堂` +
-              ` | 學員 ${member.name}`,
-            payMethod: 'CASH',
-            carrierNum: invoiceOpts.carrierNum,
-            buyerUbn: invoiceOpts.buyerUbn,
-            loveCode: invoiceOpts.loveCode,
-            status: 'PAID',
-          },
-        });
+        await saveInvoiceRequest(tx, { refType: 'ORDER', refId: order.id, buyerName: member.name, ...invoiceOpts });
 
         created.push({
           contract,
@@ -585,8 +691,8 @@ router.post('/buy-contract', async (req, res) => {
 
     const invoices = [];
     for (const row of result) {
-      const invoiceNumber = await tryIssuePtOrderInvoice(row.order, row.memberName);
-      invoices.push({ orderId: row.order.id, invoiceNumber });
+      const inv = await issueOrderInvoice(row.order.id);
+      invoices.push({ orderId: row.order.id, invoiceNumber: inv.invoiceNumber, invoiceOutcome: inv.code });
     }
 
     const totalSessionsSum = result.reduce((s, r) => s + r.totalSessions, 0);
@@ -708,7 +814,7 @@ router.post('/schedule-session', async (req, res) => {
         assertPrivateVenueAllowed(contract.branch, venue.branch);
       }
 
-      if (contract.trainer.role !== 'MANAGER') {
+      if (!isManagerTrainer(contract.trainer)) {
         const allowed = await tx.trainerBranch.findUnique({
           where: {
             trainerId_branchId: {
@@ -740,7 +846,7 @@ router.post('/schedule-session', async (req, res) => {
         );
       }
 
-      await assertTrainerNotOnTimeOff(tx, contract.trainerId, startTime, endTime);
+      await assertTrainerBookable(tx, contract.trainerId, startTime, endTime);
 
       const venueConflict = await tx.class.findFirst({
         where: {
@@ -774,6 +880,7 @@ router.post('/schedule-session', async (req, res) => {
           venueId: parsedVenueId,
           stationId: parsedStationId,
           trainerId: contract.trainerId,
+          ptContractId: contract.id,
           capacity: 1,
           startAt: startTime,
           endAt: endTime,

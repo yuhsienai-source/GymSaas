@@ -28,6 +28,10 @@ const TrainerDashboardPage = lazy(() => import('./pages/staff/TrainerDashboardPa
 const TxDashboardPage = lazy(() => import('./pages/staff/TxDashboardPage'));
 const InventoryOpsPage = lazy(() => import('./pages/staff/InventoryOpsPage'));
 const CustomerDisplayPage = lazy(() => import('./pages/staff/CustomerDisplayPage'));
+const RosterPage = lazy(() => import('./pages/staff/RosterPage'));
+const MyRosterPage = lazy(() => import('./pages/staff/MyRosterPage'));
+const MyAttendancePage = lazy(() => import('./pages/staff/MyAttendancePage'));
+const StaffLineCallbackPage = lazy(() => import('./pages/staff/StaffLineCallbackPage'));
 
 function RouteFallback() {
   return (
@@ -42,18 +46,28 @@ function LazyPage({ children }: { children: ReactNode }) {
 }
 
 function AdminRoute({ children }: { children: ReactNode }) {
-  const { isAdmin, staff } = useStaffAuth();
+  const { isAdmin, staff, duty } = useStaffAuth();
   return (
-    <ProtectedRoute isAllowed={isAdmin} redirectTo={getDefaultStaffPath(staff)}>
+    <ProtectedRoute isAllowed={isAdmin} redirectTo={getDefaultStaffPath(staff, duty)}>
       {children}
     </ProtectedRoute>
   );
 }
 
+/** 業務模組：職權／模組權限＋班表值勤（非值勤導回我的出勤；後端 staffDutyGate 同步強制） */
 function DutyRoute({ children }: { children: ReactNode }) {
-  const { canAccessTx, staff } = useStaffAuth();
+  const { canAccessTx, staff, duty, isOffDuty } = useStaffAuth();
   return (
-    <ProtectedRoute isAllowed={canAccessTx} redirectTo={getDefaultStaffPath(staff)}>
+    <ProtectedRoute isAllowed={canAccessTx && !isOffDuty} redirectTo={getDefaultStaffPath(staff, duty)}>
+      {children}
+    </ProtectedRoute>
+  );
+}
+
+function ManagerRoute({ children }: { children: ReactNode }) {
+  const { canManageRoster, staff, duty, isOffDuty } = useStaffAuth();
+  return (
+    <ProtectedRoute isAllowed={canManageRoster && !isOffDuty} redirectTo={getDefaultStaffPath(staff, duty)}>
       {children}
     </ProtectedRoute>
   );
@@ -66,17 +80,17 @@ function PermissionRoute({
   permission: StaffPermission;
   children: ReactNode;
 }) {
-  const { hasPermission, staff } = useStaffAuth();
+  const { hasPermission, staff, duty, isOffDuty } = useStaffAuth();
   return (
-    <ProtectedRoute isAllowed={hasPermission(permission)} redirectTo={getDefaultStaffPath(staff)}>
+    <ProtectedRoute isAllowed={hasPermission(permission) && !isOffDuty} redirectTo={getDefaultStaffPath(staff, duty)}>
       {children}
     </ProtectedRoute>
   );
 }
 
 function StaffHomeRedirect() {
-  const { staff } = useStaffAuth();
-  return <Navigate to={getDefaultStaffPath(staff)} replace />;
+  const { staff, duty } = useStaffAuth();
+  return <Navigate to={getDefaultStaffPath(staff, duty)} replace />;
 }
 
 function AppRoutes() {
@@ -292,6 +306,40 @@ function AppRoutes() {
                 <InventoryOpsPage />
               </LazyPage>
             </DutyRoute>
+          }
+        />
+        <Route
+          path="roster"
+          element={
+            <ManagerRoute>
+              <LazyPage>
+                <RosterPage />
+              </LazyPage>
+            </ManagerRoute>
+          }
+        />
+        <Route
+          path="my-roster"
+          element={
+            <LazyPage>
+              <MyRosterPage />
+            </LazyPage>
+          }
+        />
+        <Route
+          path="my-attendance"
+          element={
+            <LazyPage>
+              <MyAttendancePage />
+            </LazyPage>
+          }
+        />
+        <Route
+          path="line/callback"
+          element={
+            <LazyPage>
+              <StaffLineCallbackPage />
+            </LazyPage>
           }
         />
       </Route>

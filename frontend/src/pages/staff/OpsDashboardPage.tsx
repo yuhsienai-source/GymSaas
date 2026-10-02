@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useEffectEvent, useMemo, useRef, useState } from 'react';
 import {
   Alert,
   Badge,
@@ -25,8 +25,11 @@ import {
   fetchMemberContracts,
   openMemberContract,
   getErrorMessage,
+  readApiErrorCode,
   fetchOpsCheckoutStatus,
+  fetchOpsShiftCurrent,
   opsBindFace,
+  opsCancelPendingPayment,
   opsCheckout,
   opsConfirmYipay,
   openPayuniCheckoutInNewTab,
@@ -45,6 +48,8 @@ import OpsActiveCheckInsTab from '../../components/staff/OpsActiveCheckInsTab';
 import OpsShiftHandoverTab from '../../components/staff/OpsShiftHandoverTab';
 import OpsInvoiceFailBanner from '../../components/staff/OpsInvoiceFailBanner';
 import SignaturePad from '../../components/staff/SignaturePad';
+import ReasonModal from '../../components/staff/ReasonModal';
+import { staffHasDutyRankOrAbove } from '../../lib/staffPermissions';
 import { staffBranchLabel } from '../../lib/branchLabel';
 import {
   summarizePosDisplayCart,
@@ -68,10 +73,14 @@ import type {
   MemberContractSignature,
   OpsMember,
   CoursePlan,
+  GroupEnrollKind,
   Product,
   Promotion,
   Trainer,
 } from '../../types/api';
+import { isManagerTrainer } from '../../lib/orgStructure';
+import OpsGroupClassPanel from '../../components/staff/OpsGroupClassPanel';
+import { groupCartKey, type GroupCartDraft } from '../../lib/groupClass';
 
 function contractToneClass(tone?: string) {
   if (tone === 'signed') return 'contract-chip contract-chip--signed';
@@ -184,7 +193,40 @@ type CartCourseLine = {
   recurringAmountFinal?: number | null;
 };
 
-type CartLine = CartProductLine | CartPromoLine | CartCourseLine;
+/** 團課期班（整期／插班／單堂）；price 僅顯示，結帳由後端依剩餘堂數重新計價 */
+type CartGroupLine = {
+  kind: 'GROUP';
+  seriesId: number;
+  groupKind: GroupEnrollKind;
+  classId?: number;
+  qty: 1;
+  name: string;
+  price: number;
+  sessions: number;
+  detail: string;
+};
+
+type CartLine = CartProductLine | CartPromoLine | CartCourseLine | CartGroupLine;
+
+const CART_KIND_LABEL: Record<CartLine['kind'], string> = {
+  PRODUCT: '商品',
+  PROMO: '購案',
+  COURSE: '課程',
+  GROUP: '團課',
+};
+
+function cartLineKey(c: CartLine) {
+  switch (c.kind) {
+    case 'PRODUCT':
+      return `p-${c.productId}`;
+    case 'COURSE':
+      return `c-${c.coursePlanId}`;
+    case 'GROUP':
+      return `g-${groupCartKey({ seriesId: c.seriesId, kind: c.groupKind, classId: c.classId })}`;
+    default:
+      return `promo-${c.promotionId}`;
+  }
+}
 
 function buildOpsPosDisplayCart(
   cart: CartLine[],
@@ -233,6 +275,10 @@ const OPS_TABS: { key: OpsTab; label: string }[] = [
   { key: 'shift', label: '交接班結算' },
 ];
 
+function fetchCatalog() {
+  return Promise.all([fetchOpsPromotions(), fetchOpsBranches(), fetchOpsTrainers()]);
+}
+
 export default function OpsDashboardPage() {
   const { toast } = useToast();
   const { staff, isAdmin } = useStaffAuth();
@@ -255,7 +301,6 @@ export default function OpsDashboardPage() {
   const deepLinkConsumed = useRef(false);
   const [members, setMembers] = useState<OpsMember[]>([]);
   const [membersTotal, setMembersTotal] = useState(0);
-  const [membersLoading, setMembersLoading] = useState(false);
   const [membersLoadingMore, setMembersLoadingMore] = useState(false);
   const membersFetchGen = useRef(0);
   const MEMBERS_PAGE_SIZE = 50;
@@ -298,8 +343,20 @@ export default function OpsDashboardPage() {
   } | null>(null);
   const [yipayTerminalRef, setYipayTerminalRef] = useState('');
   const [yipayConfirmBusy, setYipayConfirmBusy] = useState(false);
+  const [voidPendingOpen, setVoidPendingOpen] = useState(false);
+  const [voidPendingChecked, setVoidPendingChecked] = useState(false);
+  /** 臨櫃結帳：選品 → 付款 */
+  const [checkoutStep, setCheckoutStep] = useState<'catalog' | 'pay'>('catalog');
+  /** 未開班不得結帳（對齊交班盲盤） */
+  const [shiftResult, setShiftResult] = useState<{ key: string; branchId: number; open: boolean } | null>(
+    null,
+  );
   const [search, setSearch] = useState('');
   const [debouncedSearch, setDebouncedSearch] = useState('');
+  const [membersReloadKey, setMembersReloadKey] = useState(0);
+  const membersRequestKey = `${debouncedSearch}|${membersReloadKey}`;
+  const [membersLoadedKey, setMembersLoadedKey] = useState<string | null>(null);
+  const membersLoading = membersLoadedKey !== membersRequestKey;
   const [promotionId, setPromotionId] = useState<number | ''>('');
   const [topupQty, setTopupQty] = useState(1);
   const [coursePlans, setCoursePlans] = useState<CoursePlan[]>([]);
@@ -308,6 +365,7 @@ export default function OpsDashboardPage() {
   const [courseQty, setCourseQty] = useState(1);
   const [courseSecondPerson, setCourseSecondPerson] = useState(false);
   const [trainerId, setTrainerId] = useState<number | ''>('');
+  const [groupReload, setGroupReload] = useState(0);
   const [faceMemberId, setFaceMemberId] = useState<number | null>(null);
   const [faceMemberName, setFaceMemberName] = useState('');
   const [createOpen, setCreateOpen] = useState(false);
@@ -395,78 +453,108 @@ export default function OpsDashboardPage() {
     setEditingMember((prev) => (prev?.id === updated.id ? { ...prev, ...updated } : prev));
   }, []);
 
+  // 第一頁：依搜尋字或 loadMembers({ skip: 0 }) 觸發重載
+  useEffect(() => {
+    let cancelled = false;
+    membersFetchGen.current += 1;
+    fetchOpsMembers({ q: debouncedSearch || undefined, take: MEMBERS_PAGE_SIZE, skip: 0 })
+      .then((res) => {
+        if (cancelled || res.status !== 'success' || !res.data) return;
+        const { items, total } = res.data;
+        setMembers(items);
+        setMembersTotal(total);
+        syncMemberSelections(items);
+      })
+      .catch((err) => {
+        if (!cancelled) toast(getErrorMessage(err, '載入會員失敗'), 'error');
+      })
+      .finally(() => {
+        if (!cancelled) setMembersLoadedKey(membersRequestKey);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [debouncedSearch, membersRequestKey, syncMemberSelections, toast]);
+
   const loadMembers = useCallback(
     async (opts?: { append?: boolean; skip?: number }) => {
-      const append = Boolean(opts?.append);
-      const skip = opts?.skip ?? 0;
-      const gen = append ? membersFetchGen.current : ++membersFetchGen.current;
-      if (append) setMembersLoadingMore(true);
-      else setMembersLoading(true);
+      if (!opts?.append) {
+        setMembersReloadKey((k) => k + 1);
+        return;
+      }
+      const gen = membersFetchGen.current;
+      setMembersLoadingMore(true);
       try {
         const res = await fetchOpsMembers({
           q: debouncedSearch || undefined,
           take: MEMBERS_PAGE_SIZE,
-          skip,
+          skip: opts.skip ?? 0,
         });
-        if (!append && gen !== membersFetchGen.current) return;
+        if (gen !== membersFetchGen.current) return;
         if (res.status === 'success' && res.data) {
           const { items, total } = res.data;
-          setMembers((prev) => (append ? [...prev, ...items] : items));
+          setMembers((prev) => [...prev, ...items]);
           setMembersTotal(total);
-          if (!append) syncMemberSelections(items);
         }
       } catch (err) {
-        if (!append && gen !== membersFetchGen.current) return;
         toast(getErrorMessage(err, '載入會員失敗'), 'error');
       } finally {
-        if (append) setMembersLoadingMore(false);
-        else if (gen === membersFetchGen.current) setMembersLoading(false);
+        setMembersLoadingMore(false);
       }
     },
-    [debouncedSearch, syncMemberSelections, toast],
+    [debouncedSearch, toast],
   );
 
-  const loadCatalog = useCallback(async () => {
-    try {
-      const [promosRes, branchesRes, trainersRes] = await Promise.all([
-        fetchOpsPromotions(),
-        fetchOpsBranches(),
-        fetchOpsTrainers(),
-      ]);
+  const applyCatalog = useCallback(
+    ([promosRes, branchesRes, trainersRes]: Awaited<ReturnType<typeof fetchCatalog>>) => {
       if (promosRes.status === 'success' && promosRes.data) {
         setPromotions(promosRes.data);
         if (promosRes.data[0]) setPromotionId(promosRes.data[0].id);
       }
       if (branchesRes.status === 'success' && branchesRes.data) {
         setBranches(branchesRes.data);
+        const firstBranchId = branchesRes.data[0]?.id;
         if (branchLocked && staff?.branchId) {
           setPosBranchId(staff.branchId);
-        } else if (branchesRes.data[0] && !posBranchId) {
-          setPosBranchId(branchesRes.data[0].id);
+        } else if (firstBranchId) {
+          setPosBranchId((prev) => prev || firstBranchId);
         }
       }
       if (trainersRes.status === 'success' && trainersRes.data) {
         setTrainers(trainersRes.data);
         setTrainerId((prev) => prev || trainersRes.data?.[0]?.id || '');
       }
+    },
+    [branchLocked, staff],
+  );
+
+  const loadCatalog = useCallback(async () => {
+    try {
+      applyCatalog(await fetchCatalog());
     } catch (err) {
       toast(getErrorMessage(err, '載入資料失敗'), 'error');
     }
-  }, [toast, posBranchId, branchLocked, staff]);
+  }, [applyCatalog, toast]);
 
   const loadData = useCallback(async () => {
     await Promise.all([loadMembers({ skip: 0 }), loadCatalog()]);
   }, [loadMembers, loadCatalog]);
 
+  const applyCatalogOnMount = useEffectEvent(applyCatalog);
   useEffect(() => {
-    void loadCatalog();
     // 僅初次掛載目錄；會員列表由 debouncedSearch effect 載入
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  useEffect(() => {
-    void loadMembers({ skip: 0 });
-  }, [loadMembers]);
+    let cancelled = false;
+    fetchCatalog()
+      .then((data) => {
+        if (!cancelled) applyCatalogOnMount(data);
+      })
+      .catch((err) => {
+        if (!cancelled) toast(getErrorMessage(err, '載入資料失敗'), 'error');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [toast]);
 
   useEffect(() => {
     if (!posBranchId) return;
@@ -491,6 +579,31 @@ export default function OpsDashboardPage() {
       cancelled = true;
     };
   }, [posBranchId, toast]);
+
+  // 切換分頁時重新確認開班；換分店時在確認完成前視為未知（不沿用他店狀態）
+  const shiftRequestKey = posBranchId === '' ? null : `${posBranchId}|${tab}`;
+  const shiftStatusLoading = shiftRequestKey !== null && shiftResult?.key !== shiftRequestKey;
+  const shiftOpen: boolean | null =
+    posBranchId !== '' && shiftResult?.branchId === posBranchId ? shiftResult.open : null;
+
+  useEffect(() => {
+    if (posBranchId === '' || shiftRequestKey === null) return;
+    let cancelled = false;
+    fetchOpsShiftCurrent(Number(posBranchId))
+      .then((cur) => {
+        if (cancelled) return;
+        const shift = (cur?.data as { shift?: unknown } | undefined)?.shift;
+        setShiftResult({ key: shiftRequestKey, branchId: posBranchId, open: Boolean(shift) });
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setShiftResult({ key: shiftRequestKey, branchId: posBranchId, open: false });
+        toast('讀取開班狀態失敗，請至交接班確認後再結帳', 'error');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [posBranchId, shiftRequestKey, toast]);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -585,7 +698,7 @@ export default function OpsDashboardPage() {
             'info',
           );
         }
-      } catch (err) {
+    } catch (err) {
         if (opts?.manual) toast(getErrorMessage(err, '查詢付款狀態失敗'), 'error');
       } finally {
         if (opts?.manual) setPendingPeriodChecking(false);
@@ -595,15 +708,18 @@ export default function OpsDashboardPage() {
     [pendingPeriodPay?.ref, pendingPeriodPay?.bindOnly],
   );
 
+  // 發起續期付款處已設 PENDING；此處只負責輪詢
   useEffect(() => {
     if (!pendingPeriodPay?.ref) return;
     pendingPeriodSettled.current = false;
-    setPendingPeriodStatus('PENDING');
-    void pollPendingPeriodPay();
+    const first = window.setTimeout(() => void pollPendingPeriodPay(), 0);
     const timer = window.setInterval(() => {
       void pollPendingPeriodPay();
     }, 2500);
-    return () => window.clearInterval(timer);
+    return () => {
+      window.clearTimeout(first);
+      window.clearInterval(timer);
+    };
   }, [pendingPeriodPay?.ref, pollPendingPeriodPay]);
 
   async function loadMemberContracts(memberId: number) {
@@ -971,9 +1087,18 @@ export default function OpsDashboardPage() {
     () => cart.find((c): c is CartPromoLine => c.kind === 'PROMO') || null,
     [cart],
   );
+  const walletBlockedByTopup = Boolean(cartPromoLine && cartPromoLine.usageType !== 'UNLIMITED');
   const cartCourseLines = useMemo(
     () => cart.filter((c): c is CartCourseLine => c.kind === 'COURSE'),
     [cart],
+  );
+  const cartGroupLines = useMemo(
+    () => cart.filter((c): c is CartGroupLine => c.kind === 'GROUP'),
+    [cart],
+  );
+  const cartGroupKeys = useMemo(
+    () => cartGroupLines.map((g) => groupCartKey({ seriesId: g.seriesId, kind: g.groupKind, classId: g.classId })),
+    [cartGroupLines],
   );
 
   const cartTotal = useMemo(
@@ -1081,7 +1206,7 @@ export default function OpsDashboardPage() {
   const yipayPayuniRecurring = allowCardRecurring;
 
   /** 選定期定額時，課程首期只收第1期；其餘列維持原價 */
-  const payableTotal = useMemo(() => {
+  const payableTotal = (() => {
     if (
       cardOptions.cardMode !== 'RECURRING' ||
       !recurringCourseLine ||
@@ -1099,53 +1224,93 @@ export default function OpsDashboardPage() {
       return sum + c.price * c.qty;
     }, 0);
     return Math.round((withoutRecurringCourse + first * recurringCourseLine.qty) * 100) / 100;
-  }, [cart, cartTotal, cardOptions.cardMode, cardOptions.periodTimes, recurringCourseLine, cartPromoLine]);
+  })();
 
-  /** 選定期定額時自動帶入乙禾＋PayUNi 標記與期付選項 */
-  useEffect(() => {
-    if (!yipayPayuniRecurring) return;
-    const periodAmt =
-      cartPromoLine?.enableCardRecurring
-        ? cartPromoLine.recurringAmount != null && cartPromoLine.recurringAmount > 0
-          ? cartPromoLine.recurringAmount
-          : cartPromoLine.price
-        : resolveCourseRecurringAmount(cardOptions.periodTimes) ?? defaultRecurringAmount;
-    const times =
-      cartPromoLine?.periodCount ??
-      courseDefaultPeriodTimes ??
-      cardOptions.periodTimes ??
-      12;
-    setCardOptions((prev) => ({
-      ...prev,
-      cardMode: 'RECURRING',
-      periodType: 'M',
-      periodTimes: times,
-      recurringAmount: periodAmt != null && periodAmt > 0 ? periodAmt : prev.recurringAmount,
-    }));
-    setPaySelected((prev) => {
-      const next = new Set(prev.filter((m) => m !== 'LINEPAY'));
-      next.add('YIPAY');
-      next.add('CARD');
-      next.delete('CASH');
-      return Array.from(next);
-    });
-    setPayAmounts((prev) => ({
-      ...prev,
-      YIPAY: payableTotal,
-      CARD: 0,
-    }));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [yipayPayuniRecurring, cartPromoLine?.promotionId, recurringCourseLine?.coursePlanId, payableTotal]);
+  /** 選品頁「前往付款」阻擋原因（給櫃檯看的人話） */
+  const goPayBlockers = useMemo(() => {
+    const reasons: string[] = [];
+    if (!cart.length) reasons.push('購物車是空的');
+    if (posBranchId !== '' && shiftOpen === false && !shiftStatusLoading) {
+      reasons.push('尚未開班：請先至「交接班結算」開班');
+    }
+    if (cartPromoLine && !selectedMember) reasons.push('購物車含購案，請先選擇會員');
+    if (cartCourseLines.length > 0 && !selectedMember) reasons.push('購物車含課程，請先選擇會員');
+    if (cartCourseLines.length > 0 && !trainerId) reasons.push('購買課程請選擇負責教練');
+    if (cartGroupLines.length > 0 && !selectedMember) reasons.push('購物車含團課，請先選擇會員');
+    return reasons;
+  }, [
+    cart.length,
+    posBranchId,
+    shiftOpen,
+    shiftStatusLoading,
+    cartPromoLine,
+    cartCourseLines.length,
+    cartGroupLines.length,
+    selectedMember,
+    trainerId,
+  ]);
+
+  const shiftBlocksPay = posBranchId !== '' && shiftOpen === false && !shiftStatusLoading;
+  const canGoPay = goPayBlockers.length === 0;
+
+  /** 選定期定額時自動帶入乙禾＋PayUNi 標記與期付選項（購案／課程／應付總額變動時重帶） */
+  const recurringPrefillKey = yipayPayuniRecurring
+    ? `${cartPromoLine?.promotionId ?? ''}|${recurringCourseLine?.coursePlanId ?? ''}|${payableTotal}`
+    : null;
+  const [appliedRecurringPrefillKey, setAppliedRecurringPrefillKey] = useState<string | null>(null);
+  if (recurringPrefillKey !== appliedRecurringPrefillKey) {
+    setAppliedRecurringPrefillKey(recurringPrefillKey);
+    if (recurringPrefillKey !== null) {
+      const periodAmt =
+        cartPromoLine?.enableCardRecurring
+          ? cartPromoLine.recurringAmount != null && cartPromoLine.recurringAmount > 0
+            ? cartPromoLine.recurringAmount
+            : cartPromoLine.price
+          : resolveCourseRecurringAmount(cardOptions.periodTimes) ?? defaultRecurringAmount;
+      const times =
+        cartPromoLine?.periodCount ??
+        courseDefaultPeriodTimes ??
+        cardOptions.periodTimes ??
+        12;
+      setCardOptions((prev) => ({
+        ...prev,
+        cardMode: 'RECURRING',
+        periodType: 'M',
+        periodTimes: times,
+        recurringAmount: periodAmt != null && periodAmt > 0 ? periodAmt : prev.recurringAmount,
+      }));
+      setPaySelected((prev) => {
+        const next = new Set(prev.filter((m) => m !== 'LINEPAY'));
+        next.add('YIPAY');
+        next.add('CARD');
+        next.delete('CASH');
+        return Array.from(next);
+      });
+      setPayAmounts((prev) => ({
+        ...prev,
+        YIPAY: payableTotal,
+        CARD: 0,
+      }));
+    }
+  }
+
+  const {
+    pendingConsentId: displayPendingConsentId,
+    postCart: postDisplayCart,
+    postIdle: postDisplayIdle,
+    lastSignature: displayLastSignature,
+    clearSignature: clearDisplaySignature,
+  } = posDisplay;
 
   // 客顯鏡像購物車（CONSENT 進行中不覆寫）
   useEffect(() => {
     if (tab !== 'checkout') return;
-    if (posDisplay.pendingConsentId) return;
+    if (displayPendingConsentId) return;
     if (!cart.length) {
-      posDisplay.postIdle();
+      postDisplayIdle();
       return;
     }
-    posDisplay.postCart(
+    postDisplayCart(
       buildOpsPosDisplayCart(cart, promotions, {
         payableTotal,
         memberName: selectedMember?.name,
@@ -1157,20 +1322,26 @@ export default function OpsDashboardPage() {
     promotions,
     payableTotal,
     selectedMember?.name,
-    posDisplay.pendingConsentId,
-    posDisplay.postCart,
-    posDisplay.postIdle,
+    displayPendingConsentId,
+    postDisplayCart,
+    postDisplayIdle,
   ]);
 
-  // 契約：客顯 SIGNATURE_COMPLETED → 填入本機 SignaturePad 狀態
+  // 契約：客顯 SIGNATURE_COMPLETED → 填入本機 SignaturePad 狀態（同一份簽名只帶入一次）
+  const contractDisplaySig =
+    displayLastSignature?.purpose === 'CONTRACT' && signDetail && signDetail.status !== 'SIGNED'
+      ? displayLastSignature
+      : null;
+  const [appliedContractSig, setAppliedContractSig] = useState<typeof contractDisplaySig>(null);
+  if (contractDisplaySig && contractDisplaySig !== appliedContractSig) {
+    setAppliedContractSig(contractDisplaySig);
+    setSignatureData(contractDisplaySig.signatureDataUrl);
+  }
   useEffect(() => {
-    const sig = posDisplay.lastSignature;
-    if (!sig || sig.purpose !== 'CONTRACT') return;
-    if (!signDetail || signDetail.status === 'SIGNED') return;
-    setSignatureData(sig.signatureDataUrl);
+    if (!contractDisplaySig) return;
     toast('客顯契約簽名已回傳，請確認後存檔', 'success');
-    posDisplay.clearSignature();
-  }, [posDisplay.lastSignature, signDetail, toast, posDisplay.clearSignature]);
+    clearDisplaySignature();
+  }, [contractDisplaySig, toast, clearDisplaySignature]);
 
   function resetSharedCheckoutPay() {
     setCarrier('');
@@ -1334,6 +1505,36 @@ export default function OpsDashboardPage() {
     toast(`已加入課程：${selectedCoursePlan.name}`, 'success');
   }
 
+  function addGroupToCart(draft: GroupCartDraft) {
+    const key = groupCartKey(draft);
+    setCart((prev) => {
+      if (
+        prev.some(
+          (c) =>
+            c.kind === 'GROUP' &&
+            groupCartKey({ seriesId: c.seriesId, kind: c.groupKind, classId: c.classId }) === key,
+        )
+      ) {
+        return prev;
+      }
+      return [
+        ...prev,
+        {
+          kind: 'GROUP' as const,
+          seriesId: draft.seriesId,
+          groupKind: draft.kind,
+          ...(draft.classId ? { classId: draft.classId } : {}),
+          qty: 1 as const,
+          name: draft.name,
+          price: draft.price,
+          sessions: draft.sessions,
+          detail: draft.detail,
+        },
+      ];
+    });
+    toast(`已加入團課：${draft.name}`, 'success');
+  }
+
   function updateCartCourseQty(coursePlanId: number, raw: string) {
     const n = parseInt(raw, 10);
     if (!Number.isInteger(n) || n <= 0) {
@@ -1398,6 +1599,9 @@ export default function OpsDashboardPage() {
         if (line.kind === 'COURSE') {
           return !(c.kind === 'COURSE' && c.coursePlanId === line.coursePlanId);
         }
+        if (line.kind === 'GROUP') {
+          return cartLineKey(c) !== cartLineKey(line);
+        }
         return c.kind !== 'PROMO';
       }),
     );
@@ -1405,7 +1609,13 @@ export default function OpsDashboardPage() {
 
   function clearCart() {
     setCart([]);
+    setGroupReload((k) => k + 1);
+    setCheckoutStep('catalog');
     if (!posDisplay.pendingConsentId) posDisplay.postIdle();
+  }
+
+  if (checkoutStep === 'pay' && cart.length === 0) {
+    setCheckoutStep('catalog');
   }
 
   function sendContractConsentToDisplay() {
@@ -1434,6 +1644,15 @@ export default function OpsDashboardPage() {
 
   async function handleUnifiedCheckout() {
     if (checkoutInFlight.current || checkoutBusy) return;
+    if (shiftStatusLoading) {
+      toast('正在確認開班狀態，請稍候再結帳', 'info');
+      return;
+    }
+    if (posBranchId !== '' && shiftOpen === false) {
+      toast('請先至「交接班結算」開班並確認備用金後再結帳', 'error');
+      setTab('shift');
+      return;
+    }
     if (!cart.length) {
       toast('購物車是空的', 'error');
       return;
@@ -1452,6 +1671,18 @@ export default function OpsDashboardPage() {
     }
     if (cartCourseLines.length > 0 && !trainerId) {
       toast('購買課程必須選擇教練', 'error');
+      return;
+    }
+    if (cartGroupLines.length > 0 && !selectedMember) {
+      toast('團課報名必須選擇會員', 'error');
+      return;
+    }
+    if (cartGroupLines.length > 0 && paySelected.includes('WALLET_CASH')) {
+      toast('團課報名不可使用錢包扣款，請改用現金／乙禾刷卡／LinePay，或分開結帳', 'error');
+      return;
+    }
+    if (walletBlockedByTopup && paySelected.includes('WALLET_CASH')) {
+      toast('計時儲值方案不可使用零錢包付款，請改用現金／乙禾刷卡／LinePay，或分開結帳', 'error');
       return;
     }
     if (paySelected.includes('WALLET_CASH') && !selectedMember) {
@@ -1522,6 +1753,15 @@ export default function OpsDashboardPage() {
                 ...(c.secondPersonOnSite ? { secondPersonOnSite: true } : {}),
               })),
               trainerId: Number(trainerId),
+            }
+          : {}),
+        ...(cartGroupLines.length
+          ? {
+              groupItems: cartGroupLines.map((g) => ({
+                seriesId: g.seriesId,
+                kind: g.groupKind,
+                ...(g.classId ? { classId: g.classId } : {}),
+              })),
             }
           : {}),
         payments: buildPaymentsPayload(paySelected, payAmounts, voucherCode, {
@@ -1601,9 +1841,34 @@ export default function OpsDashboardPage() {
       }
     } catch (err) {
       toast(getErrorMessage(err, '結帳失敗'), 'error');
+      if (readApiErrorCode(err) === 'SHIFT_NOT_OPEN') setTab('shift');
     } finally {
       checkoutInFlight.current = false;
       setCheckoutBusy(false);
+    }
+  }
+
+  async function handleVoidPending(reason: string): Promise<boolean> {
+    if (!pendingYipay?.checkoutId) return false;
+    if (!voidPendingChecked) {
+      toast('請先勾選已確認端末未刷卡成功', 'error');
+      return false;
+    }
+    try {
+      const result = await opsCancelPendingPayment(pendingYipay.checkoutId, { reason, checked: true });
+      if (result.status !== 'success') {
+        toast(result.message || '作廢失敗', 'error');
+        return false;
+      }
+      toast(result.message || '已作廢', 'success');
+      setPendingYipay(null);
+      setYipayTerminalRef('');
+      setVoidPendingChecked(false);
+      void loadMembers({ skip: 0 });
+      return true;
+    } catch (err) {
+      toast(getErrorMessage(err, '作廢失敗'), 'error');
+      return false;
     }
   }
 
@@ -1802,7 +2067,7 @@ export default function OpsDashboardPage() {
               .filter((b) => b.isActive !== false)
               .map((b) => {
                 const checked = form.branchIds.includes(b.id);
-                return (
+  return (
                   <label
                     key={b.id}
                     style={{
@@ -2125,7 +2390,7 @@ export default function OpsDashboardPage() {
       {tab === 'checkout' && (
       <PageSection
         title="臨櫃結帳"
-        desc="商品／購案／私教課程加入同一購物車 · 一次付款／一張發票 · 金額以後端查價為準"
+        desc="兩步驟：① 選品加入購物車 → ② 確認付款／發票 · 金額以後端查價為準"
         action={
           <Button
             size="sm"
@@ -2142,12 +2407,58 @@ export default function OpsDashboardPage() {
               }
             }}
           >
-            開啟客顯{posDisplay.displayLinked ? ' · 已連線' : ''}
+            開啟客顯{posDisplay.displayLinked ? ' · 已連線' : ' · 未連線／請重開'}
           </Button>
         }
       >
-        <div className="staff-grid">
-          <div className="form-stack">
+        {posBranchId !== '' && shiftOpen === false ? (
+          <Alert tone="warning">
+            <div className="form-stack" style={{ gap: '0.5rem' }}>
+              <span>
+                {shiftStatusLoading
+                  ? '正在確認開班狀態…'
+                  : '尚未開班：請先確認備用金並開班後，才能臨櫃結帳。'}
+              </span>
+              {!shiftStatusLoading && (
+                <Button size="sm" onClick={() => setTab('shift')} style={{ alignSelf: 'flex-start' }}>
+                  前往交接班開班
+                </Button>
+              )}
+            </div>
+          </Alert>
+        ) : null}
+
+        <nav className="ops-checkout-steps" aria-label="結帳步驟">
+          <button
+            type="button"
+            className={`ops-checkout-steps__btn ${checkoutStep === 'catalog' ? 'is-active' : ''}`}
+            onClick={() => setCheckoutStep('catalog')}
+          >
+            <span className="ops-checkout-steps__num">1</span>
+            選品加入購物車
+          </button>
+          <span className="ops-checkout-steps__sep" aria-hidden>
+            →
+          </span>
+          <button
+            type="button"
+            className={`ops-checkout-steps__btn ${checkoutStep === 'pay' ? 'is-active' : ''}`}
+            disabled={!canGoPay}
+            title={!canGoPay ? goPayBlockers.join('；') : undefined}
+            onClick={() => {
+              if (!canGoPay) return;
+              setCheckoutStep('pay');
+            }}
+          >
+            <span className="ops-checkout-steps__num">2</span>
+            確認付款
+            {cart.length ? ` · $${Math.round(payableTotal).toLocaleString('zh-TW')}` : ''}
+          </button>
+        </nav>
+
+        {checkoutStep === 'catalog' && (
+        <div className="staff-grid ops-checkout-catalog">
+            <div className="form-stack">
             <Card
               title="選品"
               subtitle={
@@ -2221,7 +2532,7 @@ export default function OpsDashboardPage() {
                   <Alert tone="warning">購案需先於上方「選擇會員」</Alert>
                 )}
                 <Field label="促銷方案">
-                  <Select
+                <Select
                     value={selectedPromotion?.id != null ? String(selectedPromotion.id) : ''}
                     onChange={(e) => {
                       setPromotionId(Number(e.target.value) || '');
@@ -2232,10 +2543,10 @@ export default function OpsDashboardPage() {
                     {branchPromotions.map((p) => (
                       <option key={p.id} value={p.id}>
                         {formatPromotionOptionLabel(p)}
-                      </option>
-                    ))}
-                  </Select>
-                </Field>
+                    </option>
+                  ))}
+                </Select>
+              </Field>
                 {branchPromotions.length === 0 && (
                   <Alert tone="info">此分店尚無可售購案</Alert>
                 )}
@@ -2323,14 +2634,14 @@ export default function OpsDashboardPage() {
                   <Alert tone="warning">購買課程需先於上方「選擇會員」</Alert>
                 )}
                 <Field label="負責教練">
-                  <Select
+                <Select
                     value={trainerId === '' ? '' : String(trainerId)}
                     onChange={(e) => setTrainerId(Number(e.target.value) || '')}
                   >
                     <option value="">— 請選擇教練 —</option>
                     {trainers.map((t) => (
                       <option key={t.id} value={t.id}>
-                        {t.name}{t.role === 'MANAGER' ? '（主管）' : ''}
+                        {t.name}{isManagerTrainer(t) ? '（主管）' : ''}
                       </option>
                     ))}
                   </Select>
@@ -2346,17 +2657,17 @@ export default function OpsDashboardPage() {
                   >
                     <option value="">— 請選擇課程方案 —</option>
                     {coursePlans.map((p) => (
-                      <option key={p.id} value={p.id}>
+                    <option key={p.id} value={p.id}>
                         {p.name} · ${p.price} · {p.sessions} 堂
                         {p.branchName || staffBranchLabel(p.branch)
                           ? ` · ${p.branchName || staffBranchLabel(p.branch)}`
                           : ''}
                         {p.giftLabel ? ` · 贈${p.giftLabel}${p.giftQty && p.giftQty > 1 ? ` ×${p.giftQty}` : ''}` : ''}
                         {p.enableCardRecurring ? ' · 定期定額' : ''}
-                      </option>
-                    ))}
-                  </Select>
-                </Field>
+                    </option>
+                  ))}
+                </Select>
+              </Field>
                 {selectedCoursePlan && (
                   <Field
                     label="數量"
@@ -2452,23 +2763,29 @@ export default function OpsDashboardPage() {
                   onClick={addCourseToCart}
                 >
                   加入購物車
-                </Button>
-              </div>
-            </Card>
+              </Button>
+            </div>
+          </Card>
+
+            <OpsGroupClassPanel
+              branchId={posBranchId}
+              member={selectedMember}
+              cartKeys={cartGroupKeys}
+              onAdd={addGroupToCart}
+              reloadSignal={groupReload}
+            />
           </div>
 
-          <Card title="購物車與結帳" subtitle={`應付約 $${payableTotal}（以後端為準）`}>
+          <Card
+            title="購物車"
+            subtitle={`共 ${cart.length} 項 · 應付約 $${Math.round(payableTotal).toLocaleString('zh-TW')}（以後端為準）`}
+            className="ops-checkout-cart-card"
+          >
             <div className="form-stack">
               <ul className="cart-lines">
                 {cart.map((c) => {
-                  const kindLabel =
-                    c.kind === 'PRODUCT' ? '商品' : c.kind === 'COURSE' ? '課程' : '購案';
-                  const lineKey =
-                    c.kind === 'PRODUCT'
-                      ? `p-${c.productId}`
-                      : c.kind === 'COURSE'
-                        ? `c-${c.coursePlanId}`
-                        : `promo-${c.promotionId}`;
+                  const kindLabel = CART_KIND_LABEL[c.kind];
+                  const lineKey = cartLineKey(c);
                   const lineTotal =
                     c.kind === 'PROMO' && c.usageType === 'UNLIMITED'
                       ? c.price
@@ -2486,6 +2803,7 @@ export default function OpsDashboardPage() {
                   if (c.kind === 'PROMO' && c.usageType === 'UNLIMITED') {
                     metaParts.push('無限方案');
                   }
+                  if (c.kind === 'GROUP') metaParts.push(c.detail);
 
                   return (
                     <li key={lineKey} className="cart-line">
@@ -2500,7 +2818,7 @@ export default function OpsDashboardPage() {
                       </div>
                       <span className="cart-line__unit">${c.price}</span>
                       {c.kind === 'PRODUCT' ? (
-                        <Input
+                <Input
                           className="cart-line__qty"
                           type="number"
                           min={1}
@@ -2535,7 +2853,7 @@ export default function OpsDashboardPage() {
                       <div className="cart-line__actions">
                         <Button size="sm" variant="ghost" onClick={() => removeCartLine(c)}>
                           移除
-                        </Button>
+              </Button>
                       </div>
                     </li>
                   );
@@ -2551,12 +2869,167 @@ export default function OpsDashboardPage() {
               {cartCourseLines.length > 0 && !selectedMember && (
                 <Alert tone="warning">購物車含課程，請先選擇會員</Alert>
               )}
+              {cartGroupLines.length > 0 && paySelected.includes('WALLET_CASH') && (
+                <Alert tone="warning">團課報名不可使用錢包扣款</Alert>
+              )}
+              {walletBlockedByTopup && paySelected.includes('WALLET_CASH') && (
+                <Alert tone="warning">計時儲值方案不可使用零錢包付款（防止循環套取贈送運動金）</Alert>
+              )}
               {cartCourseLines.length > 0 && !trainerId && (
                 <Alert tone="warning">購買課程請選擇負責教練</Alert>
               )}
               {paySelected.includes('WALLET_CASH') && !selectedMember && (
                 <Alert tone="warning">使用零錢包時請先於上方「選擇會員」</Alert>
               )}
+              {cart.length > 0 && !canGoPay && (
+                <Alert tone="warning">
+                  尚無法前往付款：{goPayBlockers.join('；')}
+                </Alert>
+              )}
+
+              <div className="checkout-actions">
+                <Button variant="ghost" onClick={clearCart} disabled={!cart.length}>
+                  清空
+                </Button>
+                {shiftBlocksPay && cart.length > 0 ? (
+                  <Button type="button" onClick={() => setTab('shift')}>
+                    前往開班
+                  </Button>
+                ) : (
+                  <Button
+                    type="button"
+                    disabled={!canGoPay || shiftStatusLoading}
+                    title={!canGoPay ? goPayBlockers.join('；') : undefined}
+                    onClick={() => setCheckoutStep('pay')}
+                  >
+                    {shiftStatusLoading ? '確認開班狀態…' : '前往付款'}
+                  </Button>
+                )}
+              </div>
+            </div>
+          </Card>
+        </div>
+        )}
+
+        {checkoutStep === 'pay' && (
+        <div className="ops-checkout-pay form-stack">
+          <div className="ops-checkout-pay__toolbar">
+            <Button type="button" variant="ghost" onClick={() => setCheckoutStep('catalog')}>
+              ← 回選品
+            </Button>
+            <p className="text-muted text-sm" style={{ margin: 0 }}>
+              請確認明細與付款方式後送出；金額以後端為準
+            </p>
+          </div>
+          <Card
+            title="確認購物車"
+            subtitle={`應付約 $${Math.round(payableTotal).toLocaleString('zh-TW')}（以後端為準）`}
+          >
+            <div className="form-stack">
+              <ul className="cart-lines">
+                {cart.map((c) => {
+                  const kindLabel = CART_KIND_LABEL[c.kind];
+                  const lineKey = cartLineKey(c);
+                  const lineTotal =
+                    c.kind === 'PROMO' && c.usageType === 'UNLIMITED'
+                      ? c.price
+                      : c.price * c.qty;
+                  const metaParts: string[] = [];
+                  if (c.kind === 'COURSE') {
+                    metaParts.push(`${c.sessions} 堂`);
+                    if (c.secondPersonOnSite) metaParts.push('第二人 +$500（當日現場）');
+                    if (c.giftLabel) {
+                      const qtyStr = c.giftQty && c.giftQty > 1 ? ` ×${c.giftQty}` : '';
+                      metaParts.push(`贈 ${c.giftLabel}${qtyStr}（$0）`);
+                    }
+                    if (c.enableCardRecurring) metaParts.push('定期定額');
+                  }
+                  if (c.kind === 'PROMO' && c.usageType === 'UNLIMITED') {
+                    metaParts.push('無限方案');
+                  }
+                  if (c.kind === 'GROUP') metaParts.push(c.detail);
+
+                  return (
+                    <li key={lineKey} className="cart-line">
+                      <div className="cart-line__info">
+                        <div className="cart-line__title">
+                          <span className="cart-line__kind">{kindLabel}</span>
+                          <span className="cart-line__name">{c.name}</span>
+                        </div>
+                        {metaParts.length > 0 ? (
+                          <p className="cart-line__meta">{metaParts.join(' · ')}</p>
+                        ) : null}
+                      </div>
+                      <span className="cart-line__unit">${c.price}</span>
+                      {c.kind === 'PRODUCT' ? (
+                <Input
+                          className="cart-line__qty"
+                          type="number"
+                          min={1}
+                          value={c.qty}
+                          onChange={(e) => updateCartProductQty(c.productId, e.target.value)}
+                          aria-label={`${c.name} 結帳數量`}
+                        />
+                      ) : c.kind === 'COURSE' ? (
+                        <Input
+                          className="cart-line__qty"
+                          type="number"
+                          min={1}
+                          value={c.qty}
+                          onChange={(e) => updateCartCourseQty(c.coursePlanId, e.target.value)}
+                          aria-label={`${c.name} 結帳數量`}
+                        />
+                      ) : c.kind === 'PROMO' && c.usageType !== 'UNLIMITED' ? (
+                        <Input
+                          className="cart-line__qty"
+                          type="number"
+                          min={1}
+                          value={c.qty}
+                          onChange={(e) => updateCartPromoQty(c.promotionId, e.target.value)}
+                          aria-label={`${c.name} 結帳數量`}
+                        />
+                      ) : (
+                        <span className="cart-line__qty-fixed" aria-label={`${c.name} 數量`}>
+                          × {c.qty}
+                        </span>
+                      )}
+                      <span className="cart-line__total">= ${lineTotal}</span>
+                      <div className="cart-line__actions">
+                        <Button size="sm" variant="ghost" onClick={() => removeCartLine(c)}>
+                          移除
+              </Button>
+                      </div>
+                    </li>
+                  );
+                })}
+                {cart.length === 0 && (
+                  <li className="text-muted">購物車是空的 · 請加入商品、購案或課程</li>
+                )}
+              </ul>
+
+              {cartPromoLine && !selectedMember && (
+                <Alert tone="warning">購物車含購案，請先選擇會員</Alert>
+              )}
+              {cartCourseLines.length > 0 && !selectedMember && (
+                <Alert tone="warning">購物車含課程，請先選擇會員</Alert>
+              )}
+              {cartGroupLines.length > 0 && paySelected.includes('WALLET_CASH') && (
+                <Alert tone="warning">團課報名不可使用錢包扣款</Alert>
+              )}
+              {walletBlockedByTopup && paySelected.includes('WALLET_CASH') && (
+                <Alert tone="warning">計時儲值方案不可使用零錢包付款（防止循環套取贈送運動金）</Alert>
+              )}
+              {cartCourseLines.length > 0 && !trainerId && (
+                <Alert tone="warning">購買課程請選擇負責教練</Alert>
+              )}
+              {paySelected.includes('WALLET_CASH') && !selectedMember && (
+                <Alert tone="warning">使用零錢包時請先於上方「選擇會員」</Alert>
+              )}
+
+            </div>
+          </Card>
+          <Card title="付款與發票" subtitle="複合支付 · 電子發票載具">
+            <div className="form-stack">
 
               <CompositePayFields
                 totalAmount={payableTotal}
@@ -2640,10 +3113,12 @@ export default function OpsDashboardPage() {
                     checkoutBusy ||
                     Boolean(pendingYipay) ||
                     !cart.length ||
+                    (posBranchId !== '' && shiftOpen === false) ||
                     (cartProductLines.length > 0 && !posBranchId) ||
                     (Boolean(cartPromoLine) && !selectedMember) ||
                     (cartCourseLines.length > 0 && (!selectedMember || !trainerId)) ||
                     (paySelected.includes('WALLET_CASH') && !selectedMember) ||
+                    (paySelected.includes('WALLET_CASH') && walletBlockedByTopup) ||
                     (paySelected.includes('LINEPAY') && !linePayOneTimeKey.trim()) ||
                     !isPaymentsBalanced(paySelected, payAmounts, payableTotal, {
                       ignoreCardAmount: yipayPayuniRecurring,
@@ -2664,6 +3139,7 @@ export default function OpsDashboardPage() {
             </div>
           </Card>
         </div>
+        )}
       </PageSection>
       )}
 
@@ -2721,9 +3197,9 @@ export default function OpsDashboardPage() {
             {membersLoading ? '載入中…' : `共 ${membersTotal} 位`}
           </span>
           <div style={{ display: 'flex', gap: '0.5rem', marginLeft: 'auto' }}>
-            <Button variant="ghost" size="sm" onClick={() => void loadData()}>
-              重新整理
-            </Button>
+          <Button variant="ghost" size="sm" onClick={() => void loadData()}>
+            重新整理
+          </Button>
             <Button size="sm" onClick={openCreateModal}>
               手動新增會員
             </Button>
@@ -2799,7 +3275,7 @@ export default function OpsDashboardPage() {
                               {c.displayName || c.shortName || c.title}
                             </button>
                           ))}
-                        </div>
+                      </div>
                       )}
                     </td>
                     <td>{m.isAlert ? <Badge tone="danger" dot>警示</Badge> : '—'}</td>
@@ -2947,10 +3423,11 @@ export default function OpsDashboardPage() {
       <Modal
         open={pendingYipay !== null}
         title="乙禾現場刷卡確認"
+        closeOnBackdrop={false}
         onClose={() => {
           if (yipayConfirmBusy) return;
           setPendingYipay(null);
-          toast('已取消確認；結帳單仍為待付款，可稍後以單號補確認或作廢', 'info');
+          toast('已取消確認；結帳單仍為待付款，可稍後以單號補確認或由值班主管作廢', 'info');
         }}
         footer={
           <>
@@ -2961,6 +3438,18 @@ export default function OpsDashboardPage() {
             >
               稍後處理
             </Button>
+            {staffHasDutyRankOrAbove(staff) ? (
+              <Button
+                variant="danger"
+                onClick={() => {
+                  setVoidPendingChecked(false);
+                  setVoidPendingOpen(true);
+                }}
+                disabled={yipayConfirmBusy}
+              >
+                作廢待付款
+              </Button>
+            ) : null}
             <Button loading={yipayConfirmBusy} onClick={() => void handleConfirmYipay()}>
               確認刷卡成功
             </Button>
@@ -2968,10 +3457,10 @@ export default function OpsDashboardPage() {
         }
       >
         <Alert tone="info">
-          請於{pendingYipay?.hint || '乙禾／凱基固定式刷卡機'}完成首期收款後，再按「確認刷卡成功」。系統將履約並開立
-          ezPay 發票；開票失敗＝整筆取消。
+          請於{pendingYipay?.hint || '乙禾／凱基固定式刷卡機'}完成收款後，再按「確認刷卡成功」。系統會完成履約並開立電子發票。
+          若開票失敗，<strong>已收款不會沖回</strong>，請至頂部「發票補開」處理。
           {pendingYipay?.needsPeriodBind
-            ? ` 確認後將另開 PayUNi 續期頁（$1 驗證授權後取消、不請款；第 2 期起 PeriodAmt $${Math.round(pendingYipay.recurringAmount || 0).toLocaleString('zh-TW')} × ${pendingYipay.periodTimes || '?'} 期）。`
+            ? ` 確認後將另開 PayUNi 續期頁（$1 驗證授權後取消、不請款；第 2 期起每期 $${Math.round(pendingYipay.recurringAmount || 0).toLocaleString('zh-TW')} × ${pendingYipay.periodTimes || '?'} 期）。`
             : ''}
         </Alert>
         <p style={{ marginTop: '0.75rem' }}>
@@ -2989,6 +3478,30 @@ export default function OpsDashboardPage() {
           />
         </Field>
       </Modal>
+
+      {voidPendingOpen && pendingYipay ? (
+        <ReasonModal
+          title={`作廢待付款 ${pendingYipay.checkoutId}`}
+          label="作廢原因"
+          confirmLabel="確認作廢"
+          danger
+          onSubmit={handleVoidPending}
+          onClose={() => setVoidPendingOpen(false)}
+        >
+          <Alert tone="warning">
+            作廢後此結帳單不可再確認入帳；若有以零錢包付款，系統會自動回補。
+            端末若已刷卡成功，請改按「確認刷卡成功」，切勿作廢。
+          </Alert>
+          <label className="checkbox-row" style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', margin: '0.75rem 0' }}>
+            <input
+              type="checkbox"
+              checked={voidPendingChecked}
+              onChange={(e) => setVoidPendingChecked(e.target.checked)}
+            />
+            已確認乙禾端末／金流後台未成功扣款
+          </label>
+        </ReasonModal>
+      ) : null}
 
       <Modal
         open={createOpen}
@@ -3222,7 +3735,7 @@ export default function OpsDashboardPage() {
                               border: `1px solid ${active ? 'var(--accent, #2563eb)' : 'var(--border)'}`,
                               borderRadius: 'var(--radius-sm)',
                               background: active
-                                ? 'var(--surface-2, #f8fafc)'
+                                ? 'var(--surface-2)'
                                 : 'transparent',
                               cursor: 'pointer',
                               font: 'inherit',
@@ -3237,8 +3750,8 @@ export default function OpsDashboardPage() {
                               style={
                                 statusLabel === '版本過期'
                                   ? { color: 'var(--text-muted)' }
-                                  : statusLabel === '已簽署'
-                                    ? { color: '#166534' }
+                                    : statusLabel === '已簽署'
+                                    ? { color: 'var(--success)' }
                                     : undefined
                               }
                             >

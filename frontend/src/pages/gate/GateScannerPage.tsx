@@ -1,4 +1,4 @@
-import { type FormEvent, type ReactNode, useCallback, useEffect, useRef, useState } from 'react';
+import { type FormEvent, type ReactNode, useCallback, useEffect, useEffectEvent, useRef, useState } from 'react';
 import { Scanner } from '@yudiel/react-qr-scanner';
 import GateLayout from '../../components/layout/GateLayout';
 import { Alert, Button, Card, EmptyState, Field, Input } from '../../components/ui';
@@ -213,6 +213,7 @@ export default function GateScannerPage() {
       if (!next) {
         stopCamera();
         setFaceReady(false);
+        setCamError(null);
         clearGatePair();
         setPair(null);
         setDeviceInfo(null);
@@ -234,26 +235,34 @@ export default function GateScannerPage() {
     [stopCamera],
   );
 
+  const retryPairVerify = useCallback(() => {
+    setPairPhase('restoring');
+    setPairRetryToken((n) => n + 1);
+  }, []);
+
+  const savePairInfo = useEffectEvent((info: GateDevice) => {
+    if (pair) persistPair(pair, info);
+  });
+
+  const pairDeviceCode = pair?.deviceCode;
+  const pairDeviceKey = pair?.deviceKey;
+
   // 還原／驗證本機配對：網路失敗保留憑證並自動重試；僅金鑰失效才要求重綁
+  // 解除配對一律經 persistPair(null)，該處已重設 phase／deviceInfo
   useEffect(() => {
-    if (!pair) {
-      setPairPhase('unpaired');
-      setDeviceInfo(null);
-      return;
-    }
+    if (!pairDeviceCode || !pairDeviceKey) return;
     let cancelled = false;
     let retryTimer: number | undefined;
-    setPairPhase((prev) => (prev === 'ready' ? 'ready' : 'restoring'));
 
     void (async () => {
       try {
-        const res = await pairGateDevice(pair.deviceCode, pair.deviceKey);
+        const res = await pairGateDevice(pairDeviceCode, pairDeviceKey);
         if (cancelled) return;
         if (res.status !== 'success' || !res.data) {
           throw new Error(res.message || '裝置配對失敗');
         }
         const info = res.data as GateDevice;
-        persistPair(pair, info);
+        savePairInfo(info);
         setDeviceInfo(info);
         setPairError(null);
         setPairPhase('ready');
@@ -261,13 +270,15 @@ export default function GateScannerPage() {
         if (cancelled) return;
         const msg = getErrorMessage(err, '裝置配對驗證失敗');
         setPairError(msg);
+        setFaceReady(false);
+        setCamError(null);
         if (isGatePairAuthError(err)) {
           setPairPhase('auth_invalid');
           return;
         }
         setPairPhase('network_error');
         retryTimer = window.setTimeout(() => {
-          if (!cancelled) setPairRetryToken((n) => n + 1);
+          if (!cancelled) retryPairVerify();
         }, 4000);
       }
     })();
@@ -276,7 +287,7 @@ export default function GateScannerPage() {
       cancelled = true;
       if (retryTimer) window.clearTimeout(retryTimer);
     };
-  }, [pair?.deviceCode, pair?.deviceKey, pairRetryToken, persistPair]);
+  }, [pairDeviceCode, pairDeviceKey, pairRetryToken, retryPairVerify]);
 
   useEffect(() => {
     if (pairPhase !== 'ready' || !pair) return;
@@ -295,31 +306,30 @@ export default function GateScannerPage() {
     };
   }, [pair, pairPhase]);
 
+  const logClockIssue = useEffectEvent((msg: string) => addLog(msg, true));
+
   // 時鐘校準：每 5 分鐘對齊伺服器時間（本機 skew 供診斷；驗票仍以後端為準）
   useEffect(() => {
     if (pairPhase !== 'ready') return;
     let cancelled = false;
-    let timer: number | undefined;
     const sync = async () => {
       try {
         const res = await fetchGateSyncTime();
         if (cancelled) return;
         const skew = Math.abs(res.offsetMs || 0);
         if (skew > 5000) {
-          addLog(`🟠 本機時鐘偏差約 ${Math.round(skew / 1000)} 秒，已與伺服器校準`, true);
+          logClockIssue(`🟠 本機時鐘偏差約 ${Math.round(skew / 1000)} 秒，已與伺服器校準`);
         }
       } catch {
-        if (!cancelled) addLog('🟠 網路通訊重試中：時間校準失敗', true);
+        if (!cancelled) logClockIssue('🟠 網路通訊重試中：時間校準失敗');
       }
     };
     void sync();
-    timer = window.setInterval(() => void sync(), 5 * 60 * 1000);
+    const timer = window.setInterval(() => void sync(), 5 * 60 * 1000);
     return () => {
       cancelled = true;
-      if (timer) window.clearInterval(timer);
+      window.clearInterval(timer);
     };
-    // addLog 穩定於閉包；刻意不列入 deps
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pairPhase]);
 
   /** 優先前鏡頭（刷臉）；失敗再退後鏡頭／任意鏡頭（仍同路解 QR） */
@@ -363,10 +373,9 @@ export default function GateScannerPage() {
   }, [stopCamera]);
 
   useEffect(() => {
+    // 離開 ready 的路徑（persistPair(null)、驗證失敗）已重設 faceReady／camError
     if (pairPhase !== 'ready' || !pair || !deviceInfo) {
       stopCamera();
-      setCamError(null);
-      setFaceReady(false);
       return;
     }
 
@@ -534,7 +543,7 @@ export default function GateScannerPage() {
       | { totalFee?: number; shortfall?: number }
       | undefined;
     if (!gateOpen || (fee?.shortfall != null && fee.shortfall > 0)) {
-      msg = `${name} 已結算但餘額不足待補扣 · 閘機不開門${idTag}`;
+      msg = `${name} 餘額不足${fee?.shortfall ? ` $${fee.shortfall}` : ''}，尚未出場 · 請儲值後再刷出${idTag}`;
       addLog(`🟠 ${result.message || msg}（${name}${idTag}）`, true);
       setLastResult({ ok: false, message: msg, renewable: true });
       toast(msg, 'error');
@@ -747,7 +756,7 @@ export default function GateScannerPage() {
                   size="sm"
                   onClick={() => {
                     setPairError(null);
-                    setPairRetryToken((n) => n + 1);
+                    retryPairVerify();
                   }}
                 >
                   立即重試
@@ -795,7 +804,7 @@ export default function GateScannerPage() {
   }
 
   return (
-    <GateLayout mode={mode} onModeChange={setMode} lastResult={lastResult}>
+      <GateLayout mode={mode} onModeChange={setMode} lastResult={lastResult} modeLocked={busy}>
       <Card variant="dark" padding="md">
         <div className="btn-row" style={{ justifyContent: 'space-between', alignItems: 'center' }}>
           <div>

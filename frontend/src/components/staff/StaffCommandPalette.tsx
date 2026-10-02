@@ -23,54 +23,52 @@ type MemberHit = { id: number; name: string; phone: string; memberNo?: string | 
 /** 短時 per-query 快取（避免連打同一關鍵字） */
 const queryCache = new Map<string, { at: number; rows: MemberHit[] }>();
 const QUERY_CACHE_TTL_MS = 30_000;
+const NO_MEMBERS: MemberHit[] = [];
 
 export default function StaffCommandPalette({ open, onClose }: Props) {
+  return open ? <CommandPaletteBody onClose={onClose} /> : null;
+}
+
+/** 僅在開啟時掛載，關閉即卸載，重開時搜尋字／結果自動歸零 */
+function CommandPaletteBody({ onClose }: Pick<Props, 'onClose'>) {
   const navigate = useNavigate();
   const { toast } = useToast();
   const { isAdmin, canAccessTx, hasPermission } = useStaffAuth();
   const [q, setQ] = useState('');
   const [active, setActive] = useState(0);
-  const [members, setMembers] = useState<MemberHit[]>([]);
-  const [memberSearchBusy, setMemberSearchBusy] = useState(false);
+  const [memberResult, setMemberResult] = useState<{ needle: string; rows: MemberHit[] } | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
+  const canSearchMembers = hasPermission('ops') || isAdmin;
+  const needle = q.trim();
+  const searchingMembers = canSearchMembers && needle.length > 0;
+  const memberResultFresh = memberResult?.needle === needle;
+  const members = searchingMembers && memberResultFresh ? memberResult.rows : NO_MEMBERS;
+  const memberSearchBusy = searchingMembers && !memberResultFresh;
+
   useEffect(() => {
-    if (!open) return;
-    setQ('');
-    setActive(0);
-    setMembers([]);
     const t = window.setTimeout(() => inputRef.current?.focus(), 30);
     return () => window.clearTimeout(t);
-  }, [open]);
+  }, []);
 
   useEffect(() => {
-    if (!open) return;
-    if (!hasPermission('ops') && !isAdmin) {
-      setMembers([]);
-      return;
-    }
-    const needle = q.trim();
-    if (needle.length < 1) {
-      setMembers([]);
-      setMemberSearchBusy(false);
-      return;
-    }
-
-    const cached = queryCache.get(needle);
-    if (cached && Date.now() - cached.at < QUERY_CACHE_TTL_MS) {
-      setMembers(cached.rows);
-      setMemberSearchBusy(false);
-      return;
-    }
-
+    if (!searchingMembers) return;
     let cancelled = false;
-    setMemberSearchBusy(true);
-    const t = window.setTimeout(() => {
-      void (async () => {
-        try {
-          const res = await fetchOpsMembers({ lite: true, take: 80, q: needle });
-          if (cancelled) return;
-          if (res.status === 'success' && res.data) {
+    const cached = queryCache.get(needle);
+    const cacheHit = cached && Date.now() - cached.at < QUERY_CACHE_TTL_MS ? cached.rows : null;
+    const t = window.setTimeout(
+      () => {
+        if (cacheHit) {
+          setMemberResult({ needle, rows: cacheHit });
+          return;
+        }
+        fetchOpsMembers({ lite: true, take: 80, q: needle })
+          .then((res) => {
+            if (cancelled) return;
+            if (res.status !== 'success' || !res.data) {
+              setMemberResult({ needle, rows: [] });
+              return;
+            }
             const rows = res.data.items.map((m) => ({
               id: m.id,
               name: m.name,
@@ -78,26 +76,22 @@ export default function StaffCommandPalette({ open, onClose }: Props) {
               memberNo: m.memberNo,
             }));
             queryCache.set(needle, { at: Date.now(), rows });
-            setMembers(rows);
-          } else {
-            setMembers([]);
-          }
-        } catch (err) {
-          if (!cancelled) {
-            setMembers([]);
+            setMemberResult({ needle, rows });
+          })
+          .catch((err) => {
+            if (cancelled) return;
+            setMemberResult({ needle, rows: [] });
             toast(getErrorMessage(err, '搜尋會員失敗'), 'error');
-          }
-        } finally {
-          if (!cancelled) setMemberSearchBusy(false);
-        }
-      })();
-    }, 200);
+          });
+      },
+      cacheHit ? 0 : 200,
+    );
 
     return () => {
       cancelled = true;
       window.clearTimeout(t);
     };
-  }, [q, open, hasPermission, isAdmin, toast]);
+  }, [needle, searchingMembers, toast]);
 
   const navItems = useMemo(() => {
     const items: CmdItem[] = [];
@@ -177,12 +171,14 @@ export default function StaffCommandPalette({ open, onClose }: Props) {
     });
   }, [members, navItems, navigate, q]);
 
-  useEffect(() => {
+  const activeResetKey = `${q}|${items.length}`;
+  const [prevActiveResetKey, setPrevActiveResetKey] = useState(activeResetKey);
+  if (prevActiveResetKey !== activeResetKey) {
+    setPrevActiveResetKey(activeResetKey);
     setActive(0);
-  }, [q, items.length]);
+  }
 
   useEffect(() => {
-    if (!open) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         e.preventDefault();
@@ -204,9 +200,7 @@ export default function StaffCommandPalette({ open, onClose }: Props) {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [active, items, onClose, open]);
-
-  if (!open) return null;
+  }, [active, items, onClose]);
 
   return (
     <div

@@ -140,8 +140,9 @@ async function processCheckIn(memberId, entryMethod, branchId, gateDeviceId = nu
     }
   }
 
+  const afterCommit = [];
   try {
-    return await prisma.$transaction(async (tx) => {
+    const result = await prisma.$transaction(async (tx) => {
       // 悲觀鎖：同會員進出場序列化，堵住 find→create 競態
       const locked = await lockMemberRow(tx, memberId);
       if (!locked) throw httpError('無此會員', 404);
@@ -183,7 +184,7 @@ async function processCheckIn(memberId, entryMethod, branchId, gateDeviceId = nu
       // 請假中不可用無限／月費通行；期滿自動清 leaveUntil
       let memberForGate;
       try {
-        memberForGate = await assertMemberNotOnLeave(member, { now, tx });
+        memberForGate = await assertMemberNotOnLeave(member, { now, tx, afterCommit });
       } catch (leaveErr) {
         if (leaveErr && typeof leaveErr === 'object') {
           leaveErr.memberId = memberId;
@@ -239,6 +240,11 @@ async function processCheckIn(memberId, entryMethod, branchId, gateDeviceId = nu
 
       return { member: memberForGate, log, appliedBillingMode, downgraded, entryMethod };
     });
+    // 交易已提交、列鎖已釋放；外部 I/O（PayUNi 恢復續期）不擋開門
+    for (const job of afterCommit) {
+      job().catch((e) => console.warn('[閘機進場] 交易後作業失敗:', e.message));
+    }
+    return result;
   } catch (err) {
     const mapped = antiPassbackFromUnique(err, memberId);
     if (mapped) throw mapped;

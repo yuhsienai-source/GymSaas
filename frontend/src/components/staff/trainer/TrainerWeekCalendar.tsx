@@ -103,11 +103,13 @@ export default function TrainerWeekCalendar({
   } | null>(null);
   const [busy, setBusy] = useState(false);
 
-  const dataMin = useMemo(() => {
-    const now = Date.now() - DAY_MS; // 允許今天稍早
-    return startOfWeekTaipei(new Date(now)).getTime();
-  }, []);
-  const dataMax = useMemo(() => Date.now() + 14 * DAY_MS, []);
+  const [{ dataMin, dataMax }] = useState(() => {
+    const now = Date.now();
+    return {
+      dataMin: startOfWeekTaipei(new Date(now - DAY_MS)).getTime(), // 允許今天稍早
+      dataMax: now + 14 * DAY_MS,
+    };
+  });
 
   const weekStart = useMemo(() => startOfWeekTaipei(weekAnchor), [weekAnchor]);
   const days = useMemo(

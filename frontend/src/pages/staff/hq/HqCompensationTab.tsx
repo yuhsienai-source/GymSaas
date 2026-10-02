@@ -1,4 +1,4 @@
-import { type FormEvent, useCallback, useEffect, useState } from 'react';
+import { type FormEvent, useEffect, useState } from 'react';
 import { Alert, Button, Card, Field, Input, PageSection, Select } from '../../../components/ui';
 import { useToast } from '../../../contexts/ToastContext';
 import {
@@ -58,42 +58,45 @@ export default function HqCompensationTab({
   const [logs, setLogs] = useState<HqCompensationLog[]>([]);
   const [busy, setBusy] = useState(false);
 
-  const loadCompPromos = useCallback(async () => {
-    try {
-      const [promoRes, courseRes] = await Promise.all([
-        fetchHqPromotions(undefined, 'COMPENSATION'),
-        fetchHqCoursePlans(undefined, 'COMPENSATION'),
-      ]);
-      if (promoRes.status === 'success' && promoRes.data) {
-        setCompPromos(promoRes.data.filter((p) => p.isActive !== false));
-      }
-      if (courseRes.status === 'success' && courseRes.data) {
-        setCompCourses(courseRes.data.filter((p) => p.isActive !== false));
-      }
-    } catch (err) {
-      toast(getErrorMessage(err, '載入補償專案失敗'), 'error');
-    }
+  useEffect(() => {
+    let cancelled = false;
+    Promise.all([
+      fetchHqPromotions(undefined, 'COMPENSATION'),
+      fetchHqCoursePlans(undefined, 'COMPENSATION'),
+    ])
+      .then(([promoRes, courseRes]) => {
+        if (cancelled) return;
+        if (promoRes.status === 'success' && promoRes.data) {
+          setCompPromos(promoRes.data.filter((p) => p.isActive !== false));
+        }
+        if (courseRes.status === 'success' && courseRes.data) {
+          setCompCourses(courseRes.data.filter((p) => p.isActive !== false));
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) toast(getErrorMessage(err, '載入補償專案失敗'), 'error');
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [toast]);
 
-  const loadLogs = useCallback(
-    async (memberId?: number) => {
-      try {
-        const res = await fetchHqCompensationLogs({
-          memberId,
-          limit: 30,
-        });
-        if (res.status === 'success' && res.data) setLogs(res.data);
-      } catch (err) {
-        toast(getErrorMessage(err, '載入補償日誌失敗'), 'error');
-      }
-    },
-    [toast],
-  );
+  const [logsQuery, setLogsQuery] = useState<{ memberId?: number; seq: number }>({ seq: 0 });
+  const loadLogs = (memberId?: number) => setLogsQuery((q) => ({ memberId, seq: q.seq + 1 }));
 
   useEffect(() => {
-    void loadCompPromos();
-    void loadLogs();
-  }, [loadCompPromos, loadLogs]);
+    let cancelled = false;
+    fetchHqCompensationLogs({ memberId: logsQuery.memberId, limit: 30 })
+      .then((res) => {
+        if (!cancelled && res.status === 'success' && res.data) setLogs(res.data);
+      })
+      .catch((err) => {
+        if (!cancelled) toast(getErrorMessage(err, '載入補償日誌失敗'), 'error');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [logsQuery, toast]);
 
   async function handleSearch(e: FormEvent) {
     e.preventDefault();

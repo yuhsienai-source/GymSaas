@@ -16,7 +16,7 @@ import {
   toDatetimeLocalValue,
   type PromotionPlanMode,
 } from '../../../lib/promotionLabels';
-import type { CoursePlan, MembershipContract, Product } from '../../../types/api';
+import type { BranchStockRow, CoursePlan, MembershipContract } from '../../../types/api';
 import type { HqDataProps } from './types';
 
 type CoursePlanType = 'CUSTOM_PT' | 'GROUP';
@@ -120,22 +120,22 @@ function unitPriceFromTotal(total: number, sessions: number | null | undefined) 
   return String(unit);
 }
 
-/** 加贈禮選單：依分店啟用中商品去重品名 */
-function giftOptionsFromProducts(products: Product[], branchIds: number[]) {
+/** 加贈禮選單：依分店上架中商品去重品名 */
+function giftOptionsFromProducts(stocks: BranchStockRow[], branchIds: number[]) {
   const idSet = new Set(branchIds);
   const names = new Set<string>();
-  for (const p of products) {
-    if (!p.isActive) continue;
-    if (idSet.size && !idSet.has(p.branchId)) continue;
-    const name = String(p.name || '').trim();
+  for (const s of stocks) {
+    if (!s.productActive || !s.isListed) continue;
+    if (idSet.size && !idSet.has(s.branchId)) continue;
+    const name = String(s.name || '').trim();
     if (name) names.add(name);
   }
   return [...names].sort((a, b) => a.localeCompare(b, 'zh-Hant'));
 }
 
-type Props = Pick<HqDataProps, 'branches' | 'coursePlans' | 'products' | 'onReload'>;
+type Props = Pick<HqDataProps, 'branches' | 'coursePlans' | 'branchStocks' | 'onReload'>;
 
-export default function HqCoursePlansTab({ branches, coursePlans, products, onReload }: Props) {
+export default function HqCoursePlansTab({ branches, coursePlans, branchStocks, onReload }: Props) {
   const { toast } = useToast();
   const activeBranches = branches.filter((b) => b.isActive);
   const [branchIds, setBranchIds] = useState<number[]>(
@@ -151,6 +151,8 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
   const [unitPrice, setUnitPrice] = useState('1000');
   const [sessions, setSessions] = useState('10');
   const [capacity, setCapacity] = useState('8');
+  const [dropInPrice, setDropInPrice] = useState('');
+  const [minEnrollment, setMinEnrollment] = useState('');
   const [description, setDescription] = useState('');
   const [cardRecurring, setCardRecurring] = useState(false);
   const [allowRecurring2, setAllowRecurring2] = useState(false);
@@ -178,6 +180,8 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
   const [editUnitPrice, setEditUnitPrice] = useState('');
   const [editSessions, setEditSessions] = useState('');
   const [editCapacity, setEditCapacity] = useState('');
+  const [editDropInPrice, setEditDropInPrice] = useState('');
+  const [editMinEnrollment, setEditMinEnrollment] = useState('');
   const [editDescription, setEditDescription] = useState('');
   const [editCardRecurring, setEditCardRecurring] = useState(false);
   const [editAllowRecurring2, setEditAllowRecurring2] = useState(false);
@@ -198,9 +202,9 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
 
   const createTotal = calcSessionTotal(unitPrice, sessions);
   const editTotal = calcSessionTotal(editUnitPrice, editSessions);
-  const createGiftOptions = giftOptionsFromProducts(products, branchIds);
+  const createGiftOptions = giftOptionsFromProducts(branchStocks, branchIds);
   const editGiftOptions = giftOptionsFromProducts(
-    products,
+    branchStocks,
     editing?.branchId ? [editing.branchId] : [],
   );
   /** 分店變更後若原加贈禮不在選單內，視為未選（不另用 effect 清 state） */
@@ -272,13 +276,17 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
       toast('團體課程必須設定人數上限', 'error');
       return;
     }
+    if (planType === 'GROUP' && minEnrollment && parseInt(minEnrollment, 10) > parseInt(capacity, 10)) {
+      toast('最低開班人數不可大於人數上限', 'error');
+      return;
+    }
     if (requiresContract && contractIds.length === 0) {
       toast('需簽署會員合約時，請至少選擇一份合約', 'error');
       return;
     }
     const price = isCompensation ? 0 : Number(createTotal);
 
-    if (!isCompensation && cardRecurring) {
+    if (!isCompensation && cardRecurring && planType !== 'GROUP') {
       if (!allowRecurring2 && !allowRecurring4) {
         toast('請至少勾選 2 期或 4 期', 'error');
         return;
@@ -331,8 +339,14 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
           isCompensation || planType !== 'GROUP'
             ? null
             : parseInt(capacity, 10),
+        ...(planType === 'GROUP' && !isCompensation
+          ? {
+              dropInPrice: dropInPrice.trim() ? parseFloat(dropInPrice) : null,
+              minEnrollment: minEnrollment.trim() ? parseInt(minEnrollment, 10) : 0,
+            }
+          : {}),
         description: description.trim() || null,
-        enableCardRecurring: isCompensation ? false : cardRecurring,
+        enableCardRecurring: isCompensation || planType === 'GROUP' ? false : cardRecurring,
         recurringPeriods:
           !isCompensation && cardRecurring
             ? encodeRecurringMask(allowRecurring2, allowRecurring4)
@@ -367,6 +381,8 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
       setPlanKind('SALE');
       setUnitPrice('1000');
       setSessions('10');
+      setDropInPrice('');
+      setMinEnrollment('');
       setDescription('');
       setCardRecurring(false);
       setPayuniPeriodHash('');
@@ -390,6 +406,8 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
     setEditSaleEnd(toDatetimeLocalValue(p.saleEndAt));
     setEditSessions(p.sessions ? String(p.sessions) : '');
     setEditCapacity(p.capacity ? String(p.capacity) : '');
+    setEditDropInPrice(p.dropInPrice != null ? String(p.dropInPrice) : '');
+    setEditMinEnrollment(p.minEnrollment ? String(p.minEnrollment) : '');
     setEditUnitPrice(unitPriceFromTotal(Number(p.price) || 0, p.sessions));
     setEditDescription(p.description || '');
     setEditCardRecurring(Boolean(p.enableCardRecurring));
@@ -443,13 +461,21 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
       toast('團體課程必須設定人數上限', 'error');
       return;
     }
+    if (
+      editPlanType === 'GROUP' &&
+      editMinEnrollment &&
+      parseInt(editMinEnrollment, 10) > parseInt(editCapacity, 10)
+    ) {
+      toast('最低開班人數不可大於人數上限', 'error');
+      return;
+    }
     if (editRequiresContract && editContractIds.length === 0) {
       toast('需簽署會員合約時，請至少選擇一份合約', 'error');
       return;
     }
     const price = Number(editTotal);
 
-    if (editCardRecurring) {
+    if (editCardRecurring && editPlanType !== 'GROUP') {
       if (!editAllowRecurring2 && !editAllowRecurring4) {
         toast('請至少勾選 2 期或 4 期', 'error');
         return;
@@ -502,8 +528,14 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
             : editCapacity
               ? parseInt(editCapacity, 10)
               : null,
+        ...(editPlanType === 'GROUP'
+          ? {
+              dropInPrice: editDropInPrice.trim() ? parseFloat(editDropInPrice) : null,
+              minEnrollment: editMinEnrollment.trim() ? parseInt(editMinEnrollment, 10) : 0,
+            }
+          : {}),
         description: editDescription.trim() || null,
-        enableCardRecurring: editCardRecurring,
+        enableCardRecurring: editPlanType === 'GROUP' ? false : editCardRecurring,
         recurringPeriods: editCardRecurring
           ? encodeRecurringMask(editAllowRecurring2, editAllowRecurring4)
           : null,
@@ -689,15 +721,33 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
               />
             </Field>
             {planType === 'GROUP' && (
-              <Field label="課程人數上限" hint="團體課建議容納人數">
-                <Input
-                  type="number"
-                  min={1}
-                  value={capacity}
-                  onChange={(e) => setCapacity(e.target.value)}
-                  required
-                />
-              </Field>
+              <>
+                <Field label="課程人數上限" hint="每期班整期名額">
+                  <Input
+                    type="number"
+                    min={1}
+                    value={capacity}
+                    onChange={(e) => setCapacity(e.target.value)}
+                    required
+                  />
+                </Field>
+                <Field label="單堂插班價（選填）" hint="留空＝不開放單堂購買；單堂僅用整期報名剩餘空位">
+                  <Input
+                    type="number"
+                    min={1}
+                    value={dropInPrice}
+                    onChange={(e) => setDropInPrice(e.target.value)}
+                  />
+                </Field>
+                <Field label="最低開班人數（選填）" hint="報名截止仍未達標，由總部決定取消並全額退費">
+                  <Input
+                    type="number"
+                    min={0}
+                    value={minEnrollment}
+                    onChange={(e) => setMinEnrollment(e.target.value)}
+                  />
+                </Field>
+              </>
             )}
             <Field label="說明" hint="選填">
               <textarea
@@ -792,6 +842,7 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
                 )}
               </Field>
             )}
+            {planType !== 'GROUP' && (
             <label className="checkbox-item">
               <input
                 type="checkbox"
@@ -800,7 +851,8 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
               />
               啟用信用卡定期定額
             </label>
-            {cardRecurring && (
+            )}
+            {cardRecurring && planType !== 'GROUP' && (
               <>
                 <Field label="可選期數" hint="未勾選的期數不會出現在櫃檯選項；兩者皆勾則可選 2 或 4 期">
                   <div className="checkbox-group">
@@ -1247,15 +1299,33 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
             />
           </Field>
           {editPlanType === 'GROUP' && (
-            <Field label="課程人數上限">
-              <Input
-                type="number"
-                min={1}
-                value={editCapacity}
-                onChange={(e) => setEditCapacity(e.target.value)}
-                required
-              />
-            </Field>
+            <>
+              <Field label="課程人數上限">
+                <Input
+                  type="number"
+                  min={1}
+                  value={editCapacity}
+                  onChange={(e) => setEditCapacity(e.target.value)}
+                  required
+                />
+              </Field>
+              <Field label="單堂插班價（選填）" hint="留空＝不開放單堂；已開班期班不受影響">
+                <Input
+                  type="number"
+                  min={1}
+                  value={editDropInPrice}
+                  onChange={(e) => setEditDropInPrice(e.target.value)}
+                />
+              </Field>
+              <Field label="最低開班人數（選填）" hint="僅影響之後新開的期班">
+                <Input
+                  type="number"
+                  min={0}
+                  value={editMinEnrollment}
+                  onChange={(e) => setEditMinEnrollment(e.target.value)}
+                />
+              </Field>
+            </>
           )}
           <Field label="說明">
             <textarea
@@ -1348,6 +1418,7 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
               )}
             </Field>
           )}
+          {editPlanType !== 'GROUP' && (
           <label className="checkbox-item">
             <input
               type="checkbox"
@@ -1356,7 +1427,8 @@ export default function HqCoursePlansTab({ branches, coursePlans, products, onRe
             />
             啟用信用卡定期定額
           </label>
-          {editCardRecurring && (
+          )}
+          {editCardRecurring && editPlanType !== 'GROUP' && (
             <>
               <Field label="可選期數" hint="未勾選的期數不會出現在櫃檯選項；兩者皆勾則可選 2 或 4 期">
                 <div className="checkbox-group">

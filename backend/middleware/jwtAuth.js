@@ -1,6 +1,7 @@
 // middleware/jwtAuth.js
 import jwt from 'jsonwebtoken';
-import { hasPermission, isAdminUser, hasDutyRankOrAbove } from '../lib/staffAccess.js';
+import { hasPermission, isAdminUser, hasDutyRankOrAbove, hasManagerRankOrAbove } from '../lib/staffAccess.js';
+import { isKnownStaffRole } from '../lib/orgStructure.js';
 import {
   assertRequestMatchesBoundDevice,
   readRequestDeviceId,
@@ -125,13 +126,8 @@ export const verifyStaff = (req, res, next) => {
       });
     }
 
-    // 🚨 第二道鎖：檢查角色（含 DUTY 值星）
-    if (
-      decoded.role !== 'STAFF' &&
-      decoded.role !== 'DUTY' &&
-      decoded.role !== 'MANAGER' &&
-      decoded.role !== 'ADMIN'
-    ) {
+    // 🚨 第二道鎖：職位須為 orgStructure 定義之職位（含舊制 MANAGER）
+    if (!isKnownStaffRole(decoded.role)) {
       return res.status(403).json({
         status: 'error',
         code: 'AUTH_EXPIRED',
@@ -177,7 +173,18 @@ export const requireDutyOrAbove = (req, res, next) => {
   if (!hasDutyRankOrAbove(req.user)) {
     return res.status(403).json({
       status: 'error',
-      message: '⛔ 權限不足：交易異動僅限 DUTY（值星）以上職權',
+      message: '⛔ 權限不足：交易異動僅限 DUTY（值班）以上職權',
+    });
+  }
+  next();
+};
+
+/** STORE_MANAGER（店長）以上職權；分店範圍另由 assertBranchAccess 檢查 */
+export const requireManagerOrAbove = (req, res, next) => {
+  if (!hasManagerRankOrAbove(req.user)) {
+    return res.status(403).json({
+      status: 'error',
+      message: '⛔ 權限不足：僅限店長（STORE_MANAGER）以上職權',
     });
   }
   next();
@@ -201,7 +208,7 @@ export const requireOpsOrDuty = (req, res, next) => {
 // 【廠館維運端 / 店長專屬海關】
 export const requireAdmin = (req, res, next) => {
   // 必須接在 verifyStaff 之後執行，此時 req.user 已經有資料
-  if (!req.user || req.user.role !== 'ADMIN') {
+  if (!isAdminUser(req.user)) {
     return res.status(403).json({ status: 'error', message: '⛔ 權限不足：限管理員操作' });
   }
   next();

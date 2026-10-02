@@ -17,7 +17,7 @@ import {
   upsertConsultGuest,
 } from '../lib/consultGuest.js';
 import {
-  assertTrainerNotOnTimeOff,
+  assertTrainerBookable,
   createTrainerTimeOff,
   deleteTrainerTimeOff,
   listTrainerTimeOffs,
@@ -25,6 +25,11 @@ import {
   updateTrainerTimeOff,
 } from '../lib/trainerTimeOff.js';
 import { assertPrivateVenueAllowed } from '../lib/branchShare.js';
+import { isManagerTrainer, normalizeTrainerRole } from '../lib/orgStructure.js';
+import { coachPerformanceBetween, resolveRules, serializeRule } from '../lib/coachPerformance.js';
+import { taipeiDateKey } from '../lib/laborLaw.js';
+import { monthRange } from '../lib/payrollExport.js';
+import { EFFECTIVE_WORK_SLOT_WHERE } from '../lib/staffScheduleService.js';
 
 const router = express.Router();
 router.use(verifyStaff, requirePermission('trainer'));
@@ -360,6 +365,8 @@ router.get('/dashboard', async (req, res) => {
           inbox: [],
           timeOffs: [],
           timeOffReasons: TIME_OFF_REASONS,
+          employed: false,
+          workSlots: [],
           stats: {
             todayClasses: 0,
             upcomingClasses: 0,
@@ -382,7 +389,7 @@ router.get('/dashboard', async (req, res) => {
     const horizon = new Date(now.getTime() + 14 * 24 * 60 * 60 * 1000);
 
     const branchIds =
-      trainer.role === 'MANAGER'
+      isManagerTrainer(trainer)
         ? null
         : trainer.branches.map((b) => b.branchId);
 
@@ -480,6 +487,14 @@ router.get('/dashboard', async (req, res) => {
           take: 60,
         }),
       ]);
+    const workSlots = trainer.staffId
+      ? await prisma.staffSchedule.findMany({
+          where: { AND: [EFFECTIVE_WORK_SLOT_WHERE, { staffId: trainer.staffId, endAt: { gt: now }, startAt: { lt: horizon } }] },
+          select: { id: true, startAt: true, endAt: true, branchId: true },
+          orderBy: { startAt: 'asc' },
+          take: 60,
+        })
+      : [];
 
     const ptContracts = ptContractRows.map(serializePtContract);
     const memberIds = [...new Set(ptContracts.map((c) => c.memberId).filter(Boolean))];
@@ -577,6 +592,8 @@ router.get('/dashboard', async (req, res) => {
         inbox,
         timeOffs: timeOffRows,
         timeOffReasons: TIME_OFF_REASONS,
+        employed: Boolean(trainer.staffId),
+        workSlots,
         stats: {
           todayClasses: todayCount,
           upcomingClasses: upcomingSerialized.length,
@@ -610,7 +627,7 @@ router.post('/register', requireAdmin, async (req, res) => {
       data: {
         name: String(name).trim(),
         phone: String(phone).trim(),
-        role: role === 'MANAGER' ? 'MANAGER' : 'NORMAL',
+        role: normalizeTrainerRole(role),
         isActive: true,
       },
     });
@@ -656,6 +673,14 @@ router.post('/schedule-class', async (req, res) => {
       return res.status(400).json({
         status: 'error',
         message: '需提供 venueId、title、startAt、endAt',
+      });
+    }
+    const classType = String(type || '').toUpperCase();
+    if (!['PRIVATE', 'CONSULT'].includes(classType)) {
+      return res.status(400).json({
+        status: 'error',
+        code: 'USE_GROUP_SERIES',
+        message: '團課為付費期班，請至「團課管理」綁定團體課程方案開班；單堂請指定 type（PRIVATE／CONSULT）',
       });
     }
 
@@ -707,7 +732,7 @@ router.post('/schedule-class', async (req, res) => {
         throw err;
       }
 
-      if (trainer.role !== 'MANAGER') {
+      if (!isManagerTrainer(trainer)) {
         const allowed = await tx.trainerBranch.findUnique({
           where: {
             trainerId_branchId: {
@@ -732,7 +757,7 @@ router.post('/schedule-class', async (req, res) => {
         throw err;
       }
 
-      await assertTrainerNotOnTimeOff(tx, trainer.id, startTime, endTime);
+      await assertTrainerBookable(tx, trainer.id, startTime, endTime);
 
       const venueConflict = await tx.class.findFirst({
         where: {
@@ -752,7 +777,7 @@ router.post('/schedule-class', async (req, res) => {
           venueId: venue.id,
           stationId: parsedStationId,
           title: String(title).trim(),
-          type: type || 'GROUP',
+          type: classType,
           capacity: parseInt(capacity, 10) || 10,
           startAt: startTime,
           endAt: endTime,
@@ -1058,7 +1083,7 @@ router.post('/book-consult', async (req, res) => {
         throw err;
       }
 
-      await assertTrainerNotOnTimeOff(
+      await assertTrainerBookable(
         tx,
         targetClass.trainerId,
         targetClass.startAt,
@@ -1318,7 +1343,7 @@ router.post('/schedule-private', async (req, res) => {
         );
       }
 
-      if (contract.trainer.role !== 'MANAGER') {
+      if (!isManagerTrainer(contract.trainer)) {
         const allowed = await tx.trainerBranch.findUnique({
           where: {
             trainerId_branchId: {
@@ -1351,7 +1376,7 @@ router.post('/schedule-private', async (req, res) => {
         throw err;
       }
 
-      await assertTrainerNotOnTimeOff(tx, contract.trainerId, startTime, endTime);
+      await assertTrainerBookable(tx, contract.trainerId, startTime, endTime);
 
       const venueConflict = await tx.class.findFirst({
         where: {
@@ -1373,6 +1398,7 @@ router.post('/schedule-private', async (req, res) => {
           venueId: parsedVenueId,
           stationId: parsedStationId,
           trainerId: contract.trainerId,
+          ptContractId: contract.id,
           capacity: 1,
           startAt: startTime,
           endAt: endTime,
@@ -1560,7 +1586,7 @@ router.post('/schedule-consult', async (req, res) => {
         throw err;
       }
 
-      if (trainer.role !== 'MANAGER') {
+      if (!isManagerTrainer(trainer)) {
         const allowed = await tx.trainerBranch.findUnique({
           where: {
             trainerId_branchId: {
@@ -1588,7 +1614,7 @@ router.post('/schedule-consult', async (req, res) => {
         throw err;
       }
 
-      await assertTrainerNotOnTimeOff(tx, trainer.id, startTime, endTime);
+      await assertTrainerBookable(tx, trainer.id, startTime, endTime);
 
       const venueConflict = await tx.class.findFirst({
         where: {
@@ -1718,7 +1744,46 @@ router.post('/schedule-consult', async (req, res) => {
 });
 
 // ==========================================
-// 教練排休（會員／排課需避開）
+// GET /api/trainer/performance?month=YYYY-MM — 本人當月業績獎金試算（實發以總部結算之薪資單為準）
+// ==========================================
+router.get('/performance', async (req, res) => {
+  try {
+    const { trainer, isAdmin } = await resolveTrainerWorkspace(req, {
+      viewAsTrainerId: req.query.viewAsTrainerId,
+    });
+    if (!trainer) {
+      return res.status(400).json({ status: 'error', message: isAdmin ? '請指定 viewAsTrainerId' : '尚未綁定教練檔案' });
+    }
+    const month = String(req.query.month || taipeiDateKey().slice(0, 7));
+    const { start, end } = monthRange(month);
+    const [perf, rules] = await Promise.all([
+      coachPerformanceBetween({ trainerIds: [trainer.id], start, end }),
+      resolveRules([trainer.id]),
+    ]);
+    const r = rules.get(trainer.id);
+    res.json({
+      status: 'success',
+      data: {
+        month,
+        trainerId: trainer.id,
+        performance: perf.get(trainer.id),
+        rules: {
+          PRIVATE: r.PRIVATE ? serializeRule(r.PRIVATE) : null,
+          GROUP: r.GROUP ? serializeRule(r.GROUP) : null,
+        },
+      },
+    });
+  } catch (error) {
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({ status: 'error', message: error.message });
+    }
+    console.error(error);
+    res.status(500).json({ status: 'error', message: '讀取業績失敗' });
+  }
+});
+
+// ==========================================
+// 教練不開放預約時段（工時內行政／備課等；休假請走請假或週班表例假／休息日）
 // ==========================================
 router.get('/time-offs', async (req, res) => {
   try {
@@ -1747,7 +1812,7 @@ router.get('/time-offs', async (req, res) => {
       return res.status(error.statusCode).json({ status: 'error', message: error.message });
     }
     console.error(error);
-    res.status(500).json({ status: 'error', message: '讀取排休失敗' });
+    res.status(500).json({ status: 'error', message: '讀取不開放預約時段失敗' });
   }
 });
 
@@ -1772,7 +1837,7 @@ router.post('/time-offs', async (req, res) => {
     });
     res.json({
       status: 'success',
-      message: `已登記排休：${row.reason}`,
+      message: `已登記不開放預約：${row.reason}`,
       data: row,
     });
   } catch (error) {
@@ -1780,7 +1845,7 @@ router.post('/time-offs', async (req, res) => {
       return res.status(error.statusCode).json({ status: 'error', message: error.message });
     }
     console.error(error);
-    res.status(500).json({ status: 'error', message: '新增排休失敗' });
+    res.status(500).json({ status: 'error', message: '新增不開放預約時段失敗' });
   }
 });
 
@@ -1793,11 +1858,11 @@ router.patch('/time-offs/:id', async (req, res) => {
       where: { id: parseInt(req.params.id, 10) },
     });
     if (!existing) {
-      return res.status(404).json({ status: 'error', message: '找不到排休紀錄' });
+      return res.status(404).json({ status: 'error', message: '找不到不開放預約時段' });
     }
     if (!isAdmin) {
       if (!trainer || existing.trainerId !== trainer.id) {
-        return res.status(403).json({ status: 'error', message: '僅能修改本人排休' });
+        return res.status(403).json({ status: 'error', message: '僅能修改本人時段' });
       }
     }
     const row = await updateTrainerTimeOff({
@@ -1808,13 +1873,13 @@ router.patch('/time-offs/:id', async (req, res) => {
       reason: req.body?.reason,
       note: req.body?.note,
     });
-    res.json({ status: 'success', message: '已更新排休', data: row });
+    res.json({ status: 'success', message: '已更新不開放預約時段', data: row });
   } catch (error) {
     if (error.statusCode) {
       return res.status(error.statusCode).json({ status: 'error', message: error.message });
     }
     console.error(error);
-    res.status(500).json({ status: 'error', message: '更新排休失敗' });
+    res.status(500).json({ status: 'error', message: '更新不開放預約時段失敗' });
   }
 });
 
@@ -1827,24 +1892,24 @@ router.delete('/time-offs/:id', async (req, res) => {
       where: { id: parseInt(req.params.id, 10) },
     });
     if (!existing) {
-      return res.status(404).json({ status: 'error', message: '找不到排休紀錄' });
+      return res.status(404).json({ status: 'error', message: '找不到不開放預約時段' });
     }
     if (!isAdmin) {
       if (!trainer || existing.trainerId !== trainer.id) {
-        return res.status(403).json({ status: 'error', message: '僅能刪除本人排休' });
+        return res.status(403).json({ status: 'error', message: '僅能刪除本人時段' });
       }
     }
     const row = await deleteTrainerTimeOff({
       id: existing.id,
       trainerId: isAdmin ? undefined : trainer.id,
     });
-    res.json({ status: 'success', message: '已取消排休', data: row });
+    res.json({ status: 'success', message: '已取消不開放預約時段', data: row });
   } catch (error) {
     if (error.statusCode) {
       return res.status(error.statusCode).json({ status: 'error', message: error.message });
     }
     console.error(error);
-    res.status(500).json({ status: 'error', message: '刪除排休失敗' });
+    res.status(500).json({ status: 'error', message: '刪除不開放預約時段失敗' });
   }
 });
 
@@ -1976,7 +2041,7 @@ router.patch('/classes/:id/reschedule', async (req, res) => {
         throw err;
       }
 
-      await assertTrainerNotOnTimeOff(tx, existing.trainerId, startTime, endTime);
+      await assertTrainerBookable(tx, existing.trainerId, startTime, endTime);
 
       const venueConflict = await tx.class.findFirst({
         where: {

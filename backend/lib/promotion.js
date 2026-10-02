@@ -1,4 +1,5 @@
 // lib/promotion.js — 儲值方案類型／模式與檔期判斷、購案入帳
+import { WALLET_MODE, WALLET_TX, mutateMemberWallet } from './walletMutation.js';
 
 export const UNLIMITED_MEMBER_PLAN = '無限會員';
 
@@ -24,6 +25,10 @@ export function normalizeUsageType(value) {
 export function isUnlimitedPromotion(promotion) {
   return normalizeUsageType(promotion?.usageType) === 'UNLIMITED';
 }
+
+/** 計時儲值會入帳本金＋贈送運動金：以零錢包支付等於原地換回本金並白拿運動金 */
+export const TOPUP_NO_WALLET_MESSAGE =
+  '計時儲值方案不可使用零錢包付款（防止以帳上本金循環套取贈送運動金），請改用現金／乙禾刷卡／LinePay，或與零錢包付款項目分開結帳';
 
 /** STANDING=長註（無檔期下架） · CAMPAIGN=活動（可設上下架時間） */
 export function normalizePlanMode(value) {
@@ -421,16 +426,22 @@ export function isUnlimitedTopupOrder(itemDesc) {
   return String(itemDesc || '').includes('| UNLIMITED |');
 }
 
+/** 計時儲值入帳快照欄位（訂單於入帳後才建立時併入 create data） */
+export function fulfillmentGrantData(fulfillment) {
+  if (fulfillment?.type !== 'TIMED') return {};
+  return { grantedCash: fulfillment.cashAdded, grantedBonus: fulfillment.bonusAdded };
+}
+
 /**
  * 購案入帳（須在 transaction 內）
- * - TIMED：本金＋運動金進錢包（qty 倍）
+ * - TIMED：本金＋運動金進錢包（qty 倍）；帶 orderId 時同步寫入 Order.grantedCash／grantedBonus
  * - UNLIMITED：不入錢包，延長 expireDate 並設 plan（qty 固定 1）
  */
 export async function fulfillPromotionPurchase(
   tx,
   memberId,
   promotion,
-  { qty = 1, durationDaysOverride } = {},
+  { qty = 1, durationDaysOverride, orderId = null, ledgerRefId = null, staffId = null, branchId = null } = {},
 ) {
   const member = await tx.member.findUnique({ where: { id: memberId } });
   if (!member) {
@@ -487,13 +498,23 @@ export async function fulfillPromotionPurchase(
   const cashAdded = promotion.price * units;
   const bonusAdded = promotion.bonusGiven * units;
 
-  const updatedMember = await tx.member.update({
-    where: { id: memberId },
-    data: {
-      cashWallet: { increment: cashAdded },
-      bonusWallet: { increment: bonusAdded },
-    },
+  const refId = orderId || ledgerRefId;
+  await mutateMemberWallet(tx, {
+    memberId,
+    txType: WALLET_TX.TOPUP_GRANT,
+    mode: WALLET_MODE.CREDIT_BUCKETS,
+    cashDelta: cashAdded,
+    bonusDelta: bonusAdded,
+    reason: `儲值入帳 ${promotion.name} ×${units}${refId ? `（${refId}）` : ''}`,
+    refType: refId ? 'ORDER' : null,
+    refId,
+    staffId,
+    branchId,
   });
+  const updatedMember = await tx.member.findUnique({ where: { id: memberId } });
+  if (orderId) {
+    await tx.order.update({ where: { id: orderId }, data: { grantedCash: cashAdded, grantedBonus: bonusAdded } });
+  }
 
   return {
     updatedMember,

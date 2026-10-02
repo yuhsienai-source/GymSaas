@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Alert, Button, Card, EmptyState } from '../ui';
 import { useToast } from '../../contexts/ToastContext';
 import {
@@ -49,27 +49,34 @@ type Props = {
 export default function OpsActiveCheckInsTab({ branchId }: Props) {
   const { toast } = useToast();
   const [rows, setRows] = useState<OpsActiveCheckIn[]>([]);
-  const [loading, setLoading] = useState(false);
   const [busyLogId, setBusyLogId] = useState<number | null>(null);
   const [alerts, setAlerts] = useState<GateAlertEvent[]>([]);
   const [wsStatus, setWsStatus] = useState('連線中…');
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    try {
-      const res = await fetchOpsActiveCheckIns(branchId === '' ? undefined : branchId);
-      setRows(Array.isArray(res.data) ? res.data : []);
-    } catch (err) {
-      toast(getErrorMessage(err, '載入進場會員失敗'), 'error');
-      setRows([]);
-    } finally {
-      setLoading(false);
-    }
-  }, [branchId, toast]);
+  const [reloadKey, setReloadKey] = useState(0);
+  const load = () => setReloadKey((k) => k + 1);
+  const requestKey = `${branchId}|${reloadKey}`;
+  const [loadedKey, setLoadedKey] = useState<string | null>(null);
+  const loading = loadedKey !== requestKey;
 
   useEffect(() => {
-    void load();
-  }, [load]);
+    let cancelled = false;
+    fetchOpsActiveCheckIns(branchId === '' ? undefined : branchId)
+      .then((res) => {
+        if (!cancelled) setRows(Array.isArray(res.data) ? res.data : []);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        toast(getErrorMessage(err, '載入進場會員失敗'), 'error');
+        setRows([]);
+      })
+      .finally(() => {
+        if (!cancelled) setLoadedKey(requestKey);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [branchId, requestKey, toast]);
 
   useEffect(() => {
     let closed = false;
@@ -85,7 +92,7 @@ export default function OpsActiveCheckInsTab({ branchId }: Props) {
         ev.title ? `${ev.title}：${ev.message || ''}` : ev.message || '閘機異常',
         'error',
       );
-      void load();
+      setReloadKey((k) => k + 1);
     }
 
     function connect() {
@@ -127,7 +134,7 @@ export default function OpsActiveCheckInsTab({ branchId }: Props) {
       if (timer) window.clearTimeout(timer);
       socket?.close();
     };
-  }, [branchId, load, toast]);
+  }, [branchId, toast]);
 
   async function handleCancel(row: OpsActiveCheckIn) {
     const accessNo =

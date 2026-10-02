@@ -1,4 +1,4 @@
-import { type FormEvent, useCallback, useEffect, useState } from 'react';
+import { type FormEvent, useEffect, useState } from 'react';
 import { QRCodeSVG } from 'qrcode.react';
 import { Alert, Badge, Button, Card, Field, Input, PageSection, Select } from '../../../components/ui';
 import { useToast } from '../../../contexts/ToastContext';
@@ -28,38 +28,39 @@ export default function HqGateDevicesTab({
 }: Pick<HqDataProps, 'branches'>) {
   const { toast } = useToast();
   const [devices, setDevices] = useState<GateDevice[]>([]);
-  const [loading, setLoading] = useState(true);
   const [filterBranchId, setFilterBranchId] = useState<number | ''>('');
   const [code, setCode] = useState('');
   const [name, setName] = useState('');
-  const [branchId, setBranchId] = useState<number | ''>(branches[0]?.id ?? '');
+  const [pickedBranchId, setBranchId] = useState<number | ''>('');
+  const branchId: number | '' = pickedBranchId !== '' ? pickedBranchId : branches.length ? branches[0].id : '';
   const [busy, setBusy] = useState(false);
   const [revealedKey, setRevealedKey] = useState<{
     code: string;
     deviceKey: string;
   } | null>(null);
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    try {
-      const res = await fetchHqGateDevices(
-        filterBranchId === '' ? undefined : Number(filterBranchId),
-      );
-      setDevices((res.data as GateDevice[]) || []);
-    } catch (err) {
-      toast(getErrorMessage(err, '讀取閘機裝置失敗'), 'error');
-    } finally {
-      setLoading(false);
-    }
-  }, [filterBranchId, toast]);
+  const [reloadKey, setReloadKey] = useState(0);
+  const load = () => setReloadKey((k) => k + 1);
+  const requestKey = `${filterBranchId}|${reloadKey}`;
+  const [loadedKey, setLoadedKey] = useState<string | null>(null);
+  const loading = loadedKey !== requestKey;
 
   useEffect(() => {
-    void load();
-  }, [load]);
-
-  useEffect(() => {
-    if (branchId === '' && branches[0]?.id) setBranchId(branches[0].id);
-  }, [branches, branchId]);
+    let cancelled = false;
+    fetchHqGateDevices(filterBranchId === '' ? undefined : Number(filterBranchId))
+      .then((res) => {
+        if (!cancelled) setDevices((res.data as GateDevice[]) || []);
+      })
+      .catch((err) => {
+        if (!cancelled) toast(getErrorMessage(err, '讀取閘機裝置失敗'), 'error');
+      })
+      .finally(() => {
+        if (!cancelled) setLoadedKey(requestKey);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [filterBranchId, requestKey, toast]);
 
   async function handleCreate(e: FormEvent) {
     e.preventDefault();

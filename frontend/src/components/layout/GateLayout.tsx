@@ -14,6 +14,8 @@ interface GateLayoutProps {
   mode: 'check-in' | 'check-out';
   onModeChange: (mode: 'check-in' | 'check-out') => void;
   lastResult?: GateFlashResult | null;
+  /** 掃描進行中時鎖定進／出場切換，避免誤觸 */
+  modeLocked?: boolean;
   children: ReactNode;
 }
 
@@ -21,13 +23,9 @@ export default function GateLayout({
   mode,
   onModeChange,
   lastResult,
+  modeLocked = false,
   children,
 }: GateLayoutProps) {
-  const renewHref =
-    lastResult?.renewable && lastResult.memberId
-      ? `/staff/ops?tab=checkout&memberId=${lastResult.memberId}`
-      : null;
-
   return (
     <div className="gate-app">
       <header className="gate-header">
@@ -46,11 +44,13 @@ export default function GateLayout({
       {lastResult && (
         <div className={`gate-flash gate-flash--${lastResult.ok ? 'ok' : 'err'}`}>
           {lastResult.message}
-          {renewHref ? (
+          {lastResult.renewable ? (
             <div className="gate-flash__actions">
-              <Link className="btn btn--primary btn--sm" to={renewHref}>
-                櫃檯續約／儲值
-              </Link>
+              <p className="gate-flash__renew-hint">
+                請至<strong>櫃檯</strong>辦理續約／儲值
+                {lastResult.memberId != null ? `（會員內部編號 #${lastResult.memberId}）` : ''}
+                ，勿在閘機平板登入員工系統。
+              </p>
             </div>
           ) : null}
         </div>
@@ -62,7 +62,10 @@ export default function GateLayout({
           role="tab"
           aria-selected={mode === 'check-in'}
           className={`gate-segment__btn ${mode === 'check-in' ? 'is-active' : ''}`}
-          onClick={() => onModeChange('check-in')}
+          disabled={modeLocked && mode !== 'check-in'}
+          onClick={() => {
+            if (!modeLocked) onModeChange('check-in');
+          }}
         >
           進場
         </button>
@@ -71,7 +74,10 @@ export default function GateLayout({
           role="tab"
           aria-selected={mode === 'check-out'}
           className={`gate-segment__btn ${mode === 'check-out' ? 'is-active' : ''}`}
-          onClick={() => onModeChange('check-out')}
+          disabled={modeLocked && mode !== 'check-out'}
+          onClick={() => {
+            if (!modeLocked) onModeChange('check-out');
+          }}
         >
           出場結算
         </button>

@@ -1,23 +1,27 @@
-import { useCallback, useEffect, useState } from 'react';
-import { Button, Card, Field, Input, Modal, PageSection, Select } from '../ui';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { Badge, Button, Card, Field, Input, Modal, PageSection, Select } from '../ui';
 import { staffBranchLabel } from '../../lib/branchLabel';
 import BranchScopeBar from './BranchScopeBar';
+import RefundDialog from './RefundDialog';
+import RefundRecordView from './RefundRecordView';
+import RefundErrorAlert from './RefundErrorAlert';
+import AllowancePrintView, { type AllowancePrintFormat } from './AllowancePrintView';
 import { useStaffAuth } from '../../contexts/StaffAuthContext';
 import { useToast } from '../../contexts/ToastContext';
 import {
   cancelOpsCardSubscription,
   completeOpsMemberLeave,
   endOpsMemberLeave,
-  fetchAllowanceSlip,
-  fetchAllowanceSlips,
+  exportAllowancesForAccounting,
+  fetchAllowances,
   fetchOpsCardSubscriptionRebindStatus,
   fetchOpsCardSubscriptions,
   fetchOpsMemberLeaves,
+  fetchRefunds,
   fetchReportBranches,
   getErrorMessage,
   openPayuniCheckoutInNewTab,
   opsCancelGate,
-  opsCancelSale,
   pauseOpsCardSubscription,
   previewCancelCardSubscription,
   rebindOpsCardSubscription,
@@ -25,18 +29,32 @@ import {
   startOpsMemberLeave,
 } from '../../lib/api';
 import { resolveBranchId } from '../../lib/resolveBranchId';
-import type { Branch, CardSubscription, MemberLeave } from '../../types/api';
-import { printAllowanceSlip, type AllowanceSlip } from '../../lib/printAllowanceSlip';
+import { defaultReportRange } from '../../lib/csvExport';
+import { downloadAllowanceCsv, downloadAllowanceXlsx } from '../../lib/allowanceExport';
+import { useAllowancePrint } from '../../lib/useAllowancePrint';
+import { describeRefundError, type RefundErrorInfo } from '../../lib/refundErrors';
+import { REFUND_STATUS_LABEL, refundStatusTone } from '../../lib/refundLabels';
+import type { AllowanceListPayload, Branch, CardSubscription, MemberLeave, RefundRecord } from '../../types/api';
 import HqReportsTab from '../../pages/staff/hq/HqReportsTab';
 
 type TxSubTab = 'reports' | 'refund' | 'cancel' | 'subscription';
 
 const TX_TABS: { key: TxSubTab; label: string }[] = [
   { key: 'reports', label: '一般報表' },
-  { key: 'refund', label: '折讓單據' },
+  { key: 'refund', label: '退費／折讓' },
   { key: 'subscription', label: '月卡訂閱／請假' },
-  { key: 'cancel', label: '取消進出場/交易' },
+  { key: 'cancel', label: '取消進出場' },
 ];
+
+type AllowanceFilter = {
+  from: string;
+  to: string;
+  allowanceNo: string;
+  invoiceNumber: string;
+  member: string;
+  subOrderId: string;
+  exportState: 'ALL' | 'EXPORTED' | 'UNEXPORTED';
+};
 
 type ExpirePolicy = 'KEEP' | 'CUT_UNUSED' | 'CUT_NO_ALLOWANCE';
 
@@ -64,11 +82,20 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
   const branchId = resolveBranchId(branchLocked, staff?.branchId, branches, branchIdDraft);
   const setBranchId = setBranchIdDraft;
 
-  const [refundAllowanceNo, setRefundAllowanceNo] = useState('');
-  const [lastAllowanceSlip, setLastAllowanceSlip] = useState<AllowanceSlip | null>(null);
-  const [allowanceList, setAllowanceList] = useState<AllowanceSlip[]>([]);
-  const [cancelSaleId, setCancelSaleId] = useState('');
-  const [cancelSaleReason, setCancelSaleReason] = useState('');
+  const [lookupInput, setLookupInput] = useState('');
+  const [refundTarget, setRefundTarget] = useState<{ refId?: string; invoiceNumber?: string } | null>(null);
+  const [openRefunds, setOpenRefunds] = useState<RefundRecord[]>([]);
+  const [selectedRefund, setSelectedRefund] = useState<RefundRecord | null>(null);
+  const [allowanceFilter, setAllowanceFilter] = useState<AllowanceFilter>(() => {
+    const r = defaultReportRange();
+    return { from: r.from, to: r.to, allowanceNo: '', invoiceNumber: '', member: '', subOrderId: '', exportState: 'ALL' };
+  });
+  const [allowanceData, setAllowanceData] = useState<AllowanceListPayload | null>(null);
+  const [refundTabError, setRefundTabError] = useState<RefundErrorInfo | null>(null);
+  const exportInFlightRef = useRef(false);
+  const [exporting, setExporting] = useState(false);
+  const printer = useAllowancePrint();
+  const { print: printAllowanceNo } = printer;
   const [cancelGateId, setCancelGateId] = useState('');
   const [cancelGateReason, setCancelGateReason] = useState('');
   const [busy, setBusy] = useState(false);
@@ -196,116 +223,115 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
     }
   }
 
-  const handleLoadRecentAllowances = useCallback(async () => {
-    setBusy(true);
+  const loadOpenRefunds = useCallback(async () => {
     try {
-      const res = await fetchAllowanceSlips({ take: 30 });
-      const slips = Array.isArray(res.data) ? (res.data as AllowanceSlip[]) : [];
-      setAllowanceList(slips);
-      toast(slips.length ? `已載入 ${slips.length} 筆折讓一覽` : '尚無折讓單據', 'info');
+      const res = await fetchRefunds({ status: 'OPEN', take: 50, ...(branchId ? { branchId: Number(branchId) } : {}) });
+      setOpenRefunds(res.data || []);
     } catch (err) {
-      toast(getErrorMessage(err, '讀取折讓一覽失敗'), 'error');
-    } finally {
-      setBusy(false);
+      setRefundTabError(describeRefundError(err, '讀取處理中退費單失敗'));
     }
-  }, [toast]);
+  }, [branchId]);
+
+  const loadAllowances = useCallback(async () => {
+    const f = allowanceFilter;
+    try {
+      const res = await fetchAllowances({
+        from: f.from || undefined,
+        to: f.to || undefined,
+        ...(branchId ? { branchId: Number(branchId) } : {}),
+        allowanceNo: f.allowanceNo.trim() || undefined,
+        invoiceNumber: f.invoiceNumber.trim().toUpperCase() || undefined,
+        member: f.member.trim() || undefined,
+        subOrderId: f.subOrderId.trim().toUpperCase() || undefined,
+        exportState: f.exportState,
+        take: 500,
+      });
+      setAllowanceData(res.data || null);
+    } catch (err) {
+      setRefundTabError(describeRefundError(err, '讀取折讓單失敗'));
+    }
+  }, [allowanceFilter, branchId]);
 
   useEffect(() => {
     if (subTab !== 'refund') return;
     let cancelled = false;
     void (async () => {
-      try {
-        const res = await fetchAllowanceSlips({ take: 30 });
-        if (cancelled) return;
-        const slips = Array.isArray(res.data) ? (res.data as AllowanceSlip[]) : [];
-        setAllowanceList(slips);
-      } catch {
-        // ignore auto-load errors
-      }
+      await Promise.resolve();
+      if (cancelled) return;
+      await loadOpenRefunds();
+      if (cancelled) return;
+      await loadAllowances();
     })();
     return () => {
       cancelled = true;
     };
-  }, [subTab]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- 切換分頁／分店時自動載入；篩選條件改按「查詢」
+  }, [subTab, branchId]);
 
-  const handleRefundLookup = useCallback(async () => {
-    const no = refundAllowanceNo.trim();
-    if (!no) {
-      toast('請填折讓單據號碼', 'error');
-      return;
-    }
-    setBusy(true);
-    try {
-      const res = await fetchAllowanceSlip(no);
-      const slip = res.data as AllowanceSlip;
-      setLastAllowanceSlip(slip);
-      setAllowanceList((prev) => [
-        slip,
-        ...prev.filter((s) => s.allowanceNo !== slip.allowanceNo),
-      ]);
-      toast(`折讓單據號碼：${slip.allowanceNo}`, 'success');
-    } catch (err) {
-      toast(getErrorMessage(err, '查詢失敗'), 'error');
-    } finally {
-      setBusy(false);
-    }
-  }, [refundAllowanceNo, toast]);
+  const handleLookup = useCallback(() => {
+    const v = lookupInput.trim().toUpperCase();
+    if (!v) return;
+    setRefundTarget(/^[A-Z]{2}\d{8}$/.test(v) ? { invoiceNumber: v } : { refId: v });
+  }, [lookupInput]);
 
-  const handleReprintAllowance = useCallback(async () => {
-    if (!lastAllowanceSlip?.allowanceNo) return;
-    setBusy(true);
-    try {
-      const res = await fetchAllowanceSlip(lastAllowanceSlip.allowanceNo);
-      const slip = res.data as AllowanceSlip;
-      setLastAllowanceSlip(slip);
-      printAllowanceSlip(slip);
-      toast(`折讓單據號碼：${slip.allowanceNo}`, 'info');
-    } catch (err) {
+  const handlePrint = useCallback(
+    async (allowanceNo: string, format: AllowancePrintFormat) => {
       try {
-        printAllowanceSlip(lastAllowanceSlip);
-        toast(`折讓單據號碼：${lastAllowanceSlip.allowanceNo}`, 'info');
-      } catch {
-        toast(getErrorMessage(err, '列印失敗'), 'error');
-      }
-    } finally {
-      setBusy(false);
-    }
-  }, [lastAllowanceSlip, toast]);
-
-  const handlePrintSlip = useCallback(
-    (slip: AllowanceSlip) => {
-      setLastAllowanceSlip(slip);
-      setRefundAllowanceNo(slip.allowanceNo);
-      try {
-        printAllowanceSlip(slip);
-        toast(`折讓單據號碼：${slip.allowanceNo}`, 'info');
+        await printAllowanceNo(allowanceNo, format);
+        void loadAllowances();
       } catch (err) {
-        toast(getErrorMessage(err, '列印失敗'), 'error');
+        setRefundTabError(describeRefundError(err, '列印失敗'));
       }
     },
-    [toast],
+    [printAllowanceNo, loadAllowances],
   );
-  const handleCancelSale = useCallback(async () => {
-    const saleId = cancelSaleId.trim();
-    if (!saleId) return;
-    if (
-      !window.confirm(
-        `確定取消銷貨單 ${saleId}？已成交將回補庫存並退回零錢包；有發票時會先呼叫 ezPay 作廢或折讓。`,
-      )
-    )
-      return;
-    setBusy(true);
-    try {
-      const result = await opsCancelSale(saleId, cancelSaleReason);
-      toast(result.message || '銷貨已取消', 'success');
-      setCancelSaleId('');
-      setCancelSaleReason('');
-    } catch (err) {
-      toast(getErrorMessage(err, '取消銷貨失敗'), 'error');
-    } finally {
-      setBusy(false);
-    }
-  }, [cancelSaleId, cancelSaleReason, toast]);
+
+  const handleExport = useCallback(
+    async (kind: 'csv' | 'xlsx', markExported: boolean) => {
+      const f = allowanceFilter;
+      if (!f.from || !f.to) {
+        setRefundTabError({ title: '請指定匯出日期區間', message: '會計匯出須填起日與迄日。', tone: 'warning' });
+        return;
+      }
+      if (exportInFlightRef.current) return;
+      exportInFlightRef.current = true;
+      setExporting(true);
+      try {
+        const res = await exportAllowancesForAccounting({
+          from: f.from,
+          to: f.to,
+          ...(branchId ? { branchId: Number(branchId) } : {}),
+          allowanceNo: f.allowanceNo.trim() || undefined,
+          invoiceNumber: f.invoiceNumber.trim().toUpperCase() || undefined,
+          member: f.member.trim() || undefined,
+          subOrderId: f.subOrderId.trim().toUpperCase() || undefined,
+          exportState: f.exportState,
+          markExported,
+        });
+        const data = res.data;
+        if (!data?.rows.length) {
+          toast('沒有可匯出的折讓單', 'error');
+          return;
+        }
+        const branch =
+          branchId === '' ? '全部門市' : staffBranchLabel(branches.find((b) => b.id === branchId)) || `分店${branchId}`;
+        const scope = { from: f.from, to: f.to, branch };
+        if (kind === 'csv') downloadAllowanceCsv(data, scope);
+        else await downloadAllowanceXlsx(data, scope);
+        toast(
+          `${res.message || (markExported ? '已下載並標記結轉' : '已下載對帳檔（未標記）')}${data.exported.truncated ? '；已達 500 筆上限，請縮小日期區間分批匯出' : ''}`,
+          data.exported.truncated ? 'info' : 'success',
+        );
+        setAllowanceData(data);
+      } catch (err) {
+        setRefundTabError(describeRefundError(err, '匯出失敗'));
+      } finally {
+        exportInFlightRef.current = false;
+        setExporting(false);
+      }
+    },
+    [allowanceFilter, branchId, branches, toast],
+  );
 
   const handleCancelGate = useCallback(async () => {
     const logId = cancelGateId.trim();
@@ -389,17 +415,14 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
             : '';
       if (resolved) setSelectedSubId(resolved);
       toast(result.message || '訂閱已取消', /PayUNi|⚠/.test(String(result.message || '')) ? 'error' : 'success');
-      const slip = (result.data as { allowanceSlip?: AllowanceSlip | null } | undefined)
+      const slip = (result.data as { allowanceSlip?: { allowanceNo?: string } | null } | undefined)
         ?.allowanceSlip;
       if (slip?.allowanceNo) {
-        setLastAllowanceSlip(slip);
-        setRefundAllowanceNo(slip.allowanceNo);
-        setAllowanceList((prev) => [slip, ...prev.filter((s) => s.allowanceNo !== slip.allowanceNo)]);
         toast(`折讓單據號碼：${slip.allowanceNo}`, 'success');
         try {
-          printAllowanceSlip(slip);
+          await printAllowanceNo(slip.allowanceNo);
         } catch (printErr) {
-          toast(getErrorMessage(printErr, `單號 ${slip.allowanceNo} 已開立，請至「折讓單據」查詢`), 'error');
+          toast(getErrorMessage(printErr, `單號 ${slip.allowanceNo} 已開立，請至「退費／折讓」查詢`), 'error');
         }
       }
       setCancelSubReason('');
@@ -410,7 +433,7 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
     } finally {
       setBusy(false);
     }
-  }, [selectedSubId, expirePolicy, doAllowance, cancelSubReason, toast, loadSubscriptions]);
+  }, [selectedSubId, expirePolicy, doAllowance, cancelSubReason, toast, loadSubscriptions, printAllowanceNo]);
 
   const handleStartLeave = useCallback(async () => {
     const memberNo = leaveMemberNo.trim().toUpperCase();
@@ -487,169 +510,74 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
           branchId={branchId}
           onBranchIdChange={setBranchId}
           hideBranchField
-          pageDesc="於列表列執行取消沖回／退費折讓；規則見頁面上方說明 · CSV 最多 1000 筆"
+          pageDesc="於列表列執行退費（後端試算）／取消沖回；規則見頁面上方說明 · CSV 最多 1000 筆"
         />
       )}
 
       {subTab === 'refund' && (
         <PageSection
-          title="折讓單據"
+          title="退費／折讓"
           desc={
             branchName
-              ? `目前作業分店：${branchName} · 以折讓單據號碼查詢／列印；退費折讓請於「一般報表」操作`
-              : '以折讓單據號碼查詢／列印；退費折讓請於「一般報表」操作'
+              ? `目前作業分店：${branchName} · 以單號或發票號查詢後退費；金額由後端試算，必填原因並留稽核`
+              : '以單號或發票號查詢後退費；金額由後端試算，必填原因並留稽核'
           }
         >
-          <div
-            style={{
-              display: 'grid',
-              gridTemplateColumns: 'minmax(0, 1fr) minmax(280px, 360px)',
-              gap: '1rem',
-              alignItems: 'start',
-            }}
-            className="allowance-layout"
-          >
-            <div className="form-stack" style={{ gap: '1rem' }}>
-              <Card
-                title="查詢折讓單據"
-                subtitle="僅需折讓單據號碼即可查詢並列印"
-              >
-                <div className="form-stack">
-                  <Field label="折讓單據號碼" hint="退費折讓完成後顯示／列印的號碼">
-                    <Input
-                      value={refundAllowanceNo}
-                      onChange={(e) => setRefundAllowanceNo(e.target.value.trim())}
-                      placeholder="貼上折讓單據號碼"
-                      className="mono"
-                    />
-                  </Field>
-                  <div className="btn-row">
-                    <Button
-                      onClick={() => void handleRefundLookup()}
-                      disabled={busy || !refundAllowanceNo.trim()}
-                    >
-                      查詢
-                    </Button>
-                    <Button
-                      variant="secondary"
-                      onClick={() => void handleReprintAllowance()}
-                      disabled={busy || !lastAllowanceSlip?.allowanceNo}
-                    >
-                      列印單號
-                    </Button>
-                  </div>
-                </div>
-              </Card>
-
-              {lastAllowanceSlip && (
-                <Card
-                  title="查詢結果"
-                  subtitle={`折讓單據號碼 ${lastAllowanceSlip.allowanceNo}`}
-                >
-                  <div className="form-stack">
-                    <p
-                      className="mono"
-                      style={{
-                        fontSize: '1.25rem',
-                        fontWeight: 700,
-                        letterSpacing: '0.04em',
-                        margin: 0,
-                      }}
-                    >
-                      {lastAllowanceSlip.allowanceNo}
-                    </p>
-                    <p className="text-sm text-muted" style={{ margin: 0 }}>
-                      原發票 {lastAllowanceSlip.invoiceNumber || '—'}
-                      {' · '}
-                      含稅 ${lastAllowanceSlip.totalAmt}
-                      {lastAllowanceSlip.orderId || lastAllowanceSlip.saleOrderId
-                        ? ` · 訂單 ${lastAllowanceSlip.orderId || lastAllowanceSlip.saleOrderId}`
-                        : ''}
-                    </p>
-                    <Button onClick={() => void handleReprintAllowance()} disabled={busy}>
-                      列印折讓單據號碼
-                    </Button>
-                  </div>
-                </Card>
-              )}
-            </div>
+          <div className="form-stack" style={{ gap: '1rem' }}>
+            <RefundErrorAlert error={refundTabError} onDismiss={() => setRefundTabError(null)} />
+            <Card title="查詢單據並退費" subtitle="可輸入子單號（SAL／TYK／CRS…）、合併結帳 CHK 或發票號碼">
+              <div className="list-toolbar">
+                <Field label="單號／發票號碼">
+                  <Input
+                    value={lookupInput}
+                    onChange={(e) => setLookupInput(e.target.value.trim())}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') handleLookup();
+                    }}
+                    placeholder="SAL…／TYK…／CHK…／AB12345678"
+                    className="mono"
+                  />
+                </Field>
+                <Button onClick={handleLookup} disabled={!lookupInput.trim()}>
+                  查詢並退費
+                </Button>
+              </div>
+            </Card>
 
             <Card
-              title="退費折讓一覽"
-              subtitle={
-                allowanceList.length
-                  ? `最近 ${allowanceList.length} 筆`
-                  : '尚無資料'
-              }
+              title="處理中退費單"
+              subtitle={openRefunds.length ? `${openRefunds.length} 筆待處理（乙禾回填、重試、簽名等）` : '目前無待處理退費單'}
             >
               <div className="form-stack">
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  onClick={() => void handleLoadRecentAllowances()}
-                  disabled={busy}
-                >
+                <Button variant="secondary" size="sm" onClick={() => void loadOpenRefunds()} disabled={busy}>
                   重新載入
                 </Button>
-                {allowanceList.length === 0 ? (
-                  <p className="text-sm text-muted" style={{ margin: 0 }}>
-                    完成退費折讓後會出現於此，亦可輸入單號查詢。
-                  </p>
-                ) : (
-                  <div className="table-wrap" style={{ maxHeight: 420, overflow: 'auto' }}>
+                {openRefunds.length > 0 && (
+                  <div className="table-wrap">
                     <table className="data-table">
                       <thead>
                         <tr>
-                          <th>折讓單據號碼</th>
-                          <th>金額</th>
+                          <th>退費單</th>
+                          <th>子單</th>
+                          <th>實退</th>
+                          <th>狀態</th>
+                          <th>建立時間</th>
                           <th />
                         </tr>
                       </thead>
                       <tbody>
-                        {allowanceList.map((slip) => (
-                          <tr
-                            key={slip.allowanceNo}
-                            style={
-                              lastAllowanceSlip?.allowanceNo === slip.allowanceNo
-                                ? { background: 'var(--color-muted-bg, #f5f5f5)' }
-                                : undefined
-                            }
-                          >
+                        {openRefunds.map((r) => (
+                          <tr key={r.id}>
+                            <td className="mono text-sm">{r.id}</td>
+                            <td className="mono text-sm">{r.subOrderId}</td>
+                            <td>${r.payoutAmount.toLocaleString('zh-TW')}</td>
                             <td>
-                              <button
-                                type="button"
-                                className="mono text-sm"
-                                style={{
-                                  background: 'none',
-                                  border: 'none',
-                                  padding: 0,
-                                  cursor: 'pointer',
-                                  textAlign: 'left',
-                                  color: 'inherit',
-                                  textDecoration: 'underline',
-                                }}
-                                onClick={() => {
-                                  setRefundAllowanceNo(slip.allowanceNo);
-                                  setLastAllowanceSlip(slip);
-                                }}
-                                title="帶入查詢"
-                              >
-                                {slip.allowanceNo}
-                              </button>
-                              <div className="text-muted" style={{ fontSize: 11 }}>
-                                {slip.issuedAt
-                                  ? new Date(slip.issuedAt).toLocaleString('zh-TW')
-                                  : '—'}
-                              </div>
+                              <Badge tone={refundStatusTone(r.status)}>{REFUND_STATUS_LABEL[r.status] || r.status}</Badge>
                             </td>
-                            <td>${slip.totalAmt}</td>
+                            <td className="text-sm">{new Date(r.createdAt).toLocaleString('zh-TW')}</td>
                             <td>
-                              <Button
-                                size="sm"
-                                variant="secondary"
-                                onClick={() => handlePrintSlip(slip)}
-                              >
-                                列印
+                              <Button size="sm" variant="secondary" onClick={() => setSelectedRefund(r)}>
+                                處理
                               </Button>
                             </td>
                           </tr>
@@ -660,14 +588,154 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
                 )}
               </div>
             </Card>
-          </div>
-          <style>{`
-            @media (max-width: 900px) {
-              .allowance-layout {
-                grid-template-columns: 1fr !important;
+
+            <Card
+              title="折讓單一覽"
+              subtitle={
+                allowanceData
+                  ? `共 ${allowanceData.items.length} 筆（最多 500 筆）· 分店依上方作業分店篩選`
+                  : '依日期區間與分店查詢後可匯出 CSV（UTF-8 BOM）／Excel 供會計申報'
               }
-            }
-          `}</style>
+            >
+              <div className="form-stack">
+                <div className="list-toolbar">
+                  <Field label="起日">
+                    <Input
+                      type="date"
+                      value={allowanceFilter.from}
+                      onChange={(e) => setAllowanceFilter({ ...allowanceFilter, from: e.target.value })}
+                    />
+                  </Field>
+                  <Field label="迄日">
+                    <Input
+                      type="date"
+                      value={allowanceFilter.to}
+                      onChange={(e) => setAllowanceFilter({ ...allowanceFilter, to: e.target.value })}
+                    />
+                  </Field>
+                  <Field label="折讓單號">
+                    <Input
+                      value={allowanceFilter.allowanceNo}
+                      onChange={(e) => setAllowanceFilter({ ...allowanceFilter, allowanceNo: e.target.value })}
+                      className="mono"
+                    />
+                  </Field>
+                  <Field label="原發票號碼">
+                    <Input
+                      value={allowanceFilter.invoiceNumber}
+                      onChange={(e) => setAllowanceFilter({ ...allowanceFilter, invoiceNumber: e.target.value })}
+                      className="mono"
+                    />
+                  </Field>
+                  <Field label="會員姓名">
+                    <Input
+                      value={allowanceFilter.member}
+                      onChange={(e) => setAllowanceFilter({ ...allowanceFilter, member: e.target.value })}
+                    />
+                  </Field>
+                  <Field label="子單號">
+                    <Input
+                      value={allowanceFilter.subOrderId}
+                      onChange={(e) => setAllowanceFilter({ ...allowanceFilter, subOrderId: e.target.value })}
+                      className="mono"
+                    />
+                  </Field>
+                  <Field label="會計匯出狀態">
+                    <select
+                      className="input"
+                      value={allowanceFilter.exportState}
+                      onChange={(e) => setAllowanceFilter({ ...allowanceFilter, exportState: e.target.value as AllowanceFilter['exportState'] })}
+                    >
+                      <option value="ALL">全部</option>
+                      <option value="UNEXPORTED">未匯出</option>
+                      <option value="EXPORTED">已匯出</option>
+                    </select>
+                  </Field>
+                </div>
+                <div className="btn-row">
+                  <Button onClick={() => void loadAllowances()} disabled={busy}>
+                    查詢
+                  </Button>
+                  <Button
+                    variant="secondary"
+                    onClick={() => void handleExport('csv', false)}
+                    loading={exporting}
+                    disabled={!allowanceData?.rows.length}
+                  >
+                    僅下載 CSV
+                  </Button>
+                  <Button
+                    variant="secondary"
+                    onClick={() => void handleExport('xlsx', false)}
+                    loading={exporting}
+                    disabled={!allowanceData?.rows.length}
+                  >
+                    僅下載 Excel
+                  </Button>
+                  <Button
+                    onClick={() => void handleExport('csv', true)}
+                    loading={exporting}
+                    disabled={!allowanceData?.rows.length}
+                  >
+                    下載 CSV 並標記已結轉
+                  </Button>
+                </div>
+                {allowanceData && allowanceData.items.length > 0 && (
+                  <div className="table-wrap" style={{ maxHeight: 480, overflow: 'auto' }}>
+                    <table className="data-table">
+                      <thead>
+                        <tr>
+                          <th>折讓日期</th>
+                          <th>折讓單號</th>
+                          <th>原發票</th>
+                          <th>門市</th>
+                          <th>會員／買受人</th>
+                          <th>子單</th>
+                          <th>含稅金額</th>
+                          <th>簽名</th>
+                          <th>列印</th>
+                          <th>會計匯出</th>
+                          <th />
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {allowanceData.items.map((a) => (
+                          <tr key={a.allowanceNo}>
+                            <td className="text-sm">{new Date(a.issuedAt).toLocaleDateString('zh-TW')}</td>
+                            <td className="mono text-sm">{a.allowanceNo}</td>
+                            <td className="mono text-sm">{a.invoiceNumber}</td>
+                            <td className="text-sm">{a.branchName || '—'}</td>
+                            <td className="text-sm">
+                              {a.category === 'B2B' ? `${a.buyerName || '—'}（${a.buyerUbn || '—'}）` : a.memberName || '—'}
+                            </td>
+                            <td className="mono text-sm">{a.subOrderId || '—'}</td>
+                            <td>${a.totalAmt.toLocaleString('zh-TW')}</td>
+                            <td className="text-sm">
+                              {a.signed ? '已簽' : a.signatureRequired ? <Badge tone="warning">待簽</Badge> : '—'}
+                            </td>
+                            <td className="text-sm">{a.printCount > 0 ? `${a.printCount} 次` : '未列印'}</td>
+                            <td className="text-sm">
+                              {a.exportedToAcctAt ? new Date(a.exportedToAcctAt).toLocaleDateString('zh-TW') : '未匯出'}
+                            </td>
+                            <td>
+                              <div className="btn-row">
+                                <Button size="sm" variant="secondary" onClick={() => void handlePrint(a.allowanceNo, 'A4_FOUR_PART')}>
+                                  {a.printCount > 0 ? 'A4 補印' : 'A4 列印'}
+                                </Button>
+                                <Button size="sm" variant="secondary" onClick={() => void handlePrint(a.allowanceNo, 'THERMAL_80MM')}>
+                                  {a.printCount > 0 ? '熱感補印' : '熱感列印'}
+                                </Button>
+                              </div>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            </Card>
+          </div>
         </PageSection>
       )}
 
@@ -1019,42 +1087,14 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
 
       {subTab === 'cancel' && (
         <PageSection
-          title="取消進出場/交易"
+          title="取消進出場"
           desc={
             branchName
-              ? `目前作業分店：${branchName} · 銷貨 SAL…、進出場 ACC＋日期時間；儲值／銷售退費折讓請用「一般報表」；折讓單列印請用「折讓單據」`
-              : '依單號處理：銷貨 SAL…、進出場 ACC＋日期時間；折讓單列印請用「折讓單據」'
+              ? `目前作業分店：${branchName} · 進出場 ACC＋日期時間；銷貨／購案退費請用「退費／折讓」`
+              : '進出場 ACC＋日期時間；銷貨／購案退費請用「退費／折讓」'
           }
         >
           <div className="form-stack" style={{ gap: '1rem' }}>
-            <Card
-              title="取消商品銷售"
-              subtitle="回補庫存、零錢包自動退回；有發票時自動 ezPay 作廢（失敗則折讓）。現金／刷卡／抵用券請人工退款"
-            >
-              <div className="form-stack">
-                <Field label="銷貨單號" hint="一般報表「商品銷售」可查 SAL…">
-                  <Input
-                    value={cancelSaleId}
-                    onChange={(e) => setCancelSaleId(e.target.value)}
-                    placeholder="SAL20260722xxxxxx"
-                  />
-                </Field>
-                <Field label="取消原因（選填）" hint="會寫入單據；作廢原因送 ezPay 時最多中文 6 字">
-                  <Input
-                    value={cancelSaleReason}
-                    onChange={(e) => setCancelSaleReason(e.target.value)}
-                    placeholder="例：錯賣、重複結帳"
-                  />
-                </Field>
-                <Button
-                  variant="danger"
-                  onClick={() => void handleCancelSale()}
-                  disabled={busy || !cancelSaleId.trim()}
-                >
-                  取消銷貨
-                </Button>
-              </div>
-            </Card>
             <Card title="取消進出場" subtitle="在場中取消進場；已出場則費用退回零錢包">
               <div className="form-stack">
                 <Field label="進出場單號" hint="例 ACC20260728215430（或報表數字 id）">
@@ -1083,6 +1123,44 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
             </Card>
           </div>
         </PageSection>
+      )}
+
+      {refundTarget && (
+        <RefundDialog
+          open
+          refId={refundTarget.refId}
+          invoiceNumber={refundTarget.invoiceNumber}
+          onClose={() => {
+            setRefundTarget(null);
+            void loadOpenRefunds();
+            void loadAllowances();
+          }}
+        />
+      )}
+
+      {selectedRefund && (
+        <Modal
+          open
+          wide
+          closeOnBackdrop={false}
+          title={`退費單 ${selectedRefund.id}`}
+          onClose={() => {
+            setSelectedRefund(null);
+            void loadOpenRefunds();
+            void loadAllowances();
+          }}
+        >
+          <RefundRecordView refund={selectedRefund} />
+        </Modal>
+      )}
+
+      {printer.job && (
+        <AllowancePrintView
+          key={`${printer.job.payload.allowance.allowanceNo}-${printer.job.format}`}
+          payload={printer.job.payload}
+          format={printer.job.format}
+          onDone={printer.clear}
+        />
       )}
 
       <Modal

@@ -1,17 +1,23 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import BrandMark from '../../components/BrandMark';
 import SignaturePad from '../../components/staff/SignaturePad';
+import AllowanceSignView from '../../features/pos-display/AllowanceSignView';
 import { Button } from '../../components/ui';
 import {
   createPosDisplayBus,
+  POS_DISPLAY_ACK_TIMEOUT_MS,
+  POS_DISPLAY_HEARTBEAT_MS,
+  POS_DISPLAY_LINK_TIMEOUT_MS,
   POS_DISPLAY_TYPES,
   summarizePosDisplayCart,
   type PosDisplayCartPayload,
   type PosDisplayConsentPayload,
   type PosDisplayMessage,
+  type PosDisplaySignatureAckPayload,
 } from '../../lib/posDisplayBus';
 
 type ViewMode = 'IDLE' | 'CART' | 'CONSENT';
+type SignPhase = 'idle' | 'sending' | 'awaiting_ack' | 'acked' | 'ack_timeout';
 type PosBus = ReturnType<typeof createPosDisplayBus>;
 
 interface OccupancySnapshot {
@@ -19,6 +25,9 @@ interface OccupancySnapshot {
   capacity?: number;
   updatedAt?: string;
 }
+
+const IDLE_MARQUEE_TEXT =
+  '歡迎光臨 1st FITNESS\u3000請至櫃檯辦理入會／結帳\u3000Welcome\u3000請出示會員動態 QR\u3000';
 
 function occupancyWsUrl() {
   const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
@@ -43,24 +52,59 @@ export default function CustomerDisplayPage() {
   const [consent, setConsent] = useState<PosDisplayConsentPayload | null>(null);
   const [signatureData, setSignatureData] = useState<string | null>(null);
   const [linkOk, setLinkOk] = useState(false);
+  const [signPhase, setSignPhase] = useState<SignPhase>('idle');
+  const [signPadKey, setSignPadKey] = useState(0);
   const [occupancy, setOccupancy] = useState<OccupancySnapshot | null>(null);
   const [occupancyVisible, setOccupancyVisible] = useState(true);
   const [occupancyStatus, setOccupancyStatus] = useState('連線中…');
   const [clock, setClock] = useState(() => new Date());
   const busRef = useRef<PosBus | null>(null);
+  const lastHostAtRef = useRef(0);
+  const pendingAckIdRef = useRef<string | null>(null);
+  const ackTimerRef = useRef<number | null>(null);
+  const ackedIdleTimerRef = useRef<number | null>(null);
 
   const cartSummary = useMemo(() => summarizePosDisplayCart(cart), [cart]);
+
+  function clearAckTimer() {
+    if (ackTimerRef.current != null) {
+      window.clearTimeout(ackTimerRef.current);
+      ackTimerRef.current = null;
+    }
+  }
+
+  function clearAckedIdleTimer() {
+    if (ackedIdleTimerRef.current != null) {
+      window.clearTimeout(ackedIdleTimerRef.current);
+      ackedIdleTimerRef.current = null;
+    }
+  }
+
+  function touchHost() {
+    lastHostAtRef.current = Date.now();
+    setLinkOk(true);
+  }
+
+  function resetConsentView(next: PosDisplayConsentPayload | null) {
+    clearAckTimer();
+    clearAckedIdleTimer();
+    pendingAckIdRef.current = null;
+    setSignPhase('idle');
+    setConsent(next);
+    setSignatureData(null);
+    setSignPadKey((k) => k + 1);
+  }
 
   useEffect(() => {
     const t = window.setInterval(() => setClock(new Date()), 1000);
     return () => window.clearInterval(t);
   }, []);
 
-  // 客顯 bus：BC + storage 備援
+  // 客顯 bus：BC + storage 備援＋心跳逾時
   useEffect(() => {
     const bus = createPosDisplayBus('display');
     busRef.current = bus;
-    bus.startHeartbeat(5000);
+    bus.startHeartbeat(POS_DISPLAY_HEARTBEAT_MS);
 
     const unsub = bus.subscribe((msg: PosDisplayMessage) => {
       if (msg.from === 'display') return;
@@ -68,47 +112,81 @@ export default function CustomerDisplayPage() {
 
       if (type === POS_DISPLAY_TYPES.PING) {
         bus.post(POS_DISPLAY_TYPES.PONG, { role: 'display' });
-        setLinkOk(true);
+        touchHost();
         return;
       }
       if (type === POS_DISPLAY_TYPES.PONG) {
-        setLinkOk(true);
+        touchHost();
         return;
       }
+
+      if (type === POS_DISPLAY_TYPES.SIGNATURE_ACK) {
+        touchHost();
+        const ack = (msg.payload || {}) as PosDisplaySignatureAckPayload;
+        const waiting = pendingAckIdRef.current;
+        if (!waiting || ack.consentSignatureId !== waiting) return;
+        if (!ack.ok) {
+          clearAckTimer();
+          pendingAckIdRef.current = null;
+          setSignPhase('ack_timeout');
+          return;
+        }
+        clearAckTimer();
+        pendingAckIdRef.current = null;
+        setSignPhase('acked');
+        clearAckedIdleTimer();
+        ackedIdleTimerRef.current = window.setTimeout(() => {
+          setMode('IDLE');
+          resetConsentView(null);
+          setCart(null);
+        }, 1200);
+        return;
+      }
+
       if (type === POS_DISPLAY_TYPES.IDLE || type === POS_DISPLAY_TYPES.RESET) {
+        touchHost();
         setMode('IDLE');
         setCart(null);
-        setConsent(null);
-        setSignatureData(null);
-        setLinkOk(true);
+        resetConsentView(null);
         return;
       }
       if (type === POS_DISPLAY_TYPES.CART || type === POS_DISPLAY_TYPES.CART_UPDATE) {
-        const payload = (msg.payload || {}) as PosDisplayCartPayload;
-        setCart(payload);
-        setConsent(null);
-        setSignatureData(null);
+        touchHost();
+        setCart((msg.payload || {}) as PosDisplayCartPayload);
+        resetConsentView(null);
         setMode('CART');
-        setLinkOk(true);
         return;
       }
       if (type === POS_DISPLAY_TYPES.CONSENT) {
+        touchHost();
         const payload = (msg.payload || {}) as PosDisplayConsentPayload;
         if (!payload?.consentSignatureId || !payload?.body) return;
-        setConsent(payload);
-        setSignatureData(null);
+        setCart(null);
+        resetConsentView(payload);
         setMode('CONSENT');
-        setLinkOk(true);
       }
     });
 
     bus.post(POS_DISPLAY_TYPES.PONG, { role: 'display', ready: true });
 
+    const watch = window.setInterval(() => {
+      const last = lastHostAtRef.current;
+      if (!last) {
+        setLinkOk(false);
+        return;
+      }
+      setLinkOk(Date.now() - last <= POS_DISPLAY_LINK_TIMEOUT_MS);
+    }, 1000);
+
     return () => {
+      window.clearInterval(watch);
+      clearAckTimer();
+      clearAckedIdleTimer();
       unsub();
       bus.close();
       busRef.current = null;
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- mount once
   }, []);
 
   // /ws/occupancy（尊重 occupancy-settings）
@@ -188,17 +266,42 @@ export default function CustomerDisplayPage() {
     };
   }, []);
 
-  function submitSignature() {
+  function sendSignatureNow() {
     if (!consent || !signatureData) return;
+    const consentSignatureId = consent.consentSignatureId;
+    pendingAckIdRef.current = consentSignatureId;
+    setSignPhase('sending');
     busRef.current?.post(POS_DISPLAY_TYPES.SIGNATURE_COMPLETED, {
       purpose: consent.purpose,
-      consentSignatureId: consent.consentSignatureId,
+      consentSignatureId,
       signatureDataUrl: signatureData,
       signedAt: new Date().toISOString(),
     });
-    setMode('IDLE');
-    setConsent(null);
+    setSignPhase('awaiting_ack');
+    clearAckTimer();
+    ackTimerRef.current = window.setTimeout(() => {
+      if (pendingAckIdRef.current !== consentSignatureId) return;
+      setSignPhase('ack_timeout');
+    }, POS_DISPLAY_ACK_TIMEOUT_MS);
+  }
+
+  function submitSignature() {
+    if (!consent || !signatureData) return;
+    if (signPhase === 'sending' || signPhase === 'awaiting_ack' || signPhase === 'acked') return;
+    sendSignatureNow();
+  }
+
+  function retrySignatureSend() {
+    if (!consent || !signatureData) return;
+    sendSignatureNow();
+  }
+
+  function clearAndResign() {
+    clearAckTimer();
+    pendingAckIdRef.current = null;
+    setSignPhase('idle');
     setSignatureData(null);
+    setSignPadKey((k) => k + 1);
   }
 
   const timeLabel = clock.toLocaleTimeString('zh-TW', {
@@ -206,6 +309,9 @@ export default function CustomerDisplayPage() {
     minute: '2-digit',
     second: '2-digit',
   });
+
+  const signingBusy =
+    signPhase === 'sending' || signPhase === 'awaiting_ack' || signPhase === 'acked';
 
   return (
     <div className={`cd-app cd-app--${mode.toLowerCase()}`}>
@@ -218,8 +324,8 @@ export default function CustomerDisplayPage() {
           </div>
         </div>
         <div className="cd-header__meta">
-          <span className={`cd-link ${linkOk ? 'is-ok' : ''}`}>
-            {linkOk ? '主螢幕已連線' : '等待主螢幕…'}
+          <span className={`cd-link ${linkOk ? 'is-ok' : 'is-bad'}`}>
+            {linkOk ? '主螢幕已連線' : '主螢幕連線中斷／等待中'}
           </span>
           <time dateTime={clock.toISOString()}>{timeLabel}</time>
         </div>
@@ -231,12 +337,8 @@ export default function CustomerDisplayPage() {
             <p className="cd-idle__eyebrow">Welcome</p>
             <h1 className="cd-idle__title">歡迎光臨</h1>
             <p className="cd-marquee" aria-hidden="true">
-              <span>
-                歡迎光臨 1st FITNESS　請至櫃檯辦理入會／結帳　Welcome　請出示會員動態 QR　
-              </span>
-              <span>
-                歡迎光臨 1st FITNESS　請至櫃檯辦理入會／結帳　Welcome　請出示會員動態 QR　
-              </span>
+              <span>{IDLE_MARQUEE_TEXT}</span>
+              <span>{IDLE_MARQUEE_TEXT}</span>
             </p>
           </div>
           {occupancyVisible && occupancy ? (
@@ -328,25 +430,58 @@ export default function CustomerDisplayPage() {
           <div className="cd-consent__sign">
             <h3>請於下方親簽</h3>
             <SignaturePad
-              key={consent.consentSignatureId}
+              key={`${consent.consentSignatureId}-${signPadKey}`}
               height={220}
               onChange={setSignatureData}
             />
             <div className="cd-consent__actions">
-              <Button
-                disabled={!signatureData}
-                onClick={submitSignature}
-                style={{ minHeight: 48, fontSize: '1.05rem' }}
-              >
-                確認簽署並送回櫃檯
-              </Button>
-              <p className="cd-consent__hint">
-                簽署完成後將自動回傳主螢幕（consentSignatureId）
-              </p>
+              {signPhase === 'acked' ? (
+                <p className="cd-consent__hint" style={{ color: 'var(--success, #069546)' }}>
+                  櫃檯已收到簽名，即將返回待機…
+                </p>
+              ) : signPhase === 'ack_timeout' ? (
+                <>
+                  <p className="cd-consent__hint" role="alert">
+                    尚未收到櫃檯確認。請勿離開，可再送一次；若仍失敗請告知櫃檯重開客顯。
+                  </p>
+                  <Button
+                    disabled={!signatureData || !linkOk}
+                    onClick={retrySignatureSend}
+                    style={{ minHeight: 48, fontSize: '1.05rem' }}
+                  >
+                    再送一次給櫃檯
+                  </Button>
+                  <Button
+                    variant="secondary"
+                    onClick={clearAndResign}
+                    style={{ minHeight: 48, fontSize: '1.05rem' }}
+                  >
+                    清除後重簽
+                  </Button>
+                </>
+              ) : (
+                <>
+                  <Button
+                    disabled={!signatureData || signingBusy}
+                    loading={signPhase === 'sending' || signPhase === 'awaiting_ack'}
+                    onClick={submitSignature}
+                    style={{ minHeight: 48, fontSize: '1.05rem' }}
+                  >
+                    {signPhase === 'awaiting_ack' ? '等待櫃檯確認…' : '確認簽署並送回櫃檯'}
+                  </Button>
+                  <p className="cd-consent__hint">
+                    {linkOk
+                      ? '簽署後需等櫃檯確認收到，畫面才會返回待機'
+                      : '主螢幕尚未連線，請先請櫃檯點「開啟客顯」'}
+                  </p>
+                </>
+              )}
             </div>
           </div>
         </section>
       )}
+
+      <AllowanceSignView />
     </div>
   );
 }

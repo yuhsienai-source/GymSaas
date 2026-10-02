@@ -2,6 +2,7 @@ import { type FormEvent, useEffect, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import BrandMark from '../../components/BrandMark';
 import LandingLayout from '../../components/layout/LandingLayout';
+import MemberIdPhotoCamera from '../../components/member/MemberIdPhotoCamera';
 import SignaturePad from '../../components/staff/SignaturePad';
 import { Alert, Button, Card, Field, Input, Modal } from '../../components/ui';
 import { useMemberAuth } from '../../contexts/MemberAuthContext';
@@ -84,15 +85,6 @@ function applyStatus(status: OnboardingStatus): Step {
   }
 }
 
-function fileToDataUrl(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result || ''));
-    reader.onerror = () => reject(new Error('讀取檔案失敗'));
-    reader.readAsDataURL(file);
-  });
-}
-
 export default function MemberLoginPage() {
   const navigate = useNavigate();
   const [params] = useSearchParams();
@@ -115,6 +107,30 @@ export default function MemberLoginPage() {
     if (q.get('needDevice') === '1') return 'bind-device';
     return 'email';
   });
+  const stepRef = useRef(step);
+  stepRef.current = step;
+  const stepHistoryRef = useRef<Step[]>([]);
+
+  function advanceStep(next: Step) {
+    const cur = stepRef.current;
+    if (cur !== next) stepHistoryRef.current.push(cur);
+    setStep(next);
+  }
+
+  function resetToEmailEntry() {
+    stepHistoryRef.current = [];
+    resetToEmailEntry();
+  }
+
+  function goBackStep() {
+    setError('');
+    const prev = stepHistoryRef.current.pop();
+    if (!prev || prev === 'done') {
+      resetToEmailEntry();
+      return;
+    }
+    setStep(prev);
+  }
   const [email, setEmail] = useState('');
   /** 入口主鍵：手機＋證件號 */
   const [entryPhone, setEntryPhone] = useState('');
@@ -183,6 +199,7 @@ export default function MemberLoginPage() {
   const [resetMaskedEmail, setResetMaskedEmail] = useState(resetSession?.maskedEmail || '');
   const [resetOtpSent, setResetOtpSent] = useState(Boolean(resetSession?.resetTicket));
   const [resetCooldown, setResetCooldown] = useState(0);
+  const [legalDoc, setLegalDoc] = useState<null | 'rights' | 'privacy'>(null);
 
   useEffect(() => {
     if (isAuthenticated && !needDevice) navigate('/member', { replace: true });
@@ -289,7 +306,7 @@ export default function MemberLoginPage() {
             resetTicket: reset.resetTicket,
             maskedEmail: reset.maskedEmail,
           });
-          setStep('device-reset');
+          advanceStep('device-reset');
           setError(reset.message);
           return;
         }
@@ -321,7 +338,7 @@ export default function MemberLoginPage() {
           });
           setResetTicket(reset.resetTicket);
           setResetMaskedEmail(reset.maskedEmail || '');
-          setStep('device-reset');
+          advanceStep('device-reset');
           setError(reset.message);
           return;
         }
@@ -354,12 +371,11 @@ export default function MemberLoginPage() {
       finishWithMemberToken(data.token, message);
       return;
     }
-    setStep(applyStatus(data));
+    advanceStep(applyStatus(data));
     if (message) toast(message, 'success');
   }
 
-  async function handleUploadIdPhoto(side: 'front' | 'back', file: File | undefined) {
-    if (!file) return;
+  async function handleUploadIdPhotoDataUrl(side: 'front' | 'back', dataUrl: string) {
     if (!idPhotoConsent) {
       setError('請先勾選同意證件蒐集告知');
       return;
@@ -367,7 +383,6 @@ export default function MemberLoginPage() {
     setError('');
     setIdPhotoBusySide(side);
     try {
-      const dataUrl = await fileToDataUrl(file);
       const res = await onboardingUploadIdPhoto(dataUrl, side, { consent: true });
       if (res.status !== 'success' || !res.data) {
         setError(res.message || '上傳失敗');
@@ -449,7 +464,7 @@ export default function MemberLoginPage() {
       setDevCode(send.data?.devCode || '');
       setOtpCode(send.data?.devCode || '');
       setOtpCooldown(OTP_COOLDOWN_SEC);
-      setStep('otp');
+      advanceStep('otp');
       toast(
         incomplete
           ? '驗證碼已寄出，請完成驗證後繼續註冊資料'
@@ -491,7 +506,7 @@ export default function MemberLoginPage() {
         setOtpCooldown(OTP_COOLDOWN_SEC);
         setRegPhone(phone);
         setRegIdNumber(idNumber.toUpperCase());
-        setStep('otp');
+        advanceStep('otp');
         toast(send.message || '驗證碼已寄出', 'success');
         return;
       }
@@ -558,7 +573,7 @@ export default function MemberLoginPage() {
         setEnrollOtp('');
         setEnrollMaskedEmail('');
         setDevCode('');
-        setStep('email-enroll');
+        advanceStep('email-enroll');
         toast(res.data.hint || '請補登並驗證 Email', 'info');
         return;
       }
@@ -583,7 +598,7 @@ export default function MemberLoginPage() {
       setDevCode(send.data?.devCode || '');
       setOtpCode(send.data?.devCode || '');
       setOtpCooldown(OTP_COOLDOWN_SEC);
-      setStep('otp');
+      advanceStep('otp');
       toast(
         incomplete
           ? '驗證碼已寄出，請完成驗證後繼續註冊資料'
@@ -908,7 +923,7 @@ export default function MemberLoginPage() {
     register: '新會員資料',
     'face-choice': '是否啟用人臉辨識',
     contracts: status?.faceEnabled ? '簽署入會契約與生物辨識同意書' : '簽署會員契約',
-    'id-photos': '上傳證件正／反面',
+    'id-photos': '拍攝證件正／反面',
     'bind-line': '綁定 LINE（選用）',
     'bind-device': '綁定本機裝置（門禁 QR）',
     'device-reset': '換機驗證',
@@ -1045,11 +1060,11 @@ export default function MemberLoginPage() {
 
                   <p className="member-center__legal">
                     點擊登入即同意
-                    <button type="button" className="member-center__link">
+                    <button type="button" className="member-center__link" onClick={() => setLegalDoc('rights')}>
                       會員權益
                     </button>
                     及
-                    <button type="button" className="member-center__link">
+                    <button type="button" className="member-center__link" onClick={() => setLegalDoc('privacy')}>
                       隱私權宣告
                     </button>
                   </p>
@@ -1059,7 +1074,7 @@ export default function MemberLoginPage() {
                     className="w-full"
                     onClick={() => {
                       setError('');
-                      setStep('device-reset');
+                      advanceStep('device-reset');
                     }}
                   >
                     換機／新裝置驗證（Email）
@@ -1163,11 +1178,11 @@ export default function MemberLoginPage() {
 
                   <p className="member-center__legal">
                     點擊繼續即同意
-                    <button type="button" className="member-center__link">
+                    <button type="button" className="member-center__link" onClick={() => setLegalDoc('rights')}>
                       會員權益
                     </button>
                     及
-                    <button type="button" className="member-center__link">
+                    <button type="button" className="member-center__link" onClick={() => setLegalDoc('privacy')}>
                       隱私權宣告
                     </button>
                   </p>
@@ -1177,6 +1192,17 @@ export default function MemberLoginPage() {
           ) : (
             <>
               <div className="auth-card__hero member-center__step-hero">
+                {viewStep !== 'done' && (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    className="member-center__back"
+                    disabled={busy}
+                    onClick={goBackStep}
+                  >
+                    ← 上一步
+                  </Button>
+                )}
                 <BrandMark size={48} />
                 <p className="member-center__eyebrow">MEMBER CENTER</p>
                 <h2>{titleByStep[viewStep]}</h2>
@@ -1198,7 +1224,7 @@ export default function MemberLoginPage() {
                       ? '請閱讀並電子簽署入會契約與生物辨識同意書'
                       : '請閱讀並電子簽署會員契約書')}
                   {viewStep === 'id-photos' &&
-                    '新會員須上傳證件正／反面（身分證／居留證／護照／國籍證件）後，才能綁定裝置進出場'}
+                    '新會員須以本機相機拍攝證件正／反面後，才能綁定裝置進出場（無法從相簿選檔）'}
                   {viewStep === 'bind-line' &&
                     '鼓勵綁定 LINE 以便下次快速登入（非必要）；可略過，直接綁本機裝置後顯示門禁 QR'}
                   {viewStep === 'bind-device' &&
@@ -1246,7 +1272,7 @@ export default function MemberLoginPage() {
                 variant="ghost"
                 disabled={busy}
                 onClick={() => {
-                  setStep('email');
+                  resetToEmailEntry();
                   setNeedsEmailCapture(false);
                   if (authMode === 'login') setShowLoginEmail(true);
                   setOtpCode('');
@@ -1345,7 +1371,7 @@ export default function MemberLoginPage() {
                     setEnrollMaskedEmail('');
                     return;
                   }
-                  setStep('email');
+                  resetToEmailEntry();
                   setNeedsEmailCapture(false);
                   setLookupDone(false);
                   setLookupHint(null);
@@ -1526,7 +1552,8 @@ export default function MemberLoginPage() {
           {viewStep === 'id-photos' && (
             <div className="form-stack">
               <Alert tone="info">
-                證件影像僅供會籍核對，依館方政策保存（會籍結束＋法定年限）。可上傳身分證、居留證或護照頁面作為正／反面。
+                證件影像僅供會籍核對。請用本機相機現場拍攝正／反面（自動存成
+                JPG），無法從相簿選檔。可拍身分證、居留證或護照頁面。
               </Alert>
               <label className="id-photo-consent">
                 <input
@@ -1535,39 +1562,29 @@ export default function MemberLoginPage() {
                   onChange={(e) => setIdPhotoConsent(e.target.checked)}
                 />
                 <span>
-                  我已了解蒐集目的與保存期間，同意上傳證件正／反面供會籍核對使用。
+                  我已了解蒐集目的與保存期間，同意拍攝證件正／反面供會籍核對使用。
                 </span>
               </label>
               {!idPhotoConsent && (
-                <Alert tone="warning">請先勾選同意後再選擇照片</Alert>
+                <Alert tone="warning">請先勾選同意後再開啟相機</Alert>
               )}
               <div className="id-photo-grid">
-                {(['front', 'back'] as const).map((side) => {
-                  const ready = side === 'front' ? idPhotoFrontReady : idPhotoBackReady;
-                  const busy = idPhotoBusySide === side;
-                  return (
-                    <div className="id-photo-side" key={side}>
-                      <p className="id-photo-side__title">
-                        證件{side === 'front' ? '正面' : '反面'}
-                        {ready ? ' · 已上傳' : ' · 必填'}
-                      </p>
-                      <div className="id-photo-side__actions">
-                        <input
-                          type="file"
-                          accept="image/jpeg,image/png,image/webp,image/*"
-                          capture="environment"
-                          disabled={busy || !idPhotoConsent}
-                          onChange={(e) => {
-                            const f = e.target.files?.[0];
-                            void handleUploadIdPhoto(side, f);
-                            e.target.value = '';
-                          }}
-                        />
-                        {busy && <span className="text-muted text-sm">上傳中…</span>}
-                      </div>
-                    </div>
-                  );
-                })}
+                <MemberIdPhotoCamera
+                  side="front"
+                  sideLabel="證件正面"
+                  disabled={!idPhotoConsent}
+                  busy={idPhotoBusySide === 'front'}
+                  alreadyDone={idPhotoFrontReady}
+                  onCaptured={(dataUrl) => void handleUploadIdPhotoDataUrl('front', dataUrl)}
+                />
+                <MemberIdPhotoCamera
+                  side="back"
+                  sideLabel="證件反面"
+                  disabled={!idPhotoConsent}
+                  busy={idPhotoBusySide === 'back'}
+                  alreadyDone={idPhotoBackReady}
+                  onCaptured={(dataUrl) => void handleUploadIdPhotoDataUrl('back', dataUrl)}
+                />
               </div>
               {idPhotoFrontReady && idPhotoBackReady ? (
                 <Button
@@ -1579,7 +1596,7 @@ export default function MemberLoginPage() {
                   證件已齊，繼續綁定裝置
                 </Button>
               ) : (
-                <Alert tone="warning">請上傳正面與反面後即可繼續</Alert>
+                <Alert tone="warning">請拍攝正面與反面後即可繼續</Alert>
               )}
             </div>
           )}
@@ -1604,7 +1621,7 @@ export default function MemberLoginPage() {
                 variant="secondary"
                 disabled={busy}
                 className="w-full"
-                onClick={() => setStep('bind-device')}
+                onClick={() => advanceStep('bind-device')}
               >
                 略過 LINE，改綁本機裝置
               </Button>
@@ -1630,7 +1647,7 @@ export default function MemberLoginPage() {
                   type="button"
                   variant="ghost"
                   disabled={busy}
-                  onClick={() => setStep('bind-line')}
+                  onClick={() => advanceStep('bind-line')}
                 >
                   改為綁定 LINE（選用）
                 </Button>
@@ -1703,7 +1720,7 @@ export default function MemberLoginPage() {
                   setResetOtpSent(false);
                   setResetOtp('');
                   setResetTicket('');
-                  setStep('email');
+                  resetToEmailEntry();
                   setNeedsEmailCapture(false);
                 }}
               >
@@ -1765,6 +1782,41 @@ export default function MemberLoginPage() {
               <span className="field__label">電子簽名</span>
               <SignaturePad key={signTarget.id} onChange={setSignatureData} />
             </div>
+          </div>
+        )}
+      </Modal>
+
+      <Modal
+        open={legalDoc !== null}
+        title={legalDoc === 'privacy' ? '隱私權宣告（摘要）' : '會員權益（摘要）'}
+        onClose={() => setLegalDoc(null)}
+        footer={
+          <Button type="button" onClick={() => setLegalDoc(null)}>
+            我知道了
+          </Button>
+        }
+      >
+        {legalDoc === 'privacy' ? (
+          <div className="form-stack text-sm">
+            <p>我們會依營運與法令需要，蒐集與使用您的會員資料，重點如下：</p>
+            <ul style={{ margin: 0, paddingLeft: '1.2rem' }}>
+              <li>身分與聯絡資料：用於登入、通知、會籍與客服。</li>
+              <li>進場與消費紀錄：用於門禁、計費、發票與對帳。</li>
+              <li>證件影像：僅供會籍查驗，加密保存；一般櫃檯無法直接預覽原圖。</li>
+              <li>人臉特徵（若您同意）：僅用於進場辨識，可依規定申請停止使用。</li>
+            </ul>
+            <p className="text-muted">完整條款以館方公告與定型化契約為準；如需查閱或更正個資，請洽櫃檯。</p>
+          </div>
+        ) : (
+          <div className="form-stack text-sm">
+            <p>成為會員後，您可依方案使用以下服務（實際內容以購買方案為準）：</p>
+            <ul style={{ margin: 0, paddingLeft: '1.2rem' }}>
+              <li>依規定進出場與使用場館設施。</li>
+              <li>查看錢包餘額、會籍效期與消費紀錄。</li>
+              <li>線上或臨櫃購買方案、請假與查詢課程（視館方開放項目）。</li>
+              <li>依消保法與定型化契約主張退費等權益。</li>
+            </ul>
+            <p className="text-muted">未完成必簽契約、證件建檔或帳號遭警示時，部分功能（含進場）可能暫時無法使用。</p>
           </div>
         )}
       </Modal>

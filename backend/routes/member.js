@@ -14,16 +14,13 @@ import {
 } from '../lib/memberContract.js';
 import { assertMemberReadyToBind } from '../lib/memberOnboardingGate.js';
 import { normalizePhone } from '../lib/memberIdentify.js';
-import { listTrainerTimeOffs, assertTrainerNotOnTimeOff } from '../lib/trainerTimeOff.js';
+import { listTrainerTimeOffs, assertTrainerBookable } from '../lib/trainerTimeOff.js';
 import { notifyClassBooked } from '../lib/lineNotify.js';
 import { memberBranchLabel } from '../lib/branchLabel.js';
 import { resolveDisplayName } from '../lib/displayName.js';
 import {
-  assertGroupClassVenueAllowed,
   assertPrivateVenueAllowed,
-  isClassVenueAllowed,
   isPrivateVenueAllowed,
-  resolveMemberFacilityBranches,
   resolvePrivateVenueBranchIds,
 } from '../lib/branchShare.js';
 import { resolveTopupOrderId } from '../lib/orderIds.js';
@@ -679,6 +676,7 @@ router.post('/orders', async (req, res) => {
           itemDesc: buildTopupItemDesc(promotion, '線上'),
           payMethod: 'LINEPAY',
           payBreakdown: { LINEPAY: promotion.price },
+          branchId: promotion.branchId ?? null,
           cardAmount: 0,
           cardMode: 'LUMP',
           status: 'PENDING',
@@ -762,6 +760,7 @@ router.post('/orders', async (req, res) => {
         itemDesc: buildTopupItemDesc(promotion, '線上'),
         payMethod: 'CARD',
         cardAmount: promotion.price,
+        branchId: promotion.branchId ?? null,
         cardMode: cardOpts.cardMode,
         cardInst: cardOpts.cardInst,
         periodType: cardOpts.periodType,
@@ -840,7 +839,7 @@ function serializeMemberClass(row, memberId) {
   };
 }
 
-// GET /api/member/classes — 可預約課程（團課＋自己私教／諮詢；受購買分店限制）
+// GET /api/member/classes — 可預約課程（自己私教／諮詢；團課改走 /api/member/group 付費報名）
 router.get('/classes', async (req, res) => {
   const memberId = req.user.memberId;
   try {
@@ -848,19 +847,16 @@ router.get('/classes', async (req, res) => {
     const days = Math.min(Math.max(parseInt(req.query.days, 10) || 14, 1), 60);
     const horizon = new Date(now.getTime() + days * 24 * 60 * 60 * 1000);
 
-    const [ptRows, facilityBranches] = await Promise.all([
-      prisma.pTContract.findMany({
-        where: { memberId, isActive: true },
-        select: {
-          trainerId: true,
-          branchId: true,
-          totalSessions: true,
-          usedSessions: true,
-          branch: { select: { id: true, name: true, code: true } },
-        },
-      }),
-      resolveMemberFacilityBranches(memberId),
-    ]);
+    const ptRows = await prisma.pTContract.findMany({
+      where: { memberId, isActive: true },
+      select: {
+        trainerId: true,
+        branchId: true,
+        totalSessions: true,
+        usedSessions: true,
+        branch: { select: { id: true, name: true, code: true } },
+      },
+    });
 
     const activePts = ptRows.filter(
       (p) => (p.usedSessions || 0) < (p.totalSessions || 0),
@@ -873,17 +869,12 @@ router.get('/classes', async (req, res) => {
       const ids = await resolvePrivateVenueBranchIds(p.branchId);
       for (const id of ids) privateBranchIdSet.add(id);
     }
-    const facilityBranchIds = new Set(facilityBranches.map((b) => b.id));
 
     const classes = await prisma.class.findMany({
       where: {
         startAt: { gte: now, lte: horizon },
-        OR: [
-          { type: 'GROUP' },
-          ...(ptTrainerIds.length
-            ? [{ type: { in: ['PRIVATE', 'CONSULT'] }, trainerId: { in: ptTrainerIds } }]
-            : []),
-        ],
+        type: { in: ['PRIVATE', 'CONSULT'] },
+        trainerId: { in: ptTrainerIds },
       },
       include: {
         trainer: { select: { id: true, name: true, displayName: true } },
@@ -901,10 +892,6 @@ router.get('/classes', async (req, res) => {
     const filtered = classes.filter((c) => {
       const venueBranch = c.venue?.branch;
       if (!venueBranch) return false;
-      if (c.type === 'GROUP') {
-        if (facilityBranchIds.size === 0) return true; // 無購案紀錄：相容舊資料
-        return isClassVenueAllowed(facilityBranches, venueBranch);
-      }
       if (c.type === 'PRIVATE' || c.type === 'CONSULT') {
         const ptsForTrainer = activePts.filter((p) => p.trainerId === c.trainerId);
         if (ptsForTrainer.length === 0) return false;
@@ -975,7 +962,8 @@ router.get('/reservations', async (req, res) => {
           : null,
         canCancel:
           ['PENDING', 'CONFIRMED'].includes(r.status) &&
-          r.class &&
+          Boolean(r.class) &&
+          r.class.type !== 'GROUP' &&
           new Date(r.class.startAt) > now,
       })),
     });
@@ -1040,10 +1028,10 @@ router.post('/book-class', async (req, res) => {
       }
 
       if (targetClass.type === 'GROUP') {
-        const facilityBranches = await resolveMemberFacilityBranches(memberId, tx);
-        if (facilityBranches.length > 0) {
-          assertGroupClassVenueAllowed(facilityBranches, targetClass.venue?.branch);
-        }
+        const err = new Error('團課為付費期班，請至「團課」頁報名整期或單堂');
+        err.statusCode = 409;
+        err.code = 'GROUP_ENROLL_REQUIRED';
+        throw err;
       } else if (targetClass.type === 'PRIVATE' || targetClass.type === 'CONSULT') {
         const pt = await tx.pTContract.findFirst({
           where: {
@@ -1072,7 +1060,7 @@ router.post('/book-class', async (req, res) => {
         throw err;
       }
 
-      await assertTrainerNotOnTimeOff(
+      await assertTrainerBookable(
         tx,
         targetClass.trainerId,
         targetClass.startAt,
@@ -1138,10 +1126,14 @@ router.post('/book-class', async (req, res) => {
       },
     });
   } catch (error) {
-    console.error(error);
     if (error.statusCode) {
-      return res.status(error.statusCode).json({ status: 'error', message: error.message });
+      return res.status(error.statusCode).json({
+        status: 'error',
+        ...(error.code ? { code: error.code } : {}),
+        message: error.message,
+      });
     }
+    console.error(error);
     res.status(500).json({ status: 'error', message: '預約失敗' });
   }
 });
@@ -1160,6 +1152,13 @@ router.post('/reservations/:id/cancel', async (req, res) => {
     }
     if (!['PENDING', 'CONFIRMED'].includes(row.status)) {
       return res.status(400).json({ status: 'error', message: '此預約狀態無法取消' });
+    }
+    if (row.enrollmentId || row.makeupCreditId) {
+      return res.status(409).json({
+        status: 'error',
+        code: 'USE_GROUP_LEAVE',
+        message: '團課預約請至「團課」頁辦理請假（開課前 24 小時可取得補課）；退費請洽櫃檯',
+      });
     }
     if (new Date(row.class.startAt) <= new Date()) {
       return res.status(400).json({ status: 'error', message: '課程已開始，無法取消' });

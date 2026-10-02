@@ -1,5 +1,10 @@
+import type { EmploymentType, LeaveType } from '../lib/laborLaw';
+import type { BranchType, TrainerLevel } from '../lib/orgStructure';
+import type { StaffPermission, StaffRole } from '../lib/storage';
+
 export interface ApiResponse<T = unknown> {
   status: 'success' | 'error';
+  code?: string;
   message?: string;
   data?: T;
 }
@@ -392,6 +397,10 @@ export interface CoursePlan {
   price: number;
   sessions?: number | null;
   capacity?: number | null;
+  /** GROUP：單堂插班價（null＝不開放單堂） */
+  dropInPrice?: number | null;
+  /** GROUP：最低開班人數 */
+  minEnrollment?: number | null;
   description?: string | null;
   requiresMemberContract?: boolean;
   enableCardRecurring?: boolean;
@@ -428,12 +437,16 @@ export interface Branch {
   /** 員工端關聯顯示用代碼；會員介面仍用 name */
   code?: string | null;
   address: string | null;
-  /** 折讓單／發票列印營業人名稱；未設則回退環境變數 */
-  invoiceSellerName?: string | null;
-  /** 折讓單抬頭統編（8 碼） */
-  invoiceSellerUbn?: string | null;
+  /** 所屬營業人（獨立統編／ezPay 商店）；發票由提供服務之分店營業人開立 */
+  legalEntityId?: number | null;
+  legalEntity?: LegalEntityRef | null;
+  /** 分店類型（規則見 lib/orgStructure.ts） */
+  type?: BranchType;
+  /** 隸屬上層分店（僅 CLASS → GYM） */
+  parentId?: number | null;
+  parent?: { id: number; name: string; code?: string | null; type?: BranchType } | null;
   isActive: boolean;
-  _count?: { venues: number; promotions: number; trainers: number };
+  _count?: { venues: number; promotions: number; trainers: number; children?: number };
 }
 
 /** 進出場閘機裝置（綁定分店） */
@@ -465,7 +478,7 @@ export interface Venue {
   id: number;
   name: string;
   branchId: number;
-  branch?: { id: number; name: string; code?: string | null };
+  branch?: { id: number; name: string; code?: string | null; parentId?: number | null };
   /** 場地下可選站點（A~E、外區等） */
   stations?: VenueStation[];
 }
@@ -478,6 +491,7 @@ export interface Trainer {
   phone?: string;
   expertise?: string;
   role?: string;
+  level?: TrainerLevel;
   isActive?: boolean;
   staffId?: number | null;
   staff?: {
@@ -612,6 +626,244 @@ export interface MemberReservation {
   } | null;
 }
 
+// ── 團課（付費期班）：金額／名額／可否請假一律由後端計算 ──
+export type GroupEnrollKind = 'TERM' | 'DROP_IN';
+
+export interface GroupTermQuote {
+  price: number;
+  sessions: number;
+  unitPrice: number;
+  prorated: boolean;
+}
+
+export interface GroupWaitlistMine {
+  id: number;
+  status: 'WAITING' | 'OFFERED' | string;
+  offerExpiresAt?: string | null;
+}
+
+export interface GroupSeriesBase {
+  id: number;
+  title: string;
+  coursePlanId: number | null;
+  coursePlanName?: string | null;
+  requiresMemberContract?: boolean;
+  startDate: string;
+  endDate: string;
+  weekdays: number[];
+  weekdaysLabel: string;
+  startTime: string;
+  endTime: string;
+  capacity: number;
+  termPrice: number | null;
+  dropInPrice: number | null;
+  sessionCount: number | null;
+  minEnrollment: number;
+  enrollDeadline: string | null;
+  status: 'OPEN' | 'CANCELLED' | string;
+  sellable: boolean;
+  branchId: number | null;
+  branchName?: string | null;
+  venueName?: string | null;
+  stationName?: string | null;
+  trainerId: number;
+  trainerName?: string | null;
+}
+
+export interface GroupSellableSeries extends GroupSeriesBase {
+  remainingSessions: number;
+  nextClassAt: string | null;
+  termQuote: GroupTermQuote | null;
+  seatsLeft: number;
+  waitingCount: number;
+  enrolledCount: number;
+  myEnrollment: { id: number; status: string } | null;
+  myWaitlist: GroupWaitlistMine | null;
+}
+
+export interface GroupSeriesClass {
+  id: number;
+  startAt: string;
+  endAt: string;
+  capacity: number;
+  booked: number;
+  upcoming: boolean;
+  dropInSeats: number;
+  mine: boolean;
+}
+
+export interface GroupSeriesDetail extends GroupSeriesBase {
+  remainingSessions: number;
+  termQuote: GroupTermQuote | null;
+  seatsLeft: number;
+  waitingCount: number;
+  myWaitlist: GroupWaitlistMine | null;
+  classes: GroupSeriesClass[];
+}
+
+export interface GroupEnrollmentReservation {
+  id: number;
+  status: string;
+  classId: number;
+  startAt: string;
+  endAt: string;
+  canLeave: boolean;
+}
+
+export interface GroupMyEnrollment {
+  id: number;
+  kind: GroupEnrollKind;
+  status: 'PENDING' | 'ACTIVE' | 'REFUNDED' | string;
+  price: number;
+  sessionsTotal: number;
+  source: 'POS' | 'ONLINE' | string;
+  paidAt: string | null;
+  holdExpiresAt: string | null;
+  refundAmount: number | null;
+  refundedAt: string | null;
+  series: GroupSeriesBase;
+  reservations: GroupEnrollmentReservation[];
+}
+
+export interface GroupMyWaitlist {
+  id: number;
+  status: 'WAITING' | 'OFFERED' | string;
+  seriesId: number;
+  seriesTitle: string;
+  startDate: string;
+  position: number | null;
+  offerExpiresAt: string | null;
+}
+
+export interface GroupMakeupCredit {
+  id: number;
+  status: 'AVAILABLE' | 'USED' | string;
+  expiresAt: string;
+  sourceSeriesTitle: string | null;
+  usedReservation: {
+    id: number;
+    status: string;
+    title: string;
+    startAt: string;
+    canLeave: boolean;
+  } | null;
+}
+
+export interface GroupMemberOverview {
+  enrollments: GroupMyEnrollment[];
+  waitlist: GroupMyWaitlist[];
+  makeupCredits: GroupMakeupCredit[];
+}
+
+export interface GroupMakeupOption {
+  classId: number;
+  seriesId: number;
+  seriesTitle: string;
+  startAt: string;
+  endAt: string;
+  seats: number;
+  branchName?: string | null;
+  venueName?: string | null;
+  trainerName?: string | null;
+}
+
+export interface GroupEnrollResult {
+  payMethod: 'CARD' | 'LINEPAY';
+  actionUrl?: string;
+  payload?: Record<string, string>;
+  paymentUrl?: string;
+  orderId: string;
+  enrollmentId: number;
+  amount: number;
+  sessions: number;
+  prorated: boolean;
+  holdExpiresAt: string | null;
+}
+
+export interface GroupRefundPreview {
+  enrollmentId: number;
+  kind: GroupEnrollKind;
+  seriesId: number;
+  seriesTitle: string;
+  seriesCancelled: boolean;
+  memberId: number;
+  memberName: string | null;
+  orderId: string;
+  price: number;
+  unitPrice: number;
+  sessionsTotal: number;
+  consumedSessions: number;
+  paidAt: string | null;
+  refundable: boolean;
+  refundKind: 'COOLING_OFF' | 'STANDARD' | 'SERIES_CANCELLED' | 'DROP_IN' | string | null;
+  refundAmount: number;
+  fee: number;
+  consumedValue: number;
+  unfulfilled: number;
+  blockCode: string | null;
+  blockMessage: string | null;
+  channels: { WALLET_CASH: number; LINEPAY: number; MANUAL: number };
+  invoice: { plan: string; invoiceNumber: string | null };
+}
+
+export interface GroupAdminSeries extends GroupSeriesBase {
+  classCount: number;
+  termActive: number;
+  termPending: number;
+  dropInActive: number;
+  refunded: number;
+  waiting: number;
+  offered: number;
+  belowMinimum: boolean;
+  deadlinePassed: boolean;
+  needsDecision: boolean;
+  cancelledAt: string | null;
+  cancelReason: string | null;
+}
+
+export interface GroupSeriesRoster {
+  series: GroupSeriesBase;
+  seatsLeft: number;
+  classes: { id: number; startAt: string; endAt: string; capacity: number; booked: number; attended: number }[];
+  enrollments: {
+    id: number;
+    kind: GroupEnrollKind;
+    status: string;
+    classId: number | null;
+    price: number;
+    sessionsTotal: number;
+    source: string;
+    paidAt: string | null;
+    holdExpiresAt: string | null;
+    refundAmount: number | null;
+    refundKind: string | null;
+    memberId: number;
+    memberName: string | null;
+    memberNo: string | null;
+  }[];
+  waitlist: {
+    id: number;
+    status: string;
+    memberId: number;
+    memberName: string | null;
+    memberNo: string | null;
+    createdAt: string;
+    offerExpiresAt: string | null;
+  }[];
+}
+
+export interface GroupCoursePlanOption {
+  id: number;
+  name: string;
+  branchId: number;
+  branchName?: string | null;
+  price: number;
+  dropInPrice: number | null;
+  sessions: number | null;
+  capacity: number | null;
+  minEnrollment: number | null;
+}
+
 export interface TrainerTimeOff {
   id: number;
   trainerId: number;
@@ -644,6 +896,10 @@ export interface TrainerDashboardData {
   inbox?: TrainerInboxItem[];
   timeOffs?: TrainerTimeOff[];
   timeOffReasons?: string[];
+  /** 已綁定在職員工（僱傭關係）才可排課 */
+  employed?: boolean;
+  /** 未來 14 日已生效出勤時段（可預約時段＝出勤 − 請假 − 不開放預約） */
+  workSlots?: { id: number; startAt: string; endAt: string; branchId: number | null }[];
   stats: {
     todayClasses: number;
     upcomingClasses: number;
@@ -677,50 +933,358 @@ export interface OpsActiveCheckIn {
   branchLabel?: string | null;
 }
 
+/** POS 可售商品（`GET /ops/products`：分店上架中＋分店庫存／售價） */
 export interface Product {
   id: number;
   branchId: number;
   sku: string;
+  barcode?: string | null;
   name: string;
   /** PHYSICAL=實體控庫存 | SERVICE=服務類不控庫存 */
-  productKind?: 'PHYSICAL' | 'SERVICE' | string;
+  productKind?: ProductKind | string;
+  taxType?: TaxType | string;
   price: number;
-  cost?: number;
   stockQty: number;
-  /** 僅 PHYSICAL；null=關閉安全庫存預警 */
   safetyStock?: number | null;
   isActive?: boolean;
-  branch?: { id: number; name: string; code?: string | null };
+}
+
+export type ProductKind = 'PHYSICAL' | 'SERVICE';
+/** 課稅別：應稅 5%／零稅率／免稅 */
+export type TaxType = 'TAXABLE' | 'ZERO' | 'FREE';
+
+export interface LegalEntityRef {
+  id: number;
+  code: string;
+  name: string;
+  ubn?: string;
+  isActive?: boolean;
+}
+
+/** 營業人（獨立統編＝獨立 ezPay 商店）；HashKey／IV 僅存後端 env，API 不回傳 */
+export interface LegalEntity extends LegalEntityRef {
+  ubn: string;
+  address: string | null;
+  phone: string | null;
+  ezpayMerchantId: string | null;
+  isActive: boolean;
+  /** 後端檢查 env 金鑰是否齊備（只回缺漏的變數名稱） */
+  ezpay: { configured: boolean; missing: string[]; merchantId: string | null };
+  branches?: { id: number; name: string; code: string | null; type: BranchType; isActive: boolean }[];
+}
+
+/** 商品主檔（全公司共用 SKU；庫存／成本在分店層） */
+export interface ProductMaster {
+  id: number;
+  sku: string;
+  barcode: string | null;
+  name: string;
+  invoiceName: string | null;
+  unit: string;
+  productKind: ProductKind;
+  taxType: TaxType;
+  listPrice: number;
+  isActive: boolean;
+  totalOnHand: number;
+  listedBranchIds: number[];
+}
+
+/** 分店庫存列（avgCost 為驗收移動平均，後端計算） */
+export interface BranchStockRow {
+  id: number;
+  branchId: number;
+  branch: { id: number; name: string; code: string | null } | null;
+  productId: number;
+  sku: string;
+  barcode: string | null;
+  name: string;
+  unit: string;
+  productKind: ProductKind;
+  taxType: TaxType;
+  listPrice: number;
+  salePrice: number | null;
+  price: number;
+  onHand: number;
+  avgCost: number;
+  stockValue: number;
+  safetyStock: number | null;
+  lowStock: boolean;
+  isListed: boolean;
+  productActive: boolean;
+  updatedAt: string;
 }
 
 export interface StockMovement {
   id: number;
+  branchId: number;
   productId: number;
-  type: string;
-  qty: number;
-  unitCost?: number | null;
-  refType?: string | null;
-  refId?: string | null;
-  note?: string | null;
-  staffId?: number | null;
+  qtyDelta: number;
+  balanceAfter: number;
+  unitCost: number | null;
+  /** OPENING／RECEIPT／SALE／SALE_CANCEL／LOSS／GAIN／STOCKTAKE／TRANSFER_IN／TRANSFER_OUT… */
+  refType: string;
+  refId: string | null;
+  reason: string | null;
+  staffId: number | null;
   createdAt: string;
-  product?: { id: number; sku: string; name: string; branchId: number };
+  product?: { id: number; sku: string; name: string };
+  branch?: { id: number; name: string; code: string | null };
+}
+
+export type SupplierPaymentTerm = 'NET' | 'EOM' | 'COD';
+
+export interface Supplier {
+  id: number;
+  name: string;
+  ubn: string | null;
+  contactName: string | null;
+  phone: string | null;
+  email: string | null;
+  address: string | null;
+  paymentTermType: SupplierPaymentTerm;
+  paymentTermDays: number;
+  note: string | null;
+  isActive: boolean;
+}
+
+export type PurchaseOrderStatus = 'DRAFT' | 'ORDERED' | 'PARTIAL' | 'RECEIVED' | 'CLOSED' | 'CANCELLED';
+
+export interface PurchaseOrderItem {
+  id: number;
+  productId: number;
+  qtyOrdered: number;
+  qtyReceived: number;
+  unitCost: number;
+  taxType: TaxType;
+  product?: { id: number; sku: string; name: string; unit: string };
 }
 
 export interface PurchaseOrder {
   id: string;
+  legalEntityId: number;
   branchId: number;
-  supplier: string | null;
-  status: string;
-  totalCost: number;
+  supplierId: number;
+  status: PurchaseOrderStatus;
+  expectedAt: string | null;
+  subtotal: number;
+  taxAmount: number;
+  total: number;
+  note: string | null;
+  orderedAt: string | null;
+  closedAt: string | null;
+  cancelReason: string | null;
   createdAt: string;
-  items?: {
-    productId: number;
-    qty: number;
-    unitCost: number;
-    lineCost: number;
-    product?: { id: number; name: string; sku: string };
-  }[];
+  items: PurchaseOrderItem[];
+  supplier?: { id: number; name: string; ubn: string | null };
+  branch?: { id: number; name: string; code: string | null };
+  legalEntity?: LegalEntityRef;
+  receipts?: { id: string; receivedAt: string; total: number; supplierInvoiceNo: string | null }[];
+}
+
+export interface PurchaseReceipt {
+  id: string;
+  purchaseOrderId: string | null;
+  branchId: number;
+  supplierId: number;
+  supplierInvoiceNo: string | null;
+  supplierInvoiceDate: string | null;
+  subtotal: number;
+  taxAmount: number;
+  total: number;
+  receivedAt: string;
+  note: string | null;
+  items: { id: number; productId: number; qty: number; unitCost: number; product?: { id: number; sku: string; name: string; unit?: string } }[];
+  supplier?: { id: number; name: string };
+  branch?: { id: number; name: string; code: string | null };
+  legalEntity?: LegalEntityRef;
+  payable?: { id: string; status: string; amount: number; paidAmount: number; dueDate: string } | null;
+}
+
+/** 門市驗收紀錄（不含金額） */
+export interface OpsReceiptRow {
+  id: string;
+  purchaseOrderId: string | null;
+  branch: { id: number; name: string; code: string | null };
+  supplier: { id: number; name: string };
+  supplierInvoiceNo: string | null;
+  receivedAt: string;
+  note: string | null;
+  items: { productId: number; product: { id: number; sku: string; name: string }; qty: number }[];
+}
+
+export type PayableStatus = 'OPEN' | 'PARTIAL' | 'PAID' | 'VOID';
+
+export interface SupplierPayable {
+  id: string;
+  legalEntityId: number;
+  supplierId: number;
+  receiptId: string | null;
+  type: string;
+  supplierInvoiceNo: string | null;
+  amount: number;
+  paidAmount: number;
+  dueDate: string;
+  status: PayableStatus;
+  note: string | null;
+  voidReason: string | null;
+  createdAt: string;
+  openAmount: number;
+  overdueDays: number;
+  supplier?: { id: number; name: string };
+  legalEntity?: LegalEntityRef;
+  receipt?: { id: string; receivedAt: string; purchaseOrderId: string | null; branchId: number } | null;
+}
+
+export interface PayableAgingRow {
+  legalEntity: LegalEntityRef;
+  supplier: { id: number; name: string };
+  notDue: number;
+  d30: number;
+  d60: number;
+  d90: number;
+  over90: number;
+  total: number;
+}
+
+export type SupplierPaymentMethod = 'TRANSFER' | 'CASH' | 'CHECK';
+
+export interface SupplierPayment {
+  id: string;
+  legalEntityId: number;
+  supplierId: number;
+  amount: number;
+  method: SupplierPaymentMethod;
+  paidAt: string;
+  reference: string | null;
+  note: string | null;
+  supplier?: { id: number; name: string };
+  legalEntity?: LegalEntityRef;
+  allocations: { payableId: string; amount: number }[];
+}
+
+export type EInvoiceStatus = 'PENDING' | 'ISSUING' | 'ISSUED' | 'FAILED' | 'VOIDED' | 'CANCELLED';
+
+/** 電子發票（HQ 監控；B2B＝打統編、B2C＝載具／捐贈／紙本） */
+export interface EInvoiceRow {
+  id: string;
+  refType: string;
+  refId: string;
+  leg: string | null;
+  amount: number;
+  itemDesc: string | null;
+  category: 'B2B' | 'B2C';
+  /** 佇列相容狀態：SUCCESS／PENDING／FAILED… */
+  status: string;
+  einvoiceStatus: EInvoiceStatus;
+  retryCount: number;
+  nextRetryAt: string | null;
+  lastError: string | null;
+  invoiceNumber: string | null;
+  checkoutId: string | null;
+  branchId: number | null;
+  legalEntity: LegalEntityRef | null;
+  createdAt: string;
+  updatedAt: string;
+  merchantOrderNo: string;
+  buyerUbn: string | null;
+  buyerName: string | null;
+  carrierType: string | null;
+  printFlag: string | null;
+  taxType: string | null;
+  salesAmount: number;
+  taxAmount: number;
+  allowanceTotal: number;
+  issuedAt: string | null;
+  periodKey: string | null;
+  voidReason: string | null;
+}
+
+/** ezPay 呼叫紀錄（後端 EInvoiceLog，唯讀） */
+export interface EInvoiceLogRow {
+  id: number;
+  einvoiceId: string | null;
+  refId: string | null;
+  leg: string | null;
+  merchantOrderNo: string | null;
+  totalAmount: number | null;
+  einvoiceStatus: EInvoiceStatus | null;
+  legalEntityId: number | null;
+  merchantId: string | null;
+  action: 'ISSUE' | 'RECOVER' | 'VOID' | 'ALLOWANCE';
+  result: 'SUCCESS' | 'FAILED' | 'NOT_FOUND';
+  attempt: number | null;
+  manual: boolean;
+  staffId: number | null;
+  errorCode: string | null;
+  ezpayStatus: string | null;
+  message: string | null;
+  invoiceNumber: string | null;
+  durationMs: number | null;
+  createdAt: string;
+}
+
+/** 門市銷貨對帳（後端計算；前端只組 Excel／CSV） */
+export interface ReconColumn {
+  key: string;
+  label: string;
+  type: 'text' | 'int' | 'money';
+}
+
+export type ReconCell = string | number | boolean | null;
+
+export interface ReconTotals {
+  salesAmount: number;
+  taxAmount: number;
+  totalAmount: number;
+  qty: number;
+  lines: number;
+}
+
+export interface ReconAmounts {
+  count: number;
+  salesAmount: number;
+  taxAmount: number;
+  totalAmount: number;
+}
+
+export interface SalesReconciliation {
+  range: { from: string; to: string; days: number };
+  branch: { id: number; name: string; code: string | null } | null;
+  legalEntities: Array<{ id: number; code: string; name: string; ubn: string }>;
+  generatedAt: string;
+  /** 商品銷貨明細（依銷貨日期） */
+  columns: ReconColumn[];
+  rows: Array<Record<string, ReconCell>>;
+  /** 門市全部發票（所有來源，依開立日期；含本期作廢與待開立） */
+  invoiceColumns: ReconColumn[];
+  invoices: Array<Record<string, ReconCell>>;
+  invoiceItemColumns: ReconColumn[];
+  invoiceItems: Array<Record<string, ReconCell>>;
+  allowanceColumns: ReconColumn[];
+  allowances: Array<Record<string, ReconCell>>;
+  summary: {
+    orderCount: number;
+    cancelledOrderCount: number;
+    valid: ReconTotals;
+    cancelled: ReconTotals;
+    byTaxType: { TAXABLE: ReconTotals; TAX_FREE: ReconTotals };
+    uninvoiced: { count: number; totalAmount: number; saleIds: string[] };
+    orderAmountMismatch: number;
+    invoices: {
+      /** 本期開立（含後續作廢） */
+      issuedAll: ReconAmounts;
+      /** 本期開立且有效 */
+      effective: ReconAmounts;
+      /** 本期作廢（含前期開立） */
+      voided: ReconAmounts;
+      /** 開立失敗／待開立 */
+      pending: ReconAmounts;
+      allowance: ReconAmounts;
+      net: { salesAmount: number; taxAmount: number; totalAmount: number };
+      byTaxType: { TAXABLE: ReconAmounts; TAX_FREE: ReconAmounts };
+      bySource: Array<ReconAmounts & { code: string; label: string }>;
+    };
+  };
 }
 
 export type PosPayMethod = 'CASH' | 'CARD' | 'YIPAY' | 'LINEPAY' | 'WALLET_CASH' | 'VOUCHER';
@@ -739,9 +1303,39 @@ export interface PosCheckoutResult {
   member?: { id: number; name: string; cashWallet: number } | null;
 }
 
-export type StaffPermission = 'ops' | 'pt' | 'trainer';
+export type { StaffPermission, StaffRole };
 
-export type StaffRole = 'STAFF' | 'DUTY' | 'MANAGER' | 'ADMIN';
+export interface StaffAvatar {
+  dataUrl: string;
+  photoUpdatedAt: string | null;
+}
+
+export interface StaffConsentTemplate {
+  kind: 'BIOMETRICS';
+  version: string;
+  title: string;
+  body: string;
+  bodyHash: string;
+}
+
+export interface StaffFaceConsent {
+  id: number;
+  version: string;
+  signerName: string;
+  signedAt: string;
+  witnessName: string | null;
+  signatureData?: string;
+  /** false＝條文已升版，須重簽才可註冊人臉 */
+  current: boolean;
+}
+
+export interface StaffPhotoStatus {
+  id: number;
+  photoUpdatedAt: string | null;
+  faceEnrolledAt: string | null;
+  faceConsentAt: string | null;
+  warning?: string | null;
+}
 
 export interface StaffAccount {
   id: number;
@@ -753,7 +1347,27 @@ export interface StaffAccount {
   permissions: StaffPermission[];
   isActive: boolean;
   createdAt: string;
-  branch?: { id: number; name: string } | null;
+  /** 頭像版本（null＝無照片） */
+  photoUpdatedAt?: string | null;
+  /** 已註冊 Face8 員工人臉 */
+  faceEnrolledAt?: string | null;
+  /** 已記錄生物辨識書面同意 */
+  faceConsentAt?: string | null;
+  employmentType?: EmploymentType;
+  /** 到職日 YYYY-MM-DD */
+  hireDate?: string | null;
+  /** 約定每週工時（兼職／實習） */
+  weeklyHours?: number | null;
+  /** 實習無勞雇關係者 false */
+  laborActApplies?: boolean;
+  leaveBalance?: StaffLeaveBalance | null;
+  branch?: {
+    id: number;
+    name: string;
+    code?: string | null;
+    type?: BranchType;
+    parentId?: number | null;
+  } | null;
 }
 
 export interface MemberIdentifyResult {
@@ -883,14 +1497,579 @@ export interface StaffAttendanceRow {
   staff?: { id: number; name: string; displayName?: string | null; role?: string };
 }
 
+/** 後端 laborLaw.computeLeaveBalances 結果 */
+export interface StaffLeaveBalance {
+  employmentType: EmploymentType;
+  hireDate: string | null;
+  /** 工時比例（正職 1；兼職＝週工時／40；無勞雇關係實習 0） */
+  ratio: number;
+  laborActApplies: boolean;
+  seniority: { years: number; months: number; days: number; totalMonths: number; started: boolean } | null;
+  annualLeave: {
+    eligible: boolean;
+    periodStart: string | null;
+    periodEnd: string | null;
+    days: number;
+    nextGrantDate: string;
+    nextGrantDays: number;
+    entitledHours: number;
+    usedHours: number;
+    unit: 'DAY' | 'HOUR';
+  } | null;
+  nationalHoliday: {
+    year: number;
+    /** null＝部分工時，依約定工作日 */
+    entitledDays: number | null;
+    usedDays: number;
+    basis: 'CALENDAR' | 'SCHEDULED_WORKDAY';
+  } | null;
+}
+
+export type RosterCellCode = 'MORNING' | 'EVENING' | 'REGULAR_OFF' | 'REST_DAY' | 'OFF';
+
+export interface RosterIssue {
+  level: 'ERROR' | 'WARNING' | 'INFO';
+  code: string;
+  message: string;
+  date?: string;
+}
+
+export interface RosterStaffRow {
+  id: number;
+  name: string;
+  displayName?: string | null;
+  role: string;
+  /** STORE 場務 | INTERN_TRAINER 實習教練 | FREE_TRAINER 已轉正（週班表提報、FM／店長核准） */
+  rosterRole: 'STORE' | 'INTERN_TRAINER' | 'FREE_TRAINER' | null;
+  rosterRoleLabel: string;
+  employmentType: EmploymentType;
+  weeklyHours: number | null;
+  laborActApplies: boolean;
+  /** 本期可排班數上限 */
+  capacity: number;
+  cells: Record<string, RosterCellCode>;
+  leaveDays: string[];
+  offRequest: RosterOffRequest | null;
+  /** 已發布版本之確認回覆；null＝未回覆或未發布 */
+  ack: {
+    status: RosterAckStatus;
+    message: string | null;
+    respondedAt: string;
+    late: boolean;
+    /** 逾期未回覆由系統自動視為同意 */
+    autoConfirmed: boolean;
+  } | null;
+  stats: {
+    workDays: number;
+    workHours: number;
+    regularOff: [number, number];
+    restDays: number;
+    offDays: number;
+    leaveDays: number;
+    unassigned: number;
+    holidaysWorked: number;
+    requestedOff: number;
+    requestedOffUnmet: number;
+    maxConsecutive: number;
+  };
+  issues: RosterIssue[];
+}
+
+export interface RosterView {
+  branch: { id: number; name: string; code?: string | null };
+  config: { cycleAnchorDate: string; requirement: { MORNING: number; EVENING: number } } | null;
+  cycle: {
+    startDate: string;
+    endDate: string;
+    /** 排假截止日（每期開始前 14 日，含當日） */
+    offRequestDeadline: string;
+    prevStartDate: string;
+    nextStartDate: string;
+    days: { date: string; weekday: number; holiday: string | null }[];
+  };
+  period: { id: number; status: 'DRAFT' | 'PUBLISHED'; publishedAt: string | null; note: string | null } | null;
+  requirement: { MORNING: number; EVENING: number };
+  staff: RosterStaffRow[];
+  coverage: { date: string; MORNING: number; EVENING: number }[];
+  issues: RosterIssue[];
+  summary: {
+    errors: number;
+    warnings: number;
+    offRequests: { submitted: number; total: number };
+    /** 發布後才有：員工 72 小時內確認回覆統計 */
+    acks: {
+      deadline: string;
+      hours: number;
+      total: number;
+      confirmed: number;
+      autoConfirmed: number;
+      disputed: number;
+      pending: number;
+      overdue: boolean;
+    } | null;
+  };
+}
+
+export type RosterAckStatus = 'CONFIRMED' | 'DISPUTED';
+
+export interface RosterOffRequest {
+  dates: string[];
+  note: string | null;
+  submittedAt: string;
+  updatedAt: string;
+}
+
+export interface MyRosterCycle {
+  startDate: string;
+  endDate: string;
+  days: RosterView['cycle']['days'];
+  period: { status: 'DRAFT' | 'PUBLISHED'; publishedAt: string | null } | null;
+  offRequestDeadline: string;
+  /** 排假不可再改（已過截止日或已發布） */
+  locked: boolean;
+  ack: {
+    deadline: string;
+    status: RosterAckStatus | 'PENDING';
+    message: string | null;
+    respondedAt: string | null;
+    overdue: boolean;
+    late: boolean;
+    autoConfirmed: boolean;
+  } | null;
+  request: RosterOffRequest | null;
+  cells: Record<string, RosterCellCode>;
+  leaveDays: string[];
+}
+
+export interface MyRosterOverview {
+  rosterRole: RosterStaffRow['rosterRole'];
+  rosterRoleLabel: string | null;
+  /** 週班表對象（轉正教練／店長・GM・FM）；null＝四週排班或免排班 */
+  weekPlanRole: WeekPlanRole | null;
+  eligible: boolean;
+  maxOffDays: number;
+  offRequestDeadlineDays: number;
+  ackHours: number;
+  branch: { id: number; name: string; code?: string | null } | null;
+  configured: boolean;
+  cycles: MyRosterCycle[];
+}
+
+export interface RosterBranchConfig {
+  branchId: number;
+  name: string;
+  code?: string | null;
+  config: RosterView['config'];
+}
+
+export interface PublicHoliday {
+  id: number;
+  date: string;
+  name: string;
+  /** 0＝週日 */
+  weekday: number;
+  past: boolean;
+}
+
+export interface HolidayCalendar {
+  year: number;
+  holidays: PublicHoliday[];
+  /** 內建預設中該年尚未建立之筆數 */
+  missingDefaults: number;
+  defaultYears: number[];
+}
+
+type HrStaffRef = { id: number; name: string; displayName?: string | null; role?: StaffRole; branchId?: number | null };
+
+/** 考勤／請假比對用之班次摘要 */
+export interface ScheduleBrief {
+  id: number;
+  branchId: number | null;
+  startAt: string;
+  endAt: string;
+  label: string;
+  source: ScheduleSource;
+}
+
+export type LeaveStatus = 'PENDING' | 'APPROVED' | 'REJECTED' | 'CANCELLED';
+
 export interface StaffLeaveRow {
   id: number;
   staffId: number;
+  staff: HrStaffRef | null;
+  leaveType: LeaveType;
+  leaveTypeLabel: string;
   startAt: string;
   endAt: string;
-  status: string;
-  reason?: string | null;
-  staff?: { id: number; name: string; displayName?: string | null };
+  hours: number | null;
+  reason: string | null;
+  status: LeaveStatus;
+  statusLabel: string;
+  createdAt: string;
+  requestedBySelf: boolean;
+  review: { at: string; byStaffId: number | null; note: string | null } | null;
+  /** 與請假重疊之已生效出勤班次 */
+  conflicts: ScheduleBrief[];
+}
+
+export interface LeaveOverview {
+  counts: Record<LeaveStatus, number>;
+  truncated: boolean;
+  rows: StaffLeaveRow[];
+}
+
+export interface MyLeaves {
+  balance: StaffLeaveBalance | null;
+  leaveTypes: { value: LeaveType; label: string }[];
+  rows: StaffLeaveRow[];
+}
+
+export type AttendanceFlag =
+  | 'LATE'
+  | 'EARLY_LEAVE'
+  | 'MISSED_PUNCH_OUT'
+  | 'OPEN'
+  | 'UNSCHEDULED'
+  | 'CORRECTED'
+  | 'BACKFILLED';
+
+export interface AttendanceRecord {
+  id: number;
+  staffId: number;
+  staff: HrStaffRef | null;
+  branchId: number | null;
+  dateKey: string;
+  punchIn: string;
+  punchOut: string | null;
+  workedMinutes: number | null;
+  source: 'SELF' | 'HQ';
+  note: string | null;
+  missedPunchOut: boolean;
+  correction: { at: string; byStaffId: number | null; reason: string | null } | null;
+  schedule: ScheduleBrief | null;
+  /** 打卡時已綁定該班次（否則為舊紀錄就近配對） */
+  scheduleBound?: boolean;
+  flags: AttendanceFlag[];
+  lateMinutes: number;
+  earlyMinutes: number;
+}
+
+/** 班表值勤判定狀態（後端計算）：EXEMPT 管理員免判定／CLOCKED_IN 上班中／IN_WINDOW 值勤窗內未打卡／ON_LEAVE 請假中／BRANCH_SCOPE 班次分店不在登入權限／OFF_SHIFT 非值勤時段 */
+export type StaffDutyState = 'EXEMPT' | 'CLOCKED_IN' | 'IN_WINDOW' | 'ON_LEAVE' | 'BRANCH_SCOPE' | 'OFF_SHIFT';
+
+export interface StaffDutyShift extends ScheduleBrief {
+  branchName: string | null;
+  /** 可打上班卡起點（班次開始前 earlyMinutes 分） */
+  punchInOpensAt: string;
+}
+
+export interface StaffDutyStatus {
+  checkedAt: string;
+  earlyMinutes: number;
+  exempt: boolean;
+  onDuty: boolean;
+  state: StaffDutyState;
+  message: string;
+  shift: StaffDutyShift | null;
+  nextShift: StaffDutyShift | null;
+  open: { id: number; punchIn: string; branchId: number | null; scheduleId: number | null } | null;
+  staleOpen: boolean;
+  canPunchIn: boolean;
+  canPunchOut: boolean;
+  leave: { startAt: string; endAt: string } | null;
+}
+
+export interface AttendanceTally {
+  records: number;
+  workedMinutes: number;
+  late: number;
+  earlyLeave: number;
+  missedPunchOut: number;
+  open: number;
+  unscheduled: number;
+  absent: number;
+  scheduled: number;
+  lateMinutes: number;
+  earlyMinutes: number;
+  unscheduledMinutes: number;
+  absentMinutes: number;
+  scheduledMinutes: number;
+}
+
+export type AttendanceAbsence = ScheduleBrief & { staffId: number; staff: HrStaffRef | null; dateKey: string };
+
+export interface AttendanceOverview {
+  from: string;
+  to: string;
+  graceMinutes: number;
+  truncated: boolean;
+  summary: AttendanceTally;
+  rows: AttendanceRecord[];
+  absences: AttendanceAbsence[];
+  byStaff: (AttendanceTally & { staffId: number; staff: HrStaffRef | null })[];
+}
+
+export interface MyAttendance {
+  now: string;
+  todayKey: string;
+  graceMinutes: number;
+  maxShiftHours: number;
+  open: { id: number; punchIn: string; branchId: number | null; stale: boolean } | null;
+  todayShifts: ScheduleBrief[];
+  nextShift: ScheduleBrief | null;
+  summary: AttendanceTally;
+  recent: AttendanceRecord[];
+  absences: AttendanceAbsence[];
+}
+
+export type StaffNotificationStatus = 'PENDING' | 'SENT' | 'SKIPPED' | 'FAILED';
+
+export interface StaffNotificationItem {
+  id: number;
+  type: string;
+  title: string;
+  body: string;
+  link: string | null;
+  status: StaffNotificationStatus;
+  createdAt: string;
+  sentAt: string | null;
+  readAt: string | null;
+}
+
+export interface StaffNotificationInbox {
+  items: StaffNotificationItem[];
+  unread: number;
+}
+
+export interface StaffLineStatus {
+  bound: boolean;
+  displayName: string | null;
+  boundAt: string | null;
+  notifyEnabled: boolean;
+  loginConfigured: boolean;
+  pushConfigured: boolean;
+}
+
+export interface PayrollColumn {
+  key: string;
+  label: string;
+  numeric?: boolean;
+}
+
+export type PayrollCell = string | number | null;
+
+export interface PayrollTable {
+  columns: PayrollColumn[];
+  rows: Record<string, PayrollCell>[];
+}
+
+export interface PayrollExport {
+  month: string;
+  from: string;
+  to: string;
+  branchId: number | null;
+  branchName: string | null;
+  graceMinutes: number;
+  generatedAt: string;
+  warnings: string[];
+  totals: Record<string, number>;
+  summary: PayrollTable;
+  detail: PayrollTable;
+}
+
+// ── 薪資系統（金額一律後端計算） ──
+export type PayType = 'MONTHLY' | 'HOURLY';
+export type OvertimeKind = 'WEEKDAY' | 'REST_DAY' | 'HOLIDAY' | 'REGULAR_OFF';
+export type PayrollAdjustmentType = 'BONUS' | 'ALLOWANCE' | 'OTHER_EARNING' | 'INCOME_TAX' | 'OTHER_DEDUCTION';
+
+export interface PayrollRateMeta {
+  label: string;
+  min: number;
+  max: number;
+}
+
+export interface PayrollConfigData {
+  rates: Record<string, number>;
+  defaults: Record<string, number>;
+  meta: Record<string, PayrollRateMeta>;
+  updatedAt: string | null;
+  updatedByStaffId: number | null;
+}
+
+export interface PayAllowance {
+  label: string;
+  amount: number;
+}
+
+export interface StaffPayProfileData {
+  payType: PayType;
+  monthlySalary: number | null;
+  hourlyWage: number | null;
+  allowances: PayAllowance[] | null;
+  laborInsuredSalary: number | null;
+  healthInsuredSalary: number | null;
+  healthDependents: number;
+  pensionWage: number | null;
+  pensionSelfRate: number;
+  note?: string | null;
+  updatedAt?: string;
+}
+
+export interface PayProfileRow {
+  staffId: number;
+  account: string;
+  name: string;
+  role: string;
+  position: string;
+  branchId: number | null;
+  branchName: string | null;
+  employmentType: string;
+  employmentLabel: string;
+  weeklyHours: number | null;
+  hireDate: string | null;
+  laborActApplies: boolean;
+  isActive: boolean;
+  profile: StaffPayProfileData | null;
+}
+
+export interface PayProfileList {
+  payTypes: Record<PayType, string>;
+  items: PayProfileRow[];
+}
+
+export interface PayrollWarning {
+  code: string;
+  message: string;
+  blocking?: boolean;
+  staffIds?: number[];
+}
+
+export interface PayrollLine {
+  kind: 'EARNING' | 'DEDUCTION' | 'EMPLOYER';
+  code: string;
+  label: string;
+  amount: number;
+}
+
+export interface PayrollOvertime {
+  key: string;
+  attendanceId: number;
+  date: string;
+  kind: OvertimeKind;
+  suggestedMinutes: number;
+  approvedMinutes: number | null;
+  decidedByStaffId: number | null;
+  decidedAt: string | null;
+}
+
+export interface PayrollAdjustment {
+  id: string;
+  type: PayrollAdjustmentType;
+  label: string;
+  amount: number;
+  note: string | null;
+  byStaffId: number | null;
+  at: string;
+}
+
+export interface PayrollItemFacts {
+  employedDays: number;
+  daysInMonth: number;
+  workedMinutes: number;
+  regularMinutes: number;
+  scheduledShifts: number;
+  lateCount: number;
+  lateMinutes: number;
+  earlyCount: number;
+  earlyMinutes: number;
+  absentShifts: number;
+  absentMinutes: number;
+  missedPunchOut: number;
+  open: number;
+  leaveHours: Record<string, number>;
+  performance: (CoachPerformance & { trainerId: number }) | null;
+}
+
+export interface PayrollItemData {
+  id: number;
+  staffId: number;
+  name: string;
+  account: string;
+  position: string;
+  branchName: string | null;
+  profile: StaffPayProfileData;
+  facts: PayrollItemFacts;
+  overtime: PayrollOvertime[];
+  adjustments: PayrollAdjustment[];
+  lines: PayrollLine[];
+  grossPay: number;
+  deductionTotal: number;
+  netPay: number;
+  employerCost: number;
+  warnings: PayrollWarning[];
+}
+
+export interface PayrollRunSummary {
+  id: number;
+  month: string;
+  status: 'DRAFT' | 'FINALIZED';
+  calculatedAt: string;
+  finalizedAt: string | null;
+  finalizedByStaffId: number | null;
+  itemCount: number;
+  grossPay: number;
+  deductionTotal: number;
+  netPay: number;
+  employerCost: number;
+}
+
+export interface PayrollRunDetail {
+  run: PayrollRunSummary & {
+    config: Record<string, number>;
+    warnings: PayrollWarning[];
+    history: { action: string; at: string; byStaffId: number | null; reason?: string }[];
+  };
+  items: PayrollItemData[];
+  table: PayrollTable;
+  meta: {
+    overtimeKinds: Record<OvertimeKind, string>;
+    adjustmentTypes: Record<PayrollAdjustmentType, { label: string; kind: 'EARNING' | 'DEDUCTION' }>;
+    leaveTypes: Record<string, string>;
+    payTypes: Record<PayType, string>;
+  };
+}
+
+export interface MyPayslipSummary {
+  month: string;
+  finalizedAt: string;
+  grossPay: number;
+  deductionTotal: number;
+  netPay: number;
+}
+
+export interface MyPayslipDetail {
+  month: string;
+  finalizedAt: string;
+  payType: PayType;
+  payTypeLabel: string;
+  lines: PayrollLine[];
+  grossPay: number;
+  deductionTotal: number;
+  netPay: number;
+  attendance: {
+    employedDays: number;
+    daysInMonth: number;
+    workedMinutes: number;
+    scheduledShifts: number;
+    lateCount: number;
+    lateMinutes: number;
+    earlyCount: number;
+    earlyMinutes: number;
+    absentShifts: number;
+    absentMinutes: number;
+    leaveHours: Record<string, number>;
+  };
+  overtime: { date: string; kind: OvertimeKind; kindLabel: string; approvedMinutes: number }[];
 }
 
 export interface StaffScheduleRow {
@@ -903,24 +2082,213 @@ export interface StaffScheduleRow {
   staff?: { id: number; name: string; displayName?: string | null };
 }
 
-export interface CoachCommissionRule {
+/** ROSTER＝四週排班；FREE＝週班表（教練／店長・GM・FM，核准後生效）；MANUAL＝總部臨時排班 */
+export type ScheduleSource = 'ROSTER' | 'FREE' | 'MANUAL';
+
+export interface ScheduleOverviewRow {
   id: number;
-  trainerId?: number | null;
-  courseKind?: string;
-  payModel?: string;
-  baseSalary?: number;
-  isActive?: boolean;
-  trainer?: { id: number; name: string };
+  staffId: number;
+  staff: {
+    id: number;
+    name: string;
+    displayName?: string | null;
+    role: StaffRole;
+    employmentType?: EmploymentType;
+    rosterRoleLabel: string | null;
+  } | null;
+  branchId: number | null;
+  dateKey: string;
+  startAt: string;
+  endAt: string;
+  slotType: string;
+  shiftCode: string | null;
+  isOff: boolean;
+  label: string;
+  note: string | null;
+  source: ScheduleSource;
+  sourceLabel: string;
+  rosterPeriodId: number | null;
+  rosterStatus: 'DRAFT' | 'PUBLISHED' | null;
+  coachPlanId?: number | null;
+  coachPlanStatus?: CoachPlanStatus | null;
+  coachPlanStatusLabel?: string | null;
+  editable: boolean;
+  deletable: boolean;
 }
 
-export interface CoachCommissionLedger {
-  id: string;
+export interface ScheduleOverview {
+  from: string;
+  to: string;
+  truncated: boolean;
+  rows: ScheduleOverviewRow[];
+}
+
+export type CoachCourseKind = 'PRIVATE' | 'GROUP';
+
+export interface CoachTierRate {
+  minRevenue: number;
+  rate: number;
+}
+
+/** 教練業績獎金規則（底薪一律於薪資設定；此處僅獎金） */
+export interface CoachCommissionRule {
+  id: number;
+  trainerId: number | null;
+  trainer: { id: number; name: string } | null;
+  scope: 'DEFAULT' | 'TRAINER';
+  courseKind: CoachCourseKind;
+  courseKindLabel: string;
+  tierRates: CoachTierRate[] | null;
+  sessionBonus: number | null;
+  perHeadRate: number | null;
+  createdAt: string;
+}
+
+/** 後端試算之業績獎金（實發以結算薪資單為準） */
+export interface CoachPerformance {
+  ptSessions: number;
+  ptRevenue: number;
+  tierRate: number;
+  ptCommission: number;
+  ptSessionBonus: number;
+  groupClasses: number;
+  groupHeads: number;
+  groupHeadBonus: number;
+  groupSessionBonus: number;
+  total: number;
+}
+
+export interface CoachPerformanceFlag {
+  code: 'NOT_EMPLOYED' | 'NO_PAY_PROFILE' | 'COACH_BASE_PAY' | 'NO_LABOR_INS';
+  message: string;
+}
+
+export interface HqCoachPerformanceItem {
   trainerId: number;
-  periodStart: string;
-  periodEnd: string;
-  grossAmount: number;
-  netAmount: number;
-  trainer?: { id: number; name: string };
+  name: string;
+  level: string | null;
+  staff: { id: number; name: string; employmentType: EmploymentType; isActive: boolean } | null;
+  basePay: { payType: PayType; monthlySalary: number | null; hourlyWage: number | null } | null;
+  performance: CoachPerformance;
+  flags: CoachPerformanceFlag[];
+}
+
+export interface TrainerMyPerformance {
+  month: string;
+  trainerId: number;
+  performance: CoachPerformance;
+  rules: { PRIVATE: CoachCommissionRule | null; GROUP: CoachCommissionRule | null };
+}
+
+// ── 週班表（教練＋管理職；勞基法 §30／§35／§36／§34；檢查結果一律由後端計算） ──
+export type CoachPlanStatus = 'DRAFT' | 'SUBMITTED' | 'APPROVED' | 'REJECTED';
+
+export interface CoachWeekRules {
+  maxDailyNormalMinutes: number;
+  maxWeeklyNormalMinutes: number;
+  continuousLimitMinutes: number;
+  breakMinutes: number;
+  minRestBetweenDaysHours: number;
+  maxConsecutiveWorkDays: number;
+  minSlotMinutes: number;
+  maxSlotsPerDay: number;
+  planAheadWeeks: number;
+}
+
+export interface CoachPlanSlot {
+  date: string;
+  start: string;
+  end: string;
+  branchId?: number | null;
+}
+
+export interface CoachPlanIssue {
+  level: 'ERROR' | 'WARNING';
+  code: string;
+  message: string;
+  date?: string;
+}
+
+export interface CoachPlanDayStat {
+  date: string;
+  weekday: number;
+  kind: 'WORK' | 'REGULAR_OFF' | 'REST_DAY' | 'NONE';
+  kindLabel: string;
+  holiday: string | null;
+  slots: { start: string; end: string }[];
+  workMinutes: number;
+  breakMinutes: number;
+  leaveMinutes: number;
+}
+
+export interface CoachPlanEvaluation {
+  issues: CoachPlanIssue[];
+  hasError: boolean;
+  stats: {
+    days: CoachPlanDayStat[];
+    weekWorkMinutes: number;
+    leaveMinutes: number;
+    agreedMinutes: number | null;
+    targetMinutes: number | null;
+    maxConsecutiveDays: number;
+  };
+}
+
+export type WeekPlanRole = 'COACH' | 'MANAGER';
+
+export interface CoachWeekPlan {
+  id: number | null;
+  staffId: number | null;
+  staff: { id: number; name: string; displayName?: string | null } | null;
+  staffRole?: string | null;
+  planRole?: WeekPlanRole | null;
+  planRoleLabel?: string | null;
+  /** 審核列表：目前登入者可否審核（後端判定） */
+  canReview?: boolean;
+  branchId: number | null;
+  weekStart: string;
+  weekEnd: string;
+  status: CoachPlanStatus | null;
+  statusLabel: string;
+  regularOffDate: string | null;
+  restDayDate: string | null;
+  slots: CoachPlanSlot[];
+  note: string | null;
+  submittedAt: string | null;
+  reviewedAt: string | null;
+  reviewedBy: { id: number; name: string | null } | null;
+  reviewNote: string | null;
+  history: { at: string; action: string; byStaffId?: number | null; reason?: string }[];
+  editable: boolean;
+  classes: { id: number; title: string; type: string; date: string; start: string; end: string }[];
+  evaluation: CoachPlanEvaluation | null;
+  holidays?: { date: string; name: string }[];
+  branchName?: string | null;
+  employmentType?: EmploymentType;
+}
+
+export interface MyCoachPlans {
+  rules: CoachWeekRules;
+  statuses: Record<CoachPlanStatus, string>;
+  today: string;
+  planRole: WeekPlanRole;
+  planRoleLabel: string;
+  approverLabel: string;
+  staff: { id: number; name: string; role: string; employmentType: EmploymentType; weeklyHours: number | null };
+  branches: { id: number; name: string }[];
+  defaultBranchId: number | null;
+  /** GM／FM 可不指定出勤分店（總部） */
+  allowNoBranch: boolean;
+  weeks: CoachWeekPlan[];
+}
+
+export interface CoachPlanReviewList {
+  rules: CoachWeekRules;
+  statuses: Record<CoachPlanStatus, string>;
+  from: string;
+  /** 登入者可審核之類別 */
+  kinds: WeekPlanRole[];
+  items: CoachWeekPlan[];
 }
 
 export interface ClassCheckInTokenResult {
@@ -928,3 +2296,355 @@ export interface ClassCheckInTokenResult {
   expiresAt: string;
 }
 
+
+// ── 退費／折讓（後端 lib/refundService.js；金額一律後端計算） ─────────────
+
+export type RefundStatus =
+  | 'PAYMENT_PENDING'
+  | 'AWAITING_TERMINAL'
+  | 'PAYMENT_FAILED'
+  | 'INVOICE_PENDING'
+  | 'INVOICE_FAILED'
+  | 'SIGNATURE_PENDING'
+  | 'GATEWAY_RETRYING'
+  | 'COMPLETED'
+  | 'ABORTED';
+
+export type RefundMethod = 'CASH' | 'WALLET_CASH' | 'VOUCHER' | 'LINEPAY' | 'PAYUNI' | 'YIPAY';
+
+export type RefundPaymentStatus =
+  | 'PENDING'
+  | 'PROCESSING'
+  | 'AWAITING_TERMINAL'
+  | 'REFUNDED'
+  | 'FAILED'
+  | 'FORFEITED'
+  | 'REVERSED'
+  | 'CANCELLED';
+
+export type RefundScope = 'FULL' | 'ITEMS' | 'UNUSED';
+
+export type RefundOrderKind = 'SALE' | 'TOPUP' | 'MEMBERSHIP' | 'PT' | 'GROUP' | 'COURSE_SUB' | 'OTHER';
+
+export type RefundAction = 'TOPUP_CANCEL' | 'SUB_ORDER_REFUND' | 'GROUP_REFUND' | 'SUBSCRIPTION_CANCEL';
+
+export interface RefundLine {
+  orderItemId: number;
+  name: string;
+  qty: number;
+  unitPrice: number;
+  gross: number;
+  taxType?: string;
+}
+
+export interface RefundLegPreview {
+  method: RefundMethod;
+  amount: number;
+  forfeited: boolean;
+  ready: boolean;
+  needsTerminal: boolean;
+}
+
+export interface RefundInvoicePlan {
+  action: 'NONE' | 'CANCEL_UNISSUED' | 'VOID' | 'ALLOWANCE';
+  sharedInvoice: boolean;
+  invoices: {
+    id: string;
+    invoiceNumber: string | null;
+    status: string;
+    category: string | null;
+    taxType: string | null;
+    periodKey: string | null;
+    totalAmount: number;
+    allowanceTotal: number;
+    action: 'VOID' | 'ALLOWANCE' | 'CANCEL' | null;
+  }[];
+}
+
+export interface RefundPreview {
+  /** 後端報價鎖：送出時原樣帶回，後端重算不符回 409 QUOTE_STALE */
+  quoteToken: string;
+  quoteExpiresAt: string;
+  kind: string;
+  subOrderId: string;
+  refType: 'ORDER' | 'SALE';
+  orderKind: RefundOrderKind;
+  checkoutSessionId: string | null;
+  memberId: number | null;
+  memberName: string | null;
+  branchId: number | null;
+  scope: RefundScope;
+  lines: RefundLine[] | null;
+  calc: { note?: string; [k: string]: unknown };
+  grossAmount: number;
+  feeAmount: number;
+  consumedValue: number;
+  payoutAmount: number;
+  fullRefund: boolean;
+  legs: RefundLegPreview[];
+  invoicePlan: RefundInvoicePlan;
+  signatureRequired: boolean;
+  warnings: string[];
+}
+
+export interface RefundInvoiceResult {
+  einvoiceId: string | null;
+  invoiceNumber: string | null;
+  action: 'VOID' | 'ALLOWANCE' | 'CANCEL' | 'NONE' | null;
+  allowanceId?: string | null;
+  allowanceNo?: string | null;
+  amount?: number;
+  category?: string | null;
+  done: boolean;
+  ambiguous?: boolean;
+  /** 失敗時之實際呼叫（作廢失敗改折讓者為 ALLOWANCE） */
+  op?: 'VOID' | 'ALLOWANCE' | null;
+  /** 折讓結果不明時保留之預占含稅金額 */
+  heldAmount?: number;
+  /** 經「核對藍新結果」人工補登 */
+  resolvedManually?: boolean;
+  /** 重試前查得 ezPay 已作廢，只同步本地 */
+  remoteAlreadyVoided?: boolean;
+  error?: string;
+}
+
+/** ezPay 折讓結果不明、預占保留中：待 DUTY+ 核對藍新後台（僅回比對所需欄位） */
+export interface RefundInvoiceResolve {
+  einvoiceId: string;
+  invoiceNumber: string;
+  /** 本次折讓含稅金額 */
+  amount: number;
+  untaxed: number;
+  tax: number;
+  category: string | null;
+}
+
+export type RefundInvoiceResolveBody =
+  | { einvoiceId: string; outcome: 'ISSUED'; ezPayAllowanceNo: string; reason: string }
+  | { einvoiceId: string; outcome: 'NOT_ISSUED'; confirmEzPayNotIssued: true; reason: string };
+
+export interface RefundPaymentRecord {
+  id: string;
+  method: RefundMethod;
+  amount: number;
+  status: RefundPaymentStatus;
+  providerRef: string | null;
+  rrn: string | null;
+  authCode: string | null;
+  cardLast4: string | null;
+  attempts: number;
+  lastError: string | null;
+  refundedAt: string | null;
+  /** 乙禾原刷卡憑證（僅 YIPAY 且有端末暫存時） */
+  original?: {
+    rrn: string | null;
+    authCode: string | null;
+    cardLast4: string | null;
+    amount: number;
+    capturedAt: string | null;
+  } | null;
+}
+
+/** POST /ops/refunds/:id/retry-gateway 回傳；金額與狀態只以後端 refundOrder 為準 */
+export interface RefundGatewayRetryData {
+  reconciledAction: 'ALREADY_COMPLETED' | 'RETRIED_AND_COMPLETED' | 'RETRIED';
+  stepSummary: {
+    paymentGatewayStep: string;
+    ezPayInvoiceStep: string;
+  } | null;
+  refundOrder: RefundRecord;
+}
+
+export interface RefundRecord {
+  id: string;
+  /** 同 Idempotency-Key 重送時為 true（回傳原退費單） */
+  replayed?: boolean;
+  kind: string;
+  refType: 'ORDER' | 'SALE';
+  subOrderId: string;
+  checkoutSessionId: string | null;
+  branchId: number | null;
+  memberId: number | null;
+  scope: RefundScope;
+  lines: RefundLine[] | null;
+  calc: { note?: string; [k: string]: unknown };
+  grossAmount: number;
+  feeAmount: number;
+  consumedValue: number;
+  payoutAmount: number;
+  fullRefund: boolean;
+  invoiceAction: string | null;
+  invoiceResults: RefundInvoiceResult[] | null;
+  /** 非 null 時重試與中止皆被後端擋下（409 INVOICE_RESULT_UNKNOWN），須經 invoice-resolve 處置 */
+  invoiceResolve: RefundInvoiceResolve | null;
+  signatureRequired: boolean;
+  signed: boolean;
+  walletCashReversed: number;
+  walletBonusReversed: number;
+  walletCashCredited: number;
+  reason: string;
+  staffId: number | null;
+  status: RefundStatus;
+  lastError: string | null;
+  needsCheck: boolean;
+  completedAt: string | null;
+  abortedAt: string | null;
+  abortReason: string | null;
+  createdAt: string;
+  payments: RefundPaymentRecord[];
+}
+
+export interface RefundLookupSubOrder {
+  id: string;
+  refType: 'ORDER' | 'SALE';
+  kind: RefundOrderKind;
+  status: string;
+  amount: number;
+  refundedAmount: number;
+  itemDesc: string;
+  checkoutSessionId: string | null;
+  createdAt: string;
+  actions: RefundAction[];
+  invoiceNumber?: string | null;
+  invoiceStatus?: string | null;
+  invoices?: RefundLookupInvoice[];
+  items?: {
+    orderItemId: number;
+    name: string;
+    qty: number;
+    refundedQty: number;
+    unitPrice: number;
+    lineTotal: number;
+    taxType: string;
+  }[];
+}
+
+/** 子單綁定之 ezPay 發票（後端 serializeEInvoiceBrief） */
+export interface RefundLookupInvoice {
+  id: string;
+  leg: string;
+  status: string;
+  invoiceNumber: string | null;
+  category: string | null;
+  totalAmount: number;
+  allowanceTotal: number;
+  issuedAt: string | null;
+  lastError: string | null;
+}
+
+export interface RefundLookupResult {
+  checkoutSessionId: string | null;
+  subOrders: RefundLookupSubOrder[];
+  sharedInvoices: RefundLookupInvoice[];
+  member: { id: number; name: string; memberNo: string | null; phone: string | null } | null;
+  allowances: AllowanceListItem[];
+  openRefunds: { id: string; refId: string; status: RefundStatus; payoutAmount: number; createdAt: string }[];
+}
+
+export interface AllowanceListItem {
+  id: string | null;
+  allowanceNo: string;
+  status: string;
+  invoiceNumber: string;
+  orderId: string | null;
+  saleOrderId: string | null;
+  subOrderId: string | null;
+  refundId: string | null;
+  memberId: number | null;
+  memberName: string | null;
+  itemDesc: string | null;
+  untaxedAmt: number;
+  taxAmt: number;
+  totalAmt: number;
+  remainAmt: number | null;
+  source: string;
+  branchId: number | null;
+  branchName: string | null;
+  issuedAt: string;
+  sellerName: string;
+  sellerUbn: string | null;
+  category: string | null;
+  buyerUbn: string | null;
+  buyerName: string | null;
+  invoiceIssuedAt: string | null;
+  reason: string | null;
+  signed: boolean;
+  signatureRequired: boolean;
+  printCount: number;
+  lastPrintedAt: string | null;
+  exportedToAcctAt: string | null;
+}
+
+export interface AllowanceListPayload {
+  items: AllowanceListItem[];
+  columns: ReconColumn[];
+  rows: Record<string, ReconCell>[];
+}
+
+export interface AllowanceExportPayload extends AllowanceListPayload {
+  exported: { total: number; firstTime: number; exportedAt: string | null; truncated: boolean; marked: boolean };
+}
+
+export interface AllowancePrintPayload {
+  allowance: {
+    id: string;
+    allowanceNo: string;
+    status: string;
+    issuedAt: string;
+    source: string;
+    refundId: string | null;
+    subOrderId: string | null;
+    reason: string | null;
+    staffId: number | null;
+  };
+  seller: {
+    name: string;
+    ubn: string | null;
+    address: string | null;
+    phone: string | null;
+    branchName: string | null;
+    branchCode: string | null;
+    branchAddress: string | null;
+  };
+  buyer: {
+    category: string;
+    ubn: string | null;
+    name: string | null;
+    memberName: string | null;
+    memberNo: string | null;
+    email: string | null;
+  };
+  originalInvoice: {
+    invoiceNumber: string;
+    track: string;
+    number: string;
+    issuedAt: string | null;
+    periodKey: string | null;
+    taxType: string;
+    taxTypeLabel: string;
+    totalAmount: number | null;
+  };
+  items: {
+    lineNo: number;
+    name: string;
+    qty: number;
+    unit: string;
+    unitPrice: number;
+    amount: number;
+    taxAmt: number;
+    grossAmount: number;
+    taxType: string;
+  }[];
+  amounts: { untaxed: number; tax: number; total: number; remainAmt: number | null };
+  signature: {
+    required: boolean;
+    signed: boolean;
+    signatureId: string | null;
+    signedAt: string | null;
+    intact: boolean | null;
+    dataUrl: string | null;
+  };
+  /** 列印次數（含本次）；isReprint＝補印 */
+  print: { count: number; isReprint: boolean; lastPrintedAt: string | null };
+  formats: ('A4_FOUR_PART' | 'THERMAL_80MM')[];
+}

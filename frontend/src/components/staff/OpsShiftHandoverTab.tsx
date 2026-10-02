@@ -21,12 +21,9 @@ import {
   CASH_DENOMINATIONS,
 } from '../../lib/cashDenominations';
 import { printShiftHandoverSlip } from '../../lib/printShiftHandoverSlip';
-import {
-  staffHasManagerRankOrAbove,
-  STAFF_ROLE_LABELS,
-} from '../../lib/staffPermissions';
+import { staffHasManagerRankOrAbove } from '../../lib/staffPermissions';
+import { positionShortLabel } from '../../lib/orgStructure';
 import type { Branch } from '../../types/api';
-import type { StaffRole } from '../../lib/storage';
 
 type Props = {
   branchId: number | '';
@@ -34,7 +31,7 @@ type Props = {
   branches: Branch[];
 };
 
-type ShiftSlot = 'MORNING' | 'MIDDAY' | 'EVENING';
+type ShiftSlot = 'MORNING' | 'EVENING' | 'MIDDAY';
 type CloseStep = 'summary' | 'count' | 'reconcile';
 
 type SlotMeta = { key: ShiftSlot; label: string; short?: string; hint?: string };
@@ -75,6 +72,8 @@ type ShiftRow = {
 
 type LiveSummary = {
   cashIn: number;
+  /** 本班臨櫃現金退款（已自系統應有現金扣除） */
+  cashRefund?: number;
   payMix: Record<string, number>;
   payMixColumns?: PayColumn[];
   totals: {
@@ -87,7 +86,7 @@ type LiveSummary = {
     paidTxnCount: number;
     paidTxnAmount: number;
   };
-  refunds?: { count: number; note?: string };
+  refunds?: { count: number; cashOut?: number; note?: string };
   gateNote?: string;
 };
 
@@ -111,9 +110,8 @@ const FALLBACK_PAY_COLUMNS: { key: string; label: string }[] = [
 ];
 
 const FALLBACK_SLOTS: SlotMeta[] = [
-  { key: 'MORNING', label: '早班', hint: '約 05:00–13:00' },
-  { key: 'MIDDAY', label: '中班', hint: '約 13:00–18:00' },
-  { key: 'EVENING', label: '晚班', hint: '約 18:00–隔日 05:00' },
+  { key: 'MORNING', label: '早班', hint: '07:00–15:30' },
+  { key: 'EVENING', label: '晚班', hint: '15:30–00:00' },
 ];
 
 const CLOSE_STEPS: { key: CloseStep; n: number; label: string }[] = [
@@ -216,8 +214,7 @@ export default function OpsShiftHandoverTab({ branchId, branchName }: Props) {
   const canAdjustVariance = staffHasManagerRankOrAbove(staff);
   const operatorLabel = useMemo(() => {
     if (!staff) return '未登入';
-    const roleKey = String(staff.role || '').toUpperCase() as StaffRole;
-    const roleZh = STAFF_ROLE_LABELS[roleKey] || staff.role || '員工';
+    const roleZh = positionShortLabel(staff.role) || '員工';
     return `${staff.name || '員工'}（${roleZh}）`;
   }, [staff]);
 
@@ -563,6 +560,7 @@ export default function OpsShiftHandoverTab({ branchId, branchName }: Props) {
         <Alert tone="info">
           <strong>標準作業（比照超商交班）</strong>
           <ul style={{ margin: '0.35rem 0 0', paddingLeft: '1.1rem' }}>
+            <li>班別兩班制：早班 07:00–15:30、晚班 15:30–00:00。</li>
             <li>預設「盲點」：先依面額點鈔，再揭示系統應有，避免先看帳再湊數。</li>
             <li>支付分欄：現金／刷卡／零錢包／抵用券；進出場零錢包不計入錢櫃。</li>
             <li>交班須勾選檢核清單；差額僅店長／總部可結案並註明原因。</li>
@@ -652,6 +650,9 @@ export default function OpsShiftHandoverTab({ branchId, branchName }: Props) {
                   {showExpected ? (
                     <>
                       <StatCard label="班內現金收入" value={Math.round(live?.cashIn || 0)} tone="cash" />
+                      {live?.cashRefund ? (
+                        <StatCard label="班內現金退款" value={-Math.round(live.cashRefund)} tone="cash" />
+                      ) : null}
                       <StatCard label="系統應有現金" value={systemExpected} tone="cash" />
                     </>
                   ) : null}
@@ -693,7 +694,7 @@ export default function OpsShiftHandoverTab({ branchId, branchName }: Props) {
                   合併結帳 {live?.totals?.checkoutCount || 0}／{money(live?.totals?.checkoutAmount)} ·
                   銷貨 {live?.totals?.salesCount || 0}／{money(live?.totals?.salesAmount)} · 儲值{' '}
                   {live?.totals?.topupCount || 0}／{money(live?.totals?.topupAmount)}
-                  {live?.refunds?.count ? ` · 退費提示 ${live.refunds.count}` : ''}
+                  {live?.refunds?.count ? ` · 退費 ${live.refunds.count} 筆` : ''}
                   <br />
                   {live?.gateNote}
                 </p>

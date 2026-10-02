@@ -79,7 +79,7 @@ export function normalizeIdNumber(raw) {
   const id = String(raw || '')
     .trim()
     .toUpperCase()
-    .replace(/[\s\-]/g, '');
+    .replace(/[\s-]/g, '');
   if (!id) return null;
   // 不可把台灣手機當證件
   if (/^09\d{8}$/.test(id)) return null;
@@ -281,7 +281,7 @@ export async function resolveMemberByIdentityAndEmail({
     throw httpError(IDENTITY_MISMATCH_MSG, 400, 'IDENTITY_MISMATCH');
   }
 
-  let member = null;
+  let member;
   if (resetTicket) {
     const { memberId } = verifyDeviceResetTicket(resetTicket);
     member = await prisma.member.findUnique({ where: { id: memberId } });

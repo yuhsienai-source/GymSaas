@@ -4,67 +4,77 @@ import bcrypt from 'bcrypt';
 import crypto from 'crypto';
 import prisma from '../lib/prisma.js';
 import { allocateUniqueMemberNo, backfillMissingMemberNos } from '../lib/memberNo.js';
+import { DEFAULT_PUBLIC_HOLIDAYS } from '../lib/laborLaw.js';
 
 async function main() {
   console.log('🌱 開始灌入體育客種子資料...');
 
-  // 1. 分店（以代碼為穩定鍵，避免正式名稱變更造成重複列）
-  let branch = await prisma.branch.findUnique({ where: { code: 'HP' } });
-  if (!branch) {
-    branch = await prisma.branch.findFirst({
-      where: { OR: [{ name: '和平店' }, { name: '體育客和平店' }] },
-      orderBy: { id: 'asc' },
+  // 1. 分店（依組織圖；代碼為穩定鍵，舊代碼／名稱自動改名）
+  async function upsertBranch({ code, name, type, parentId = null, address, ubn, legacy = [] }) {
+    const legacyKeys = legacy.flatMap((k) => [{ code: k }, { name: k }]);
+    let row =
+      (await prisma.branch.findFirst({ where: { name } })) ||
+      (await prisma.branch.findUnique({ where: { code } })) ||
+      (legacyKeys.length
+        ? await prisma.branch.findFirst({ where: { OR: legacyKeys }, orderBy: { id: 'asc' } })
+        : null);
+    const conflicts = await prisma.branch.findMany({
+      where: { OR: [{ code }, { name }], ...(row ? { NOT: { id: row.id } } : {}) },
     });
-  }
-  if (branch) {
-    branch = await prisma.branch.update({
-      where: { id: branch.id },
-      data: {
-        name: branch.name.includes('和平') ? branch.name : '和平店',
-        code: 'HP',
-        address: '台北市信義區和平東路三段333號B1',
-        isActive: true,
-      },
-    });
-  } else {
-    branch = await prisma.branch.create({
-      data: {
-        name: '和平店',
-        code: 'HP',
-        address: '台北市信義區和平東路三段333號B1',
-        isActive: true,
-      },
-    });
-  }
-
-  // 1b. 共享分店：HR（私教與 HP 共享）、AC（進出場與 HP 共享）
-  async function upsertBranchByCode({ code, name, address }) {
-    let row = await prisma.branch.findUnique({ where: { code } });
-    if (!row) {
-      row = await prisma.branch.findFirst({ where: { name }, orderBy: { id: 'asc' } });
-    }
-    if (row) {
-      return prisma.branch.update({
-        where: { id: row.id },
-        data: { name, code, address, isActive: true },
+    for (const c of conflicts) {
+      await prisma.branch.update({
+        where: { id: c.id },
+        data: { code: null, name: `${c.name}（停用#${c.id}）`, parentId: null, isActive: false },
       });
     }
-    return prisma.branch.create({
-      data: { name, code, address, isActive: true },
-    });
+    // 一店一統編＝一營業人（ezPay 商店）；MerchantID／HashKey 另於 HQ／env 設定
+    const entity = ubn
+      ? await prisma.legalEntity.upsert({
+          where: { ubn },
+          create: { code, name: `體育客 ${name}`, ubn, address, isActive: true },
+          update: {},
+        })
+      : null;
+    const data = { name, code, type, parentId, address, legalEntityId: entity?.id ?? null, isActive: true };
+    return row
+      ? prisma.branch.update({ where: { id: row.id }, data })
+      : prisma.branch.create({ data });
   }
-  const branchHr = await upsertBranchByCode({
+
+  const branch = await upsertBranch({
+    code: 'HP',
+    name: '和平店',
+    type: 'GYM',
+    address: '台北市信義區和平東路三段333號B1',
+    ubn: '24747555',
+    legacy: ['體育客和平店'],
+  });
+  const branchHr = await upsertBranch({
     code: 'HR',
-    name: '華榮店',
-    address: '台北市（示範）華榮店',
+    name: '熱河教室',
+    type: 'CLASS',
+    parentId: branch.id,
+    address: '台北市（示範）熱河教室',
+    ubn: '83122541',
   });
-  const branchAc = await upsertBranchByCode({
+  const branchAc = await upsertBranch({
     code: 'AC',
-    name: '安和店',
-    address: '台北市（示範）安和店',
+    name: '體適能學院',
+    type: 'ACADEMY',
+    address: '台北市大安區和平東路二段（總部培訓基地）',
+    ubn: '83004468',
+    legacy: ['ACADEMY'],
   });
-  for (const b of [branchHr, branchAc]) {
-    const vName = b.code === 'HR' ? '私教區' : '訓練區';
+  const branchFd = await upsertBranch({
+    code: 'FD',
+    name: '輔大店',
+    type: 'GYM',
+    address: '新北市新莊區中正路510號',
+    ubn: '52555000',
+    legacy: ['FJU'],
+  });
+  for (const b of [branchHr, branchAc, branchFd]) {
+    const vName = b.type === 'ACADEMY' ? '學院培訓場' : '重訓區';
     const existingV = await prisma.venue.findFirst({
       where: { branchId: b.id, name: vName },
     });
@@ -131,98 +141,169 @@ async function main() {
     }
   }
 
-  // 4. 教練 + 分店指派
-  const trainer = await prisma.trainer.upsert({
-    where: { phone: '0911000001' },
-    update: { name: '李教練', displayName: '匿名', role: 'NORMAL', isActive: true },
-    create: {
-      name: '李教練',
-      displayName: '匿名',
-      phone: '0911000001',
-      role: 'NORMAL',
-      isActive: true,
-    },
+  // 4. 教練陣容（金牌 GOLD / 銀牌 SILVER；指派和平店、輔大店、體適能學院）
+  async function upsertDemoTrainer({ phone, name, role = 'NORMAL', level = 'SILVER', branchIds = [] }) {
+    const t = await prisma.trainer.upsert({
+      where: { phone },
+      update: { name, displayName: '匿名', role, level, isActive: true },
+      create: { name, displayName: '匿名', phone, role, level, isActive: true },
+    });
+    for (const bId of branchIds) {
+      await prisma.trainerBranch.upsert({
+        where: { trainerId_branchId: { trainerId: t.id, branchId: bId } },
+        update: {},
+        create: { trainerId: t.id, branchId: bId },
+      });
+    }
+    return t;
+  }
+
+  // 和平店教練
+  const hpGoldTrainer = await upsertDemoTrainer({
+    phone: '0911000001',
+    name: '李教練（和平金牌）',
+    role: 'NORMAL',
+    level: 'GOLD',
+    branchIds: [branch.id, branchHr.id],
   });
-  await prisma.trainerBranch.upsert({
-    where: {
-      trainerId_branchId: { trainerId: trainer.id, branchId: branch.id },
-    },
-    update: {},
-    create: { trainerId: trainer.id, branchId: branch.id },
-  });
-  // HP 教練亦可在 HR 上私教（場地共享）
-  await prisma.trainerBranch.upsert({
-    where: {
-      trainerId_branchId: { trainerId: trainer.id, branchId: branchHr.id },
-    },
-    update: {},
-    create: { trainerId: trainer.id, branchId: branchHr.id },
+  await upsertDemoTrainer({
+    phone: '0911000002',
+    name: '陳教練（和平銀牌）',
+    role: 'NORMAL',
+    level: 'SILVER',
+    branchIds: [branch.id],
   });
 
-  // 5. 總部 ADMIN 員工帳號（密碼：admin1234）
-  const hashed = await bcrypt.hash('admin1234', 10);
+  // 輔大店教練
+  await upsertDemoTrainer({
+    phone: '0911000003',
+    name: '張教練（輔大金牌）',
+    role: 'NORMAL',
+    level: 'GOLD',
+    branchIds: [branchFd.id],
+  });
+  await upsertDemoTrainer({
+    phone: '0911000004',
+    name: '林教練（輔大銀牌）',
+    role: 'NORMAL',
+    level: 'SILVER',
+    branchIds: [branchFd.id],
+  });
+
+  // 體適能學院教練
+  await upsertDemoTrainer({
+    phone: '0911000005',
+    name: '趙教官（學院金牌）',
+    role: 'MANAGER',
+    level: 'GOLD',
+    branchIds: [branchAc.id],
+  });
+  await upsertDemoTrainer({
+    phone: '0911000006',
+    name: '孫助教（學院銀牌）',
+    role: 'NORMAL',
+    level: 'SILVER',
+    branchIds: [branchAc.id],
+  });
+
+  // 5. 組織架構各級主管與員工帳號（依體育客組織階層圖）
+  const passHash = await bcrypt.hash('admin1234', 10);
+  const commonPass = await bcrypt.hash('staff1234', 10);
+
+  // 5a. 總公司 (ADMIN)
   const staff = await prisma.staff.upsert({
     where: { account: 'admin' },
-    update: { password: hashed, name: '總部管理員', displayName: '匿名', role: 'ADMIN', isActive: true },
-    create: {
-      account: 'admin',
-      password: hashed,
-      name: '總部管理員',
-      displayName: '匿名',
-      role: 'ADMIN',
-      isActive: true,
-    },
+    update: { password: passHash, name: '總部管理員', displayName: '匿名', role: 'ADMIN', isActive: true },
+    create: { account: 'admin', password: passHash, name: '總部管理員', displayName: '匿名', role: 'ADMIN', isActive: true },
   });
 
-  // 5. 示範櫃檯員工（和平店 · 僅櫃檯權限）
-  const counterHash = await bcrypt.hash('staff1234', 10);
+  // 5b. 管理層：GM 店務部主管、FM 教練部主管
+  await prisma.staff.upsert({
+    where: { account: 'gm' },
+    update: { password: commonPass, name: '王大強（店務部主管）', displayName: '匿名', role: 'GM', branchId: null, permissions: ['ops', 'pt'], isActive: true },
+    create: { account: 'gm', password: commonPass, name: '王大強（店務部主管）', displayName: '匿名', role: 'GM', branchId: null, permissions: ['ops', 'pt'], isActive: true },
+  });
+
+  await prisma.staff.upsert({
+    where: { account: 'fm' },
+    update: { password: commonPass, name: '林家豪（教練部主管）', displayName: '匿名', role: 'FM', branchId: null, permissions: ['pt', 'trainer'], isActive: true },
+    create: { account: 'fm', password: commonPass, name: '林家豪（教練部主管）', displayName: '匿名', role: 'FM', branchId: null, permissions: ['pt', 'trainer'], isActive: true },
+  });
+
+  // 5c. 和平店（熱河教室由和平店督導支援）：店長、值班、一般場務
+  await prisma.staff.upsert({
+    where: { account: 'hp_mgr' },
+    update: { password: commonPass, name: '張和平（和平店長）', displayName: '匿名', role: 'STORE_MANAGER', branchId: branch.id, permissions: ['ops', 'pt'], isActive: true },
+    create: { account: 'hp_mgr', password: commonPass, name: '張和平（和平店長）', displayName: '匿名', role: 'STORE_MANAGER', branchId: branch.id, permissions: ['ops', 'pt'], isActive: true },
+  });
+  const counterHash = commonPass;
   await prisma.staff.upsert({
     where: { account: 'counter' },
-    update: {
-      password: counterHash,
-      name: '和平店櫃檯',
-      displayName: '匿名',
-      role: 'STAFF',
-      branchId: branch.id,
-      permissions: ['ops'],
-      isActive: true,
-    },
-    create: {
-      account: 'counter',
-      password: counterHash,
-      name: '和平店櫃檯',
-      displayName: '匿名',
-      role: 'STAFF',
-      branchId: branch.id,
-      permissions: ['ops'],
-      isActive: true,
-    },
+    update: { password: counterHash, name: '和平店櫃檯', displayName: '匿名', role: 'STAFF', branchId: branch.id, permissions: ['ops'], isActive: true },
+    create: { account: 'counter', password: counterHash, name: '和平店櫃檯', displayName: '匿名', role: 'STAFF', branchId: branch.id, permissions: ['ops'], isActive: true },
   });
-
-  // 5b. 示範值星（DUTY · 可進交易異動）
   const dutyHash = await bcrypt.hash('duty1234', 10);
   const dutyStaff = await prisma.staff.upsert({
     where: { account: 'duty' },
-    update: {
-      password: dutyHash,
-      name: '和平店值星',
-      displayName: '匿名',
-      role: 'DUTY',
-      branchId: branch.id,
-      permissions: ['ops'],
-      isActive: true,
-    },
-    create: {
-      account: 'duty',
-      password: dutyHash,
-      name: '和平店值星',
-      displayName: '匿名',
-      role: 'DUTY',
-      branchId: branch.id,
-      permissions: ['ops'],
-      isActive: true,
-    },
+    update: { password: dutyHash, name: '和平店值星', displayName: '匿名', role: 'DUTY', branchId: branch.id, permissions: ['ops'], isActive: true },
+    create: { account: 'duty', password: dutyHash, name: '和平店值星', displayName: '匿名', role: 'DUTY', branchId: branch.id, permissions: ['ops'], isActive: true },
   });
+
+  // 5d. 輔大店：店長、值班、一般場務（舊 fju_* 帳號改名為 fd_*）
+  for (const suffix of ['mgr', 'duty', 'staff']) {
+    const legacy = await prisma.staff.findUnique({ where: { account: `fju_${suffix}` } });
+    const current = await prisma.staff.findUnique({ where: { account: `fd_${suffix}` } });
+    if (legacy && !current) {
+      await prisma.staff.update({ where: { id: legacy.id }, data: { account: `fd_${suffix}` } });
+    }
+  }
+  const fdStaffDefs = [
+    { account: 'fd_mgr', name: '郭輔大（輔大店長）', role: 'STORE_MANAGER', permissions: ['ops', 'pt'] },
+    { account: 'fd_duty', name: '輔大店值班', role: 'DUTY', permissions: ['ops'] },
+    { account: 'fd_staff', name: '輔大店場務', role: 'STAFF', permissions: ['ops'] },
+  ];
+  for (const d of fdStaffDefs) {
+    const data = { ...d, password: commonPass, displayName: '匿名', branchId: branchFd.id, isActive: true };
+    await prisma.staff.upsert({ where: { account: d.account }, update: data, create: data });
+  }
+
+  // 5e. 體適能學院：教練帳號（TRAINER，綁定孫助教教練檔案）
+  const acCoachData = {
+    account: 'ac_coach',
+    password: commonPass,
+    name: '孫助教（學院教練）',
+    displayName: '匿名',
+    role: 'TRAINER',
+    branchId: branchAc.id,
+    permissions: ['trainer'],
+    isActive: true,
+  };
+  const acCoach = await prisma.staff.upsert({
+    where: { account: 'ac_coach' },
+    update: acCoachData,
+    create: acCoachData,
+  });
+  await prisma.trainer.update({ where: { phone: '0911000006' }, data: { staffId: acCoach.id } });
+
+  // 5f. 和平／輔大四週變形排班：週期錨點（週一）＋早晚班各 2 名場務；補足示範排班人力（場務＋實習教練）
+  for (const [b, prefix, label] of [[branch, 'hp', '和平'], [branchFd, 'fd', '輔大']]) {
+    await prisma.branchRosterConfig.upsert({
+      where: { branchId: b.id },
+      update: {},
+      create: { branchId: b.id, cycleAnchorDate: new Date('2026-01-05T00:00:00Z'), morningHeadcount: 2, eveningHeadcount: 2 },
+    });
+    const rosterDefs = [
+      ...[1, 2, 3].map((n) => ({ account: `${prefix}_floor${n}`, name: `${label}場務${n}`, role: 'STAFF', permissions: ['ops'], employmentType: 'FULL_TIME' })),
+      ...[1, 2].map((n) => ({ account: `${prefix}_intern${n}`, name: `${label}實習教練${n}`, role: 'TRAINER', permissions: ['trainer'], employmentType: 'INTERN', weeklyHours: 24 })),
+    ];
+    for (const d of rosterDefs) {
+      await prisma.staff.upsert({
+        where: { account: d.account },
+        update: {},
+        create: { ...d, password: commonPass, displayName: '匿名', branchId: b.id, isActive: true, hireDate: new Date('2026-03-02T00:00:00Z') },
+      });
+    }
+  }
 
   // 6. 示範會員（含現金錢包供 POS 測試）
   const demoMemberNo = (await prisma.member.findUnique({ where: { phone: '0912345678' } }))
@@ -284,38 +365,55 @@ async function main() {
     console.log(`✅ 已為 ${backfilled} 位既有會員補上會員編號`);
   }
 
-  // 7. 示範進銷存商品（和平店，可立即 POS 測試）
+  // 7. 示範進銷存：商品主檔（全公司 SKU）＋和平店期初庫存（經 StockMovement OPENING 留痕）
   const productDefs = [
-    { sku: 'DR-WA-001', name: '波爾水', price: 15, cost: 7, stockQty: 100 },
-    { sku: 'TO2026-BK', name: '運動毛巾', price: 150, cost: 80, stockQty: 100 },
+    { sku: 'DR-WA-001', name: '波爾水', listPrice: 15, avgCost: 7, opening: 100 },
+    { sku: 'TO2026-BK', name: '運動毛巾', listPrice: 150, avgCost: 80, opening: 100 },
   ];
   for (const p of productDefs) {
-    const found = await prisma.product.findFirst({
-      where: { branchId: branch.id, sku: p.sku },
+    const product = await prisma.product.upsert({
+      where: { sku: p.sku },
+      create: { sku: p.sku, name: p.name, listPrice: p.listPrice, isActive: true },
+      update: { name: p.name, listPrice: p.listPrice, isActive: true },
     });
-    if (found) {
-      await prisma.product.update({
-        where: { id: found.id },
-        data: {
-          name: p.name,
-          price: p.price,
-          cost: p.cost,
-          stockQty: p.stockQty,
-          isActive: true,
-        },
-      });
-    } else {
-      await prisma.product.create({
-        data: { ...p, branchId: branch.id, isActive: true },
+    const stock = await prisma.branchStock.findUnique({
+      where: { branchId_productId: { branchId: branch.id, productId: product.id } },
+    });
+    if (!stock) {
+      await prisma.$transaction(async (tx) => {
+        await tx.branchStock.create({
+          data: { branchId: branch.id, productId: product.id, onHand: p.opening, avgCost: p.avgCost, isListed: true },
+        });
+        await tx.stockMovement.create({
+          data: {
+            branchId: branch.id,
+            productId: product.id,
+            qtyDelta: p.opening,
+            balanceAfter: p.opening,
+            unitCost: p.avgCost,
+            refType: 'OPENING',
+            reason: '種子期初庫存',
+          },
+        });
       });
     }
   }
 
+  const holidays = await prisma.publicHoliday.createMany({
+    data: DEFAULT_PUBLIC_HOLIDAYS.map(([date, name]) => ({ date: new Date(`${date}T00:00:00Z`), name })),
+    skipDuplicates: true,
+  });
+  console.log(`📅 國定假日曆：新增 ${holidays.count} 筆`);
+
   console.log('✅ 種子資料完成');
   console.log(`   分店: ${branch.name} (#${branch.id})`);
   console.log(`   場地: ${venue.name} (#${venue.id})`);
-  console.log(`   教練: ${trainer.name} (#${trainer.id})`);
+  console.log(`   教練: ${hpGoldTrainer.name} (#${hpGoldTrainer.id}) 等金銀牌教練已就位`);
   console.log(`   員工登入: account=admin / password=admin1234 (role=${staff.role})`);
+  console.log(`   主管示範: account=gm / password=staff1234 (GM 店務主管)`);
+  console.log(`   主管示範: account=fm / password=staff1234 (FM 教練主管)`);
+  console.log(`   店長示範: account=hp_mgr (和平店長), account=fd_mgr (輔大店長)`);
+  console.log(`   教練示範: account=ac_coach / password=staff1234 (TRAINER · 體適能學院)`);
   console.log(`   櫃檯示範: account=counter / password=staff1234 (STAFF · 無交易異動)`);
   console.log(`   值星示範: account=duty / password=duty1234 (DUTY · 可交易異動 · ${dutyStaff.name})`);
   console.log(`   示範會員: ${member.name} / ${member.phone} / ${member.memberNo || '(待補號)'}`);

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Alert, Button, Card, Field, Input, PageSection, Select } from '../../../components/ui';
 import { useToast } from '../../../contexts/ToastContext';
 import { fetchGroupClassCrm, getErrorMessage } from '../../../lib/api';
@@ -34,32 +34,34 @@ export default function HqCrmTab({ branches }: Props) {
   const [branchId, setBranchId] = useState<number | ''>('');
   const [rows, setRows] = useState<CrmRow[]>([]);
   const [summary, setSummary] = useState<Record<string, unknown> | null>(null);
-  const [busy, setBusy] = useState(false);
-
-  const load = useCallback(async () => {
-    setBusy(true);
-    try {
-      const res = await fetchGroupClassCrm({
-        from,
-        to,
-        branchId: branchId || undefined,
-      });
-      if (res.status !== 'success' || !res.data) {
-        toast(res.message || '載入失敗', 'error');
-        return;
-      }
-      setRows((res.data.rows || []) as CrmRow[]);
-      setSummary(res.data.summary || null);
-    } catch (err) {
-      toast(getErrorMessage(err, '載入團課 CRM 失敗'), 'error');
-    } finally {
-      setBusy(false);
-    }
-  }, [from, to, branchId, toast]);
+  const [reloadKey, setReloadKey] = useState(0);
+  const load = () => setReloadKey((k) => k + 1);
+  const requestKey = `${from}|${to}|${branchId}|${reloadKey}`;
+  const [loadedKey, setLoadedKey] = useState<string | null>(null);
+  const busy = loadedKey !== requestKey;
 
   useEffect(() => {
-    void load();
-  }, [load]);
+    let cancelled = false;
+    fetchGroupClassCrm({ from, to, branchId: branchId || undefined })
+      .then((res) => {
+        if (cancelled) return;
+        if (res.status !== 'success' || !res.data) {
+          toast(res.message || '載入失敗', 'error');
+          return;
+        }
+        setRows((res.data.rows || []) as CrmRow[]);
+        setSummary(res.data.summary || null);
+      })
+      .catch((err) => {
+        if (!cancelled) toast(getErrorMessage(err, '載入團課 CRM 失敗'), 'error');
+      })
+      .finally(() => {
+        if (!cancelled) setLoadedKey(requestKey);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [from, to, branchId, requestKey, toast]);
 
   const renew = (summary?.renewProxy || {}) as {
     membersWithClass?: number;

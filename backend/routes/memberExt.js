@@ -73,7 +73,7 @@ function sendErr(res, error, fallback = '操作失敗') {
   return res.status(500).json({ status: 'error', message: fallback });
 }
 
-/** 課程請假：開課前 24 小時內視為逾期（扣課／扣點） */
+/** 私教請假：開課前 24 小時內視為逾期（扣課）；團課請假走 /api/member/group */
 const CLASS_LEAVE_POLICY_HOURS = 24;
 
 // PATCH /api/member/profile-ext
@@ -343,6 +343,13 @@ router.post('/class-leave', verifyMemberDevice, async (req, res) => {
       return res.status(404).json({ status: 'error', message: '找不到預約' });
     }
     if (reservation.classLeave) throw httpError('此預約已申請請假');
+    if (reservation.class.type === 'GROUP') {
+      return res.status(409).json({
+        status: 'error',
+        code: 'USE_GROUP_LEAVE',
+        message: '團課請假請改用 POST /api/member/group/reservations/:id/leave（開課前 24 小時取得補課權）',
+      });
+    }
     if (!['CONFIRMED', 'PENDING'].includes(reservation.status)) {
       throw httpError('此預約狀態不可請假');
     }
@@ -351,7 +358,7 @@ router.post('/class-leave', verifyMemberDevice, async (req, res) => {
       (new Date(reservation.class.startAt) - Date.now()) / (3600 * 1000);
     const withinPolicy = hoursUntil >= CLASS_LEAVE_POLICY_HOURS;
     let deductedSessions = 0;
-    let deductedPoints = 0;
+    const deductedPoints = 0;
 
     const row = await prisma.$transaction(async (tx) => {
       if (!withinPolicy && reservation.class.type === 'PRIVATE') {
@@ -367,27 +374,6 @@ router.post('/class-leave', verifyMemberDevice, async (req, res) => {
           deductedSessions = 1;
         }
       }
-      if (!withinPolicy && reservation.class.type === 'GROUP') {
-        const member = await tx.member.findUnique({ where: { id: memberId } });
-        if (member && member.pointsBalance >= 1) {
-          await tx.member.update({
-            where: { id: memberId },
-            data: { pointsBalance: member.pointsBalance - 1 },
-          });
-          await tx.memberPointsLedger.create({
-            data: {
-              memberId,
-              delta: -1,
-              balance: member.pointsBalance - 1,
-              reason: '逾期請假扣點',
-              refType: 'CLASS_LEAVE',
-              refId: String(reservationId),
-            },
-          });
-          deductedPoints = 1;
-        }
-      }
-
       const leave = await tx.classLeave.create({
         data: {
           memberId,
@@ -417,79 +403,16 @@ router.post('/class-leave', verifyMemberDevice, async (req, res) => {
   }
 });
 
-router.get('/makeup-slots', async (req, res) => {
-  try {
-    const memberId = req.user.memberId;
-    const now = new Date();
-    const slots = await prisma.makeupSlot.findMany({
-      where: { class: { startAt: { gt: now } } },
-      include: {
-        class: {
-          select: {
-            id: true,
-            title: true,
-            startAt: true,
-            endAt: true,
-            trainer: { select: { id: true, name: true } },
-          },
-        },
-        _count: { select: { registrations: true } },
-      },
-      orderBy: { class: { startAt: 'asc' } },
-      take: 50,
-    });
-    const items = slots
-      .filter((s) => s._count.registrations < s.capacity)
-      .map((s) => ({
-        id: s.id,
-        classId: s.classId,
-        capacity: s.capacity,
-        registered: s._count.registrations,
-        remaining: s.capacity - s._count.registrations,
-        class: s.class,
-      }));
-
-    const myRegs = await prisma.makeupRegistration.findMany({
-      where: { memberId },
-      select: { makeupSlotId: true, status: true },
-    });
-    res.json({ status: 'success', data: { slots: items, myRegistrations: myRegs } });
-  } catch (error) {
-    sendErr(res, error, '讀取補課名額失敗');
-  }
-});
-
-router.post('/makeup-register', verifyMemberDevice, async (req, res) => {
-  try {
-    const memberId = req.user.memberId;
-    const makeupSlotId = parseInt(req.body?.makeupSlotId, 10);
-    if (!Number.isInteger(makeupSlotId) || makeupSlotId <= 0) {
-      throw httpError('請提供 makeupSlotId');
-    }
-    const slot = await prisma.makeupSlot.findUnique({
-      where: { id: makeupSlotId },
-      include: { _count: { select: { registrations: true } }, class: true },
-    });
-    if (!slot) return res.status(404).json({ status: 'error', message: '找不到補課名額' });
-    if (slot._count.registrations >= slot.capacity) throw httpError('補課名額已滿');
-
-    const row = await prisma.makeupRegistration.create({
-      data: {
-        memberId,
-        makeupSlotId,
-        originalReservationId: req.body?.originalReservationId
-          ? parseInt(req.body.originalReservationId, 10)
-          : null,
-      },
-    });
-    res.json({ status: 'success', message: '補課登記成功', data: row });
-  } catch (error) {
-    if (error.code === 'P2002') {
-      return res.status(409).json({ status: 'error', message: '您已登記此補課' });
-    }
-    sendErr(res, error, '補課登記失敗');
-  }
-});
+// 舊版免費補課名額已停用：團課改為付費期班，補課一律走 /api/member/group（請假取得補課權）
+function makeupRetired(req, res) {
+  res.status(410).json({
+    status: 'error',
+    code: 'USE_GROUP_MAKEUP',
+    message: '團課補課改為「請假取得補課權 → 同課程其他期班補課」，請至團課頁操作',
+  });
+}
+router.get('/makeup-slots', makeupRetired);
+router.post('/makeup-register', makeupRetired);
 
 router.post('/subscription-leave', verifyMemberDevice, async (req, res) => {
   try {

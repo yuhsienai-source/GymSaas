@@ -1,4 +1,4 @@
-import { type FormEvent, useCallback, useEffect, useState } from 'react';
+import { type FormEvent, useEffect, useState } from 'react';
 import { Button, Card, Field, Input, PageSection, Select } from '../../../components/ui';
 import { useToast } from '../../../contexts/ToastContext';
 import {
@@ -32,43 +32,44 @@ export default function HqCmsTab({ branches }: Pick<HqDataProps, 'branches'>) {
   const [faqQ, setFaqQ] = useState('');
   const [faqA, setFaqA] = useState('');
 
-  const [editBranchId, setEditBranchId] = useState<number | ''>('');
-  const [introText, setIntroText] = useState('');
-  const [showOccupancy, setShowOccupancy] = useState(true);
+  const [pickedBranchId, setEditBranchId] = useState<number | ''>('');
+  const editBranchId: number | '' = pickedBranchId !== '' ? pickedBranchId : branchIntros.length ? branchIntros[0].id : '';
+  const currentIntro = branchIntros.find((x) => x.id === editBranchId);
+  /** 草稿綁定載入當下的分店資料；切換分店或重新載入後回到伺服器內容 */
+  const [introDraft, setIntroDraft] = useState<{
+    record: CmsBranchIntro;
+    introText: string;
+    showOccupancy: boolean;
+  } | null>(null);
+  const activeDraft = introDraft && introDraft.record === currentIntro ? introDraft : null;
+  const introText = activeDraft?.introText ?? currentIntro?.introText ?? '';
+  const showOccupancy = activeDraft?.showOccupancy ?? (currentIntro?.showOccupancy !== false);
+  const setIntroText = (value: string) => {
+    if (currentIntro) setIntroDraft({ record: currentIntro, introText: value, showOccupancy });
+  };
+  const setShowOccupancy = (value: boolean) => {
+    if (currentIntro) setIntroDraft({ record: currentIntro, introText, showOccupancy: value });
+  };
 
-  const load = useCallback(async () => {
-    try {
-      const [annRes, faqRes, branchRes] = await Promise.all([
-        fetchCmsAnnouncements(),
-        fetchCmsFaq(),
-        fetchCmsBranches(),
-      ]);
-      if (annRes.status === 'success' && annRes.data) setAnnouncements(annRes.data);
-      if (faqRes.status === 'success' && faqRes.data) setFaqItems(faqRes.data);
-      if (branchRes.status === 'success' && branchRes.data) {
-        setBranchIntros(branchRes.data);
-        if (!editBranchId && branchRes.data[0]) {
-          setEditBranchId(branchRes.data[0].id);
-          setIntroText(branchRes.data[0].introText || '');
-          setShowOccupancy(branchRes.data[0].showOccupancy !== false);
-        }
-      }
-    } catch (err) {
-      toast(getErrorMessage(err, '載入 CMS 失敗'), 'error');
-    }
-  }, [editBranchId, toast]);
+  const [reloadKey, setReloadKey] = useState(0);
+  const load = () => setReloadKey((k) => k + 1);
 
   useEffect(() => {
-    void load();
-  }, [load]);
-
-  useEffect(() => {
-    const b = branchIntros.find((x) => x.id === editBranchId);
-    if (b) {
-      setIntroText(b.introText || '');
-      setShowOccupancy(b.showOccupancy !== false);
-    }
-  }, [editBranchId, branchIntros]);
+    let cancelled = false;
+    Promise.all([fetchCmsAnnouncements(), fetchCmsFaq(), fetchCmsBranches()])
+      .then(([annRes, faqRes, branchRes]) => {
+        if (cancelled) return;
+        if (annRes.status === 'success' && annRes.data) setAnnouncements(annRes.data);
+        if (faqRes.status === 'success' && faqRes.data) setFaqItems(faqRes.data);
+        if (branchRes.status === 'success' && branchRes.data) setBranchIntros(branchRes.data);
+      })
+      .catch((err) => {
+        if (!cancelled) toast(getErrorMessage(err, '載入 CMS 失敗'), 'error');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [reloadKey, toast]);
 
   async function onSaveBranchIntro(e: FormEvent) {
     e.preventDefault();

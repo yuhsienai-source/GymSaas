@@ -10,15 +10,12 @@ import {
   fetchTopupReport,
   getErrorMessage,
   opsCancelGate,
-  opsCancelPtPurchase,
-  opsCancelSale,
-  opsRefund,
   type ReportPayload,
 } from '../../../lib/api';
 import { staffBranchLabel } from '../../../lib/branchLabel';
 import { defaultReportRange, downloadCsv } from '../../../lib/csvExport';
 import { formatGateAccessNo } from '../../../lib/gateAccessNo';
-import { printAllowanceSlip, type AllowanceSlip } from '../../../lib/printAllowanceSlip';
+import RefundDialog from '../../../components/staff/RefundDialog';
 import type { Branch } from '../../../types/api';
 
 type ReportKind = 'orders' | 'topup' | 'gate' | 'sales' | 'coursePurchases';
@@ -80,33 +77,6 @@ function cardModeLabel(r: Record<string, unknown>) {
   }
   if (mode === 'LUMP' || !mode) return '一次付清';
   return mode;
-}
-
-/** @returns 折讓單據號碼；無則 null */
-function tryPrintAllowanceSlip(result: { data?: unknown; message?: string }): string | null {
-  const slip = (result.data as { allowanceSlip?: AllowanceSlip | null } | undefined)
-    ?.allowanceSlip;
-  if (!slip?.allowanceNo) return null;
-  try {
-    printAllowanceSlip(slip);
-  } catch {
-    // 列印失敗仍回傳單號，由呼叫端 toast 提示查詢
-  }
-  return slip.allowanceNo;
-}
-
-function toastRefundDone(
-  toastFn: (m: string, t?: 'success' | 'error' | 'info') => void,
-  result: { data?: unknown; message?: string },
-  fallback: string,
-) {
-  const no = tryPrintAllowanceSlip(result);
-  toastFn(
-    no
-      ? `${result.message || fallback} · 折讓單據號碼 ${no}`
-      : result.message || fallback,
-    'success',
-  );
 }
 
 function txnStatusText(r: Record<string, unknown>) {
@@ -210,6 +180,10 @@ export default function HqReportsTab({
   const [payload, setPayload] = useState<ReportPayload<Record<string, unknown>> | null>(null);
   const [detailRow, setDetailRow] = useState<Record<string, unknown> | null>(null);
   const [actionBusyKey, setActionBusyKey] = useState<string | null>(null);
+  const [refundTarget, setRefundTarget] = useState<{
+    refId: string;
+    prefer?: 'TOPUP_CANCEL' | 'SUB_ORDER_REFUND';
+  } | null>(null);
 
   const runQuery = useCallback(async () => {
     setLoading(true);
@@ -313,8 +287,8 @@ export default function HqReportsTab({
     if (
       !window.confirm(
         isUnlimited && !isRecurring
-          ? `確定取消沖回月卡購案 ${orderId}？\n將截斷效期並降為計時（不開折讓）；若要依月卡退費基準折讓請用「退費折讓」。`
-          : `確定取消沖回訂閱／月卡相關單號 ${orderId}？\n（定期定額將停續扣並保留效期；計時儲值請改用退費折讓）`,
+          ? `確定取消沖回月卡購案 ${orderId}？\n將截斷效期並降為計時（不退款、不開折讓）；要退款請用「退費」。`
+          : `確定取消沖回訂閱／月卡相關單號 ${orderId}？\n（定期定額將停續扣並保留效期；要退款請用「退費」）`,
       )
     )
       return;
@@ -327,132 +301,32 @@ export default function HqReportsTab({
         });
         toast(result.message || '已取消', 'success');
       } catch (err) {
-        toast(getErrorMessage(err, '取消沖回失敗（計時儲值請改用退費折讓）'), 'error');
+        toast(getErrorMessage(err, '取消沖回失敗（計時儲值請改用退費）'), 'error');
       }
     });
   }
 
-  async function onTopupRefund(r: Record<string, unknown>) {
+  /** 退費一律走後端試算＋必填原因（RefundDialog）；計時儲值預設原單取消，月卡預設子單退費 */
+  function onTopupRefund(r: Record<string, unknown>) {
     const orderId = String(r.orderId || '').trim();
     if (!orderId) return;
     const isUnlimited = String(r.usageType || '').toUpperCase() === 'UNLIMITED';
-    if (isUnlimited) {
-      if (
-        !window.confirm(
-          `確定對月卡 ${orderId} 執行退費折讓？\n` +
-            `將截斷效期。退費基準：30 日為一期；未滿十五日＝已繳×存續比例−手續費$500；滿／逾十五日以一期計不可退。` +
-            (r.recurringStopped
-              ? `\n（此單定期定額已停，將直接依訂單做截斷／折讓）`
-              : ''),
-        )
-      )
-        return;
-      await withRowAction(`topup-refund-${orderId}`, async () => {
-        try {
-          const result = await cancelOpsCardSubscription(orderId, {
-            expirePolicy: 'CUT_UNUSED',
-            doAllowance: true,
-            settle: true,
-          });
-          toastRefundDone(toast, result, '月卡退費折讓完成');
-        } catch (err) {
-          toast(getErrorMessage(err, '退費折讓失敗'), 'error');
-        }
-      });
-      return;
-    }
-    if (
-      !window.confirm(
-        `確定對 ${orderId} 執行退費折讓？\n` +
-          `公式：實付金額 − 實際使用額度 − 手續費 $100 = 退費金額\n` +
-          `將回收剩餘本金／運動金，並對已開立發票開立 ezPay 折讓。`,
-      )
-    )
-      return;
-    await withRowAction(`topup-refund-${orderId}`, async () => {
-      try {
-        // 發票號以後端訂單為準，勿帶報表顯示值（避免格式／複合號誤判）
-        const result = await opsRefund(orderId);
-        toastRefundDone(toast, result, '退費折讓完成');
-      } catch (err) {
-        toast(getErrorMessage(err, '退費折讓失敗'), 'error');
-      }
-    });
+    setRefundTarget({ refId: orderId, prefer: isUnlimited ? 'SUB_ORDER_REFUND' : 'TOPUP_CANCEL' });
   }
 
-  async function onSaleCancel(r: Record<string, unknown>) {
+  function onSaleRefund(r: Record<string, unknown>) {
     const saleId = String(r.saleId || '').trim();
-    if (!saleId) return;
-    if (
-      !window.confirm(
-        `確定取消沖回銷貨 ${saleId}？將回補庫存、退回零錢包；有發票時會作廢或折讓。`,
-      )
-    )
-      return;
-    await withRowAction(`sale-cancel-${saleId}`, async () => {
-      try {
-        const result = await opsCancelSale(saleId, '報表取消沖回', { prefer: 'void' });
-        toast(result.message || '銷貨已取消', 'success');
-      } catch (err) {
-        toast(getErrorMessage(err, '取消沖回失敗'), 'error');
-      }
-    });
+    if (saleId) setRefundTarget({ refId: saleId });
   }
 
-  async function onSaleRefund(r: Record<string, unknown>) {
-    const saleId = String(r.saleId || '').trim();
-    if (!saleId) return;
-    if (
-      !window.confirm(
-        `確定對銷貨 ${saleId} 執行退費折讓取消？將回補庫存並優先以發票折讓／作廢處理。`,
-      )
-    )
-      return;
-    await withRowAction(`sale-refund-${saleId}`, async () => {
-      try {
-        const result = await opsCancelSale(saleId, '報表退費折讓', { prefer: 'allowance' });
-        toastRefundDone(toast, result, '銷貨已取消（折讓／作廢）');
-      } catch (err) {
-        toast(getErrorMessage(err, '退費折讓失敗'), 'error');
-      }
-    });
-  }
-
-  async function onCourseCancel(r: Record<string, unknown>, prefer: 'void' | 'allowance') {
-    const checkoutId = r.checkoutId ? String(r.checkoutId).trim() : '';
-    const orderId = r.orderId ? String(r.orderId).trim() : '';
-    if (!checkoutId && !orderId) {
+  /** 優先單筆私教子單；僅有 CHK 時由視窗列出子單選擇 */
+  function onCourseRefund(r: Record<string, unknown>) {
+    const ref = String(r.orderId || r.checkoutId || '').trim();
+    if (!ref) {
       toast('缺少結帳／訂單編號', 'error');
       return;
     }
-    const label = prefer === 'allowance' ? '退費折讓' : '取消沖回';
-    // 優先單筆 orderId，避免 CHK 一次取消所有私教腿
-    const ref = orderId || checkoutId;
-    if (
-      !window.confirm(
-        `確定對 ${ref} 執行${label}？\n` +
-          (prefer === 'allowance'
-            ? '將以發票折讓處理並停用未使用私教合約。'
-            : '將作廢／沖回發票並停用未使用私教合約。'),
-      )
-    )
-      return;
-    await withRowAction(`course-${prefer}-${ref}`, async () => {
-      try {
-        const result = await opsCancelPtPurchase({
-          ...(orderId ? { orderId } : { checkoutId }),
-          prefer,
-          reason: `報表${label}`,
-        });
-        if (prefer === 'allowance') {
-          toastRefundDone(toast, result, `私教購案已${label}`);
-        } else {
-          toast(result.message || `私教購案已${label}`, 'success');
-        }
-      } catch (err) {
-        toast(getErrorMessage(err, `${label}失敗`), 'error');
-      }
-    });
+    setRefundTarget({ refId: ref, prefer: 'SUB_ORDER_REFUND' });
   }
 
   async function onGateCancel(r: Record<string, unknown>) {
@@ -645,17 +519,17 @@ export default function HqReportsTab({
     pageDesc ||
     (fixedKind === 'orders'
       ? '依分店查詢合併結帳／獨立訂單 · 明細與 CSV（最多 1000 筆）'
-      : '明細列表查詢與 CSV 輸出；列上可執行取消沖回／退費折讓（最多 1000 筆）');
+      : '明細列表查詢與 CSV 輸出；列上可執行退費（後端試算）／取消沖回（最多 1000 筆）');
 
   const reverseRulesByKind: Record<Exclude<ReportKind, 'orders'>, string> = {
     topup:
-      '儲值／月卡：計時儲值僅能「退費折讓」，公式＝實付金額 − 實際使用額度 − 手續費$100。無限月卡／訂閱「退費折讓」＝截斷效期；未滿十五日＝已繳金額×契約存續比例−手續費$500，滿／逾十五日以一期計不可退。無限月卡「取消沖回」＝截斷效期、不開折讓。定期定額「取消沖回」＝停續扣並保留效期（訂單仍顯示成功／訂閱已停）；之後仍可再按「退費折讓」截斷效期並開折讓。',
+      '儲值／月卡：計時儲值「退費」預設原單取消（會員錢包須仍完整保有本次本金與運動金，否則 409），已動用者改選「未使用退費」（消保公式）。月卡「退費」＝7 日內未使用全額退或未使用部分退費（含終止定期定額）。「取消沖回」僅停續扣／截斷效期，不退款。',
     sales:
-      '銷貨：兩者皆回補庫存並退回零錢包。「取消沖回」優先作廢發票；「退費折讓」優先開立折讓單（須已開票成功；無真實發票號不可折讓）。已結案列不可再操作。',
+      '銷貨：「退貨／退費」可全部或指定品項數量退貨，庫存回補；本期全額退作廢發票，其餘開立 ezPay 折讓單。',
     gate:
-      '進出場：僅「取消沖回」。在場可取消不計費；已出場則退回已扣費用至零錢包（已出場退費限 DUTY 以上）。無退費折讓按鈕。',
+      '進出場：僅「取消沖回」。在場可取消不計費；已出場則退回已扣費用至零錢包（已出場退費限 DUTY 以上）。',
     coursePurchases:
-      '私教購案：「取消沖回」優先作廢／沖回發票；「退費折讓」開立折讓單。兩者皆停用未使用合約；若已使用堂數則無法取消沖回。合併結帳請盡量用列上的訂單號操作，避免一次沖掉整筆 CHK。',
+      '私教購案：「退費」＝未上課全額退或未上堂數退費（扣已上堂數與手續費），合約停用。合併結帳僅列子單供選擇，不會整筆沖回 CHK。',
   };
 
   return (
@@ -663,42 +537,14 @@ export default function HqReportsTab({
       {!fixedKind ? (
         <>
           <Card
-            title="取消沖回與退費折讓｜使用規則"
-            subtitle="權限：DUTY（值星）以上 · 實際異動請於下方報表列操作；「折讓單據」分頁僅供查詢／列印"
+            title="退費與取消沖回｜使用規則"
+            subtitle="權限：DUTY（值星）以上 · 退費必填原因並留稽核；處理中退費單與折讓單請至「退費／折讓」分頁"
           >
             <div className="form-stack" style={{ gap: '0.65rem' }}>
               <p className="text-sm" style={{ margin: 0 }}>
-                <strong>取消沖回</strong>
-                ：交易當下作廢／沖銷為主（盡量不作折讓單）。適用「當日誤開、整筆撤銷、停定期定額但保留效期」等。
+                <strong>退費</strong>
+                ：金額、退款管道（依原付款比例：現金／零錢包／LINE Pay／PayUNi／乙禾，抵用券註銷不退現）與發票作法（本期全額作廢、其餘折讓）皆由後端試算後執行。乙禾刷卡須於端末退貨後回填憑證；B2B 折讓須顧客客顯簽名才結案。
               </p>
-              <p className="text-sm" style={{ margin: 0 }}>
-                <strong>退費折讓</strong>
-                ：須已開票成功；已開發票後需退現金／部分退費時開立 ezPay 折讓單；完成後可至「折讓單據」查詢或列印號碼。未開票不可折讓。
-              </p>
-              <ul className="text-sm" style={{ margin: 0, paddingLeft: '1.2rem' }}>
-                <li>
-                  <strong>一般儲值（計時）</strong>
-                  ：僅「退費折讓」；公式＝實付金額 − 實際使用額度 − 手續費$100。勿用取消沖回。
-                </li>
-                <li>
-                  <strong>無限月卡（非定期定額）</strong>
-                  ：取消沖回＝截斷效期不開折讓；退費折讓＝截斷效期＋30
-                  日一期基準（未滿十五日可退、手續費$500；滿／逾十五日不可退）。
-                </li>
-                <li>
-                  <strong>定期定額訂閱</strong>
-                  ：取消沖回＝停續扣、保留效期（訂單仍為成功／訂閱已停）；若要截斷效期並退費請再按退費折讓（同上月卡基準）。
-                </li>
-                <li>
-                  <strong>銷貨</strong>：兩者皆可；沖回優先作廢發票，折讓優先開折讓單。
-                </li>
-                <li>
-                  <strong>進出場</strong>：僅取消沖回（無折讓）。
-                </li>
-                <li>
-                  <strong>私教購案</strong>：兩者皆可，但已使用堂數不可取消沖回；有發票時折讓才會開折讓單。
-                </li>
-              </ul>
             </div>
           </Card>
 
@@ -988,9 +834,9 @@ export default function HqReportsTab({
                         size="sm"
                         variant="secondary"
                         disabled={done || Boolean(busy) || loading}
-                        onClick={() => void onTopupRefund(r)}
+                        onClick={() => onTopupRefund(r)}
                       >
-                        退費折讓
+                        退費
                       </Button>
                     </ActionCell>
                   </tr>
@@ -1034,9 +880,6 @@ export default function HqReportsTab({
             {kind === 'sales' &&
               rows.map((r) => {
                 const saleId = String(r.saleId ?? '');
-                const busy =
-                  actionBusyKey === `sale-cancel-${saleId}` ||
-                  actionBusyKey === `sale-refund-${saleId}`;
                 const done = rowIsFinal(r);
                 return (
                   <tr key={saleId}>
@@ -1057,18 +900,10 @@ export default function HqReportsTab({
                       <Button
                         size="sm"
                         variant="secondary"
-                        disabled={done || busy || loading}
-                        onClick={() => void onSaleCancel(r)}
+                        disabled={done || loading}
+                        onClick={() => onSaleRefund(r)}
                       >
-                        取消沖回
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="secondary"
-                        disabled={done || busy || loading}
-                        onClick={() => void onSaleRefund(r)}
-                      >
-                        退費折讓
+                        退貨／退費
                       </Button>
                     </ActionCell>
                   </tr>
@@ -1077,10 +912,6 @@ export default function HqReportsTab({
             {kind === 'coursePurchases' &&
               rows.map((r) => {
                 const rowKey = String(r.rowId ?? `${r.checkoutId}-${r.planName}`);
-                const ref = String(r.checkoutId || r.orderId || rowKey);
-                const busy =
-                  actionBusyKey === `course-void-${ref}` ||
-                  actionBusyKey === `course-allowance-${ref}`;
                 const done = rowIsFinal(r);
                 return (
                   <tr key={rowKey}>
@@ -1106,18 +937,10 @@ export default function HqReportsTab({
                       <Button
                         size="sm"
                         variant="secondary"
-                        disabled={done || busy || loading}
-                        onClick={() => void onCourseCancel(r, 'void')}
+                        disabled={done || loading}
+                        onClick={() => onCourseRefund(r)}
                       >
-                        取消沖回
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="secondary"
-                        disabled={done || busy || loading}
-                        onClick={() => void onCourseCancel(r, 'allowance')}
-                      >
-                        退費折讓
+                        退費
                       </Button>
                     </ActionCell>
                   </tr>
@@ -1204,6 +1027,18 @@ export default function HqReportsTab({
           </div>
         )}
       </Modal>
+
+      {refundTarget && (
+        <RefundDialog
+          open
+          refId={refundTarget.refId}
+          preferAction={refundTarget.prefer}
+          onClose={() => {
+            setRefundTarget(null);
+            void runQuery();
+          }}
+        />
+      )}
     </PageSection>
   );
 }

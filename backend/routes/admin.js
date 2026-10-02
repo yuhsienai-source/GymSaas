@@ -3,7 +3,9 @@ import prisma from '../lib/prisma.js';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
 import { verifyStaff, requireAdmin } from '../middleware/jwtAuth.js';
-import { toJwtPayload, toStaffAuthPayload } from '../lib/staffAccess.js';
+import { staffAuthInclude, toJwtPayload, toStaffAuthPayload } from '../lib/staffAccess.js';
+import { readStaffAvatar } from '../lib/staffPhoto.js';
+import { resolveDutyStatus } from '../lib/attendanceService.js';
 import { createRateLimiter } from '../middleware/rateLimit.js';
 import { opsResetMemberDevice } from '../lib/deviceReset.js';
 import { clientIp, clientUserAgent } from '../lib/memberDeviceAudit.js';
@@ -123,10 +125,7 @@ router.post('/login', loginLimiter, async (req, res) => {
     // 2. 尋找帳號
     const staff = await prisma.staff.findUnique({
       where: { account },
-      include: {
-        branch: { select: { id: true, name: true, code: true } },
-        trainerProfile: { select: { id: true, isActive: true } },
-      },
+      include: staffAuthInclude,
     });
     
     // 資安觀念：帳號不存在或密碼錯誤，一律回傳相同的模糊錯誤，防止駭客猜測帳號是否存在
@@ -149,18 +148,24 @@ router.post('/login', loginLimiter, async (req, res) => {
       staff.trainerProfile?.isActive === false ? null : staff.trainerProfile?.id ?? null;
 
     // 5. 發行 JWT
-    const token = jwt.sign(
-      toJwtPayload(staff, { trainerId }),
-      process.env.JWT_SECRET,
-      { expiresIn: '8h' },
-    );
+    const payload = toJwtPayload(staff, { trainerId });
+    const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });
+
+    // 6. 班表值勤判定（非值勤仍可登入，業務模組由 staffDutyGate 鎖定）
+    let duty = null;
+    try {
+      duty = await resolveDutyStatus(payload);
+    } catch (err) {
+      console.error('員工登入值勤判定失敗:', err.message);
+    }
 
     res.json({
       status: 'success',
-      message: '登入成功',
+      message: duty && !duty.onDuty ? `登入成功（非值勤：${duty.message}）` : '登入成功',
       data: {
         token,
         staff: toStaffAuthPayload(staff, { trainerId }),
+        duty,
       },
     });
 
@@ -178,10 +183,7 @@ router.get('/me', verifyStaff, async (req, res) => {
   try {
     const staff = await prisma.staff.findUnique({
       where: { id: req.user.id },
-      include: {
-        branch: { select: { id: true, name: true, code: true } },
-        trainerProfile: { select: { id: true, isActive: true } },
-      },
+      include: staffAuthInclude,
     });
     if (!staff || !staff.isActive) {
       return res.status(403).json({ status: 'error', message: '帳號不存在或已停權' });
@@ -192,6 +194,17 @@ router.get('/me', verifyStaff, async (req, res) => {
   } catch (error) {
     console.error('讀取員工資訊失敗:', error);
     res.status(500).json({ status: 'error', message: '系統錯誤' });
+  }
+});
+
+// 本人頭像縮圖（JSON data URL；無照片回 null）
+router.get('/me/photo', verifyStaff, async (req, res) => {
+  try {
+    const avatar = await readStaffAvatar(req.user.id);
+    res.json({ status: 'success', data: avatar });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ status: 'error', message: '讀取頭像失敗' });
   }
 });
 

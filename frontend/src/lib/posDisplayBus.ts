@@ -1,10 +1,19 @@
 /**
  * 客顯通訊層：BroadcastChannel('pos_display_bus') 為主，
- * localStorage + storage 事件為跨進程／跨視窗備援心跳。
+ * localStorage + storage 事件為跨進程／跨視窗備援。
+ * Host 定期 PING；Display 回 PONG。超過 LINK_TIMEOUT 未收到對端 → 視為斷線。
+ * 簽名：Display 送 SIGNATURE_COMPLETED，Host 回 SIGNATURE_ACK 後客顯才回 IDLE。
  */
-const CHANNEL = 'pos_display_bus';
+export const POS_DISPLAY_CHANNEL = 'pos_display_bus';
+const CHANNEL = POS_DISPLAY_CHANNEL;
 const STORAGE_KEY = 'gymsaas_pos_display_bus_v1';
 const HEARTBEAT_KEY = 'gymsaas_pos_display_hb';
+
+export const POS_DISPLAY_HEARTBEAT_MS = 5000;
+/** 約 2～3 次心跳沒回應 → 斷線 */
+export const POS_DISPLAY_LINK_TIMEOUT_MS = 12000;
+/** 客顯等主機簽名回執 */
+export const POS_DISPLAY_ACK_TIMEOUT_MS = 8000;
 
 export const POS_DISPLAY_TYPES = {
   IDLE: 'IDLE',
@@ -12,6 +21,7 @@ export const POS_DISPLAY_TYPES = {
   CART_UPDATE: 'CART_UPDATE',
   CONSENT: 'CONSENT',
   SIGNATURE_COMPLETED: 'SIGNATURE_COMPLETED',
+  SIGNATURE_ACK: 'SIGNATURE_ACK',
   PING: 'PING',
   PONG: 'PONG',
   RESET: 'RESET',
@@ -39,7 +49,7 @@ export type PosDisplayCartPayload = {
 };
 
 export type PosDisplayConsentPayload = {
-  /** ID_PHOTO_ASSIST | CONTRACT | … */
+  /** ID_PHOTO_ASSIST | CONTRACT | …（折讓簽收改走 ALLOWANCE_SIGN_* 事件，見 types/posDisplayBus.ts） */
   purpose: string;
   title: string;
   body: string;
@@ -54,6 +64,12 @@ export type PosDisplaySignaturePayload = {
   consentSignatureId: string;
   signatureDataUrl: string;
   signedAt: string;
+};
+
+export type PosDisplaySignatureAckPayload = {
+  consentSignatureId: string;
+  ok: boolean;
+  message?: string;
 };
 
 export type PosDisplayMessage = {
@@ -154,10 +170,12 @@ export function createPosDisplayBus(role: 'host' | 'display' = 'host') {
   }
 
   let hbTimer: ReturnType<typeof setInterval> | null = null;
-  function startHeartbeat(intervalMs = 5000) {
+  function startHeartbeat(intervalMs = POS_DISPLAY_HEARTBEAT_MS) {
     stopHeartbeat();
+    // 立刻打一拍，縮短開窗後的「尚未連線」空窗
+    post(role === 'host' ? POS_DISPLAY_TYPES.PING : POS_DISPLAY_TYPES.PONG, { role, beat: true });
     hbTimer = setInterval(() => {
-      post(role === 'host' ? POS_DISPLAY_TYPES.PING : POS_DISPLAY_TYPES.PONG, { role });
+      post(role === 'host' ? POS_DISPLAY_TYPES.PING : POS_DISPLAY_TYPES.PONG, { role, beat: true });
     }, intervalMs);
   }
   function stopHeartbeat() {

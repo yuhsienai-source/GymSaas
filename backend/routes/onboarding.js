@@ -865,9 +865,10 @@ router.post('/face-preference', requireOnboarding, async (req, res) => {
           facePreferenceSet: true,
         },
       });
-      const contracts = await loadOnboardingContracts({
-        includeBiometrics: faceEnabled,
-      });
+      const contracts = await loadOnboardingContracts(
+        { includeBiometrics: faceEnabled },
+        tx,
+      );
       if (contracts.length) {
         await ensurePendingSignatures(
           tx,

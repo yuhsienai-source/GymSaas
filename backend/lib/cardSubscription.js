@@ -21,7 +21,7 @@ import {
   resolveRecurringPeriodDays,
   buildRecurringInvoiceItemDesc,
 } from './promotion.js';
-import { issueInvoice } from './ezpay.js';
+import { issueOrderInvoice } from './einvoice.js';
 import { generateSubscriptionOrderId } from './orderIds.js';
 
 const MAX_FAILS = 3;
@@ -764,6 +764,7 @@ export async function processOneSubscription(subscriptionId, { now = new Date() 
           recurringAmount: sub.amount,
           recurringAmountFinal: sub.amountFinal,
           creditHash: sub.creditHash,
+          branchId: sub.promotion?.branchId ?? sub.coursePlan?.branchId ?? null,
           status: 'PENDING',
         },
       });
@@ -856,6 +857,7 @@ export async function processOneSubscription(subscriptionId, { now = new Date() 
       await fulfillPromotionPurchase(tx, sub.memberId, sub.promotion, {
         qty: 1,
         durationDaysOverride: durationOverride ?? undefined,
+        orderId,
       });
     }
 
@@ -874,24 +876,11 @@ export async function processOneSubscription(subscriptionId, { now = new Date() 
     });
   });
 
-  // 續扣發票（失敗不擋主流程）
-  try {
-    const invoiceResult = await issueInvoice({
-      id: orderId,
-      amount: chargeAmount,
-      itemDesc: buildRecurringInvoiceItemDesc(planName, { periodIndex }),
-      buyerName: sub.member?.name || '會員',
-    });
-    if (invoiceResult.Status === 'SUCCESS') {
-      const invoiceData = JSON.parse(invoiceResult.Result);
-      await prisma.order.update({
-        where: { id: orderId },
-        data: { invoiceNumber: invoiceData.InvoiceNumber },
-      });
-    }
-  } catch (err) {
-    console.error(`❌ 訂閱續扣 ${orderId} 發票失敗:`, err.message);
-  }
+  // 續扣發票（失敗入佇列，不擋主流程）
+  await issueOrderInvoice(orderId, {
+    buyerName: sub.member?.name || '會員',
+    itemName: buildRecurringInvoiceItemDesc(planName, { periodIndex }),
+  });
 
   console.log(`✅ 訂閱 ${sub.id} 第 ${periodIndex} 期扣款成功 → 訂單 ${orderId} $${chargeAmount}`);
   return { ok: true, orderId, chargeId, periodIndex, amount: chargeAmount };

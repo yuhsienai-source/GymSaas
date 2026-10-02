@@ -5,12 +5,12 @@ import { Alert, Button, Card, Field, Input, PasswordInput } from '../../componen
 import { useStaffAuth } from '../../contexts/StaffAuthContext';
 import { useToast } from '../../contexts/ToastContext';
 import { getErrorMessage, pingApiHealth, staffLogin } from '../../lib/api';
-import { getDefaultStaffPath } from '../../lib/staffPermissions';
+import { MY_ATTENDANCE_PATH, getDefaultStaffPath } from '../../lib/staffPermissions';
 
 export default function StaffLoginPage() {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
-  const { isAuthenticated, staff, login } = useStaffAuth();
+  const { isAuthenticated, staff, duty, login } = useStaffAuth();
   const { toast } = useToast();
   const [account, setAccount] = useState('');
   const [password, setPassword] = useState('');
@@ -35,10 +35,8 @@ export default function StaffLoginPage() {
 
   useEffect(() => {
     if (!isAuthenticated || !staff) return;
-    const next = getDefaultStaffPath(staff);
-    // 無可用模組時 getDefaultStaffPath 會是 /staff/login，避免自我導頁迴圈
-    if (next !== '/staff/login') navigate(next, { replace: true });
-  }, [isAuthenticated, navigate, staff]);
+    navigate(getDefaultStaffPath(staff, duty), { replace: true });
+  }, [isAuthenticated, navigate, staff, duty]);
 
   useEffect(() => {
     let cancelled = false;
@@ -62,14 +60,19 @@ export default function StaffLoginPage() {
     try {
       const result = await staffLogin(account, password);
       if (result.status === 'success' && result.data) {
-        login(result.data.token, result.data.staff);
-        const next = getDefaultStaffPath(result.data.staff);
-        if (next === '/staff/login') {
-          setError('此帳號尚未分配可用模組權限，請洽總部');
+        const { token, staff: info, duty: loginDuty } = result.data;
+        login(token, info, loginDuty);
+        // 班表值勤判定由後端：值勤窗內未打卡 → 引導打上班卡；非值勤 → 我的出勤（業務模組鎖定）
+        if (loginDuty?.canPunchIn && !loginDuty.exempt) {
+          toast(`歡迎，${info.name}：您是本時段班表值勤人員，請打上班卡`, 'info');
+          navigate(`${MY_ATTENDANCE_PATH}?punch=1`, { replace: true });
           return;
         }
-        toast(`歡迎，${result.data.staff.name}`, 'success');
-        navigate(next, { replace: true });
+        toast(
+          loginDuty && !loginDuty.onDuty ? `歡迎，${info.name}（非值勤：${loginDuty.message}）` : `歡迎，${info.name}`,
+          loginDuty && !loginDuty.onDuty ? 'info' : 'success',
+        );
+        navigate(getDefaultStaffPath(info, loginDuty), { replace: true });
       } else {
         setError(result.message || '登入失敗');
       }
@@ -99,7 +102,7 @@ export default function StaffLoginPage() {
         <Card className="auth-card" variant="elevated" padding="md">
           <div className="auth-card__hero">
             <h2>員工登入</h2>
-            <p>STAFF / DUTY / MANAGER / ADMIN · 交易異動限 DUTY 以上</p>
+            <p>STAFF / DUTY / STORE MANAGER / FM / GM / ADMIN · 交易異動限 DUTY 以上</p>
           </div>
 
           {apiOk === false ? (

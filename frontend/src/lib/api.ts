@@ -9,7 +9,9 @@ import {
   clearStaffToken,
   MEMBER_AUTH_LOST_EVENT,
   STAFF_AUTH_LOST_EVENT,
+  STAFF_OFF_DUTY_EVENT,
 } from './storage';
+import type { EmploymentType, LeaveType } from './laborLaw';
 import type {
   ApiResponse,
   MemberProfile,
@@ -23,12 +25,38 @@ import type {
   Venue,
   Trainer,
   Product,
+  ProductKind,
+  TaxType,
+  LegalEntity,
+  ProductMaster,
+  BranchStockRow,
+  Supplier,
+  SupplierPaymentTerm,
   PurchaseOrder,
+  PurchaseReceipt,
+  OpsReceiptRow,
+  SupplierPayable,
+  PayableAgingRow,
+  SupplierPayment,
+  SupplierPaymentMethod,
+  EInvoiceRow,
+  EInvoiceLogRow,
+  SalesReconciliation,
   StockMovement,
   PosPayMethod,
   PosCheckoutResult,
   StaffAccount,
+  StaffAvatar,
+  StaffConsentTemplate,
+  StaffFaceConsent,
   StaffPermission,
+  StaffPhotoStatus,
+  PublicHoliday,
+  RosterBranchConfig,
+  MyRosterOverview,
+  RosterAckStatus,
+  RosterCellCode,
+  RosterView,
   MemberIdentifyResult,
   MembershipContract,
   TrainerDashboardData,
@@ -54,11 +82,65 @@ import type {
   StaffAttendanceRow,
   StaffLeaveRow,
   StaffScheduleRow,
+  AttendanceFlag,
+  AttendanceOverview,
+  AttendanceRecord,
+  HolidayCalendar,
+  LeaveOverview,
+  LeaveStatus,
+  MyAttendance,
+  ScheduleBrief,
+  StaffDutyStatus,
+  MyLeaves,
+  PayrollExport,
+  PayrollAdjustmentType,
+  PayrollConfigData,
+  PayrollRunDetail,
+  PayrollRunSummary,
+  PayProfileList,
+  StaffPayProfileData,
+  MyPayslipDetail,
+  MyPayslipSummary,
+  ScheduleOverview,
+  ScheduleOverviewRow,
+  ScheduleSource,
+  StaffLineStatus,
+  StaffNotificationInbox,
+  StaffNotificationItem,
   CoachCommissionRule,
-  CoachCommissionLedger,
+  CoachCourseKind,
+  CoachTierRate,
+  HqCoachPerformanceItem,
+  TrainerMyPerformance,
+  MyCoachPlans,
+  CoachWeekPlan,
+  CoachPlanSlot,
+  CoachPlanStatus,
+  CoachPlanReviewList,
+  WeekPlanRole,
   ClassCheckInTokenResult,
+  GroupAdminSeries,
+  GroupEnrollKind,
+  GroupEnrollResult,
+  GroupMakeupOption,
+  GroupMemberOverview,
+  GroupRefundPreview,
+  GroupSellableSeries,
+  GroupSeriesDetail,
+  GroupSeriesRoster,
+  AllowanceExportPayload,
+  AllowanceListPayload,
+  AllowancePrintPayload,
+  RefundLookupResult,
+  RefundInvoiceResolveBody,
+  RefundGatewayRetryData,
+  RefundPreview,
+  RefundRecord,
+  RefundScope,
 } from '../types/api';
-import type { StaffInfo } from './storage';
+import type { AllowanceSignPreview } from '../types/posDisplayBus';
+import type { StaffInfo, StaffRole } from './storage';
+import type { BranchType, TrainerLevel, TrainerRole } from './orgStructure';
 
 function createClient(getToken: () => string | null): AxiosInstance {
   const client = axios.create({ baseURL: '/api' });
@@ -91,7 +173,7 @@ const SESSION_AUTH_CODES = new Set([
 let memberAuthRedirecting = false;
 let staffAuthRedirecting = false;
 
-function readApiErrorCode(error: unknown): string | undefined {
+export function readApiErrorCode(error: unknown): string | undefined {
   if (!axios.isAxiosError(error)) return undefined;
   const code = (error.response?.data as { code?: string } | undefined)?.code;
   return typeof code === 'string' ? code : undefined;
@@ -166,12 +248,15 @@ memberApi.interceptors.response.use(
   },
 );
 
-/** 員工 API：JWT 過期／缺票 → 清憑證並硬導員工登入（模組權限 403 不導） */
+/** 員工 API：JWT 過期／缺票 → 清憑證並硬導員工登入（模組權限 403 不導）；403 OFF_DUTY → 通知 AuthContext 切非值勤模式 */
 staffApi.interceptors.response.use(
   (res) => res,
   (error) => {
     if (isSessionAuthFailure(error)) {
       redirectStaffLogin(readApiErrorMessage(error, '登入已過期，請重新登入'));
+    } else if (readApiErrorCode(error) === 'OFF_DUTY' && typeof window !== 'undefined') {
+      const duty = (error.response?.data as { data?: { duty?: StaffDutyStatus } } | undefined)?.data?.duty ?? null;
+      window.dispatchEvent(new CustomEvent(STAFF_OFF_DUTY_EVENT, { detail: { duty } }));
     }
     return Promise.reject(error);
   },
@@ -591,15 +676,28 @@ export async function bindMemberDevice(deviceId: string) {
   return data;
 }
 
+/** 員工登入：回傳 duty＝班表值勤判定（null＝判定暫時失敗，登入後再查） */
 export async function staffLogin(account: string, password: string) {
   const { data } = await publicApi.post<
-    ApiResponse<{ token: string; staff: StaffInfo }>
+    ApiResponse<{ token: string; staff: StaffInfo; duty: StaffDutyStatus | null }>
   >('/admin/login', { account, password });
+  return data;
+}
+
+/** 目前班表值勤狀態（業務模組海關同一套規則） */
+export async function fetchStaffDutyStatus() {
+  const { data } = await staffApi.get<ApiResponse<StaffDutyStatus>>('/staff/hr/duty-status');
   return data;
 }
 
 export async function fetchStaffMe() {
   const { data } = await staffApi.get<ApiResponse<StaffInfo>>('/admin/me');
+  return data;
+}
+
+/** 本人頭像縮圖（無照片 data=null） */
+export async function fetchMyStaffPhoto() {
+  const { data } = await staffApi.get<ApiResponse<StaffAvatar | null>>('/admin/me/photo');
   return data;
 }
 
@@ -985,6 +1083,8 @@ export async function opsCheckout(payload: {
   promotionId?: number;
   qty?: number;
   courseItems?: { coursePlanId: number; qty: number; secondPersonOnSite?: boolean }[];
+  /** 團課期班（整期／單堂）：金額由後端依剩餘堂數計價 */
+  groupItems?: { seriesId: number; kind: GroupEnrollKind; classId?: number }[];
   trainerId?: number;
   payments?: { method: string; amount: number; voucherCode?: string }[];
   carrierNum?: string;
@@ -1008,9 +1108,9 @@ export async function opsCheckout(payload: {
       channel?: string;
       terminalHint?: string;
       invoiceNumber?: string | null;
-      /** Soft-split: one invoice per leg (SAL / promo / PT). */
+      /** Soft-split: one invoice per leg (SAL / promo / PT / GROUP). */
       invoices?: Array<{
-        leg: 'SALE' | 'PROMO' | 'PT' | string;
+        leg: 'SALE' | 'PROMO' | 'PT' | 'GROUP' | string;
         id: string;
         invoiceNumber: string | null;
         amount: number;
@@ -1029,8 +1129,22 @@ export async function opsCheckout(payload: {
       needsPeriodBind?: boolean;
       recurringAmount?: number | null;
       periodTimes?: number | null;
+      groupEnrollmentIds?: number[];
     }>
   >('/ops/checkout', payload);
+  return data;
+}
+
+/** 作廢待付款（乙禾／PayUNi 未完成）之 CHK／SAL／儲值單；後端回補預扣零錢包（DUTY+） */
+export async function opsCancelPendingPayment(id: string, body: { reason: string; checked: boolean }) {
+  const { data } = await staffApi.post<
+    ApiResponse<{
+      id: string;
+      kind: 'CHECKOUT' | 'SALE' | 'ORDER';
+      walletRestored: number;
+      memberWallet: { cashWallet: number; bonusWallet: number } | null;
+    }>
+  >(`/ops/pending-payments/${encodeURIComponent(id)}/cancel`, body);
   return data;
 }
 
@@ -1099,36 +1213,218 @@ export async function opsTopup(
   return data;
 }
 
-export async function opsRefund(
-  orderId: string,
-  options?: { invoiceNumber?: string; buyerEmail?: string },
-) {
-  const { data } = await staffApi.post('/ops/refund', {
-    ...(orderId?.trim() ? { orderId: orderId.trim() } : {}),
-    ...(options?.invoiceNumber?.trim()
-      ? { invoiceNumber: options.invoiceNumber.trim().toUpperCase() }
-      : {}),
-    ...(options?.buyerEmail?.trim() ? { buyerEmail: options.buyerEmail.trim() } : {}),
-  });
-  return data;
+// ── 退費／折讓：前端只送單號、scope、品項數量與原因；金額一律由後端試算 ──
+
+function refundRef(id: string) {
+  return encodeURIComponent(String(id || '').trim().toUpperCase());
 }
 
 export async function opsRefundLookup(params: { orderId?: string; invoiceNumber?: string }) {
-  const { data } = await staffApi.get('/ops/refund-lookup', { params });
+  const { data } = await staffApi.get<ApiResponse<RefundLookupResult>>('/ops/refund-lookup', { params });
   return data;
 }
 
-export async function fetchAllowanceSlip(allowanceNo: string) {
-  const { data } = await staffApi.get(`/ops/allowances/${encodeURIComponent(allowanceNo)}`);
+export async function previewTopupCancel(orderId: string) {
+  const { data } = await staffApi.get<ApiResponse<RefundPreview>>(`/ops/topups/${refundRef(orderId)}/cancel-preview`);
   return data;
 }
 
-export async function fetchAllowanceSlips(params?: {
-  orderId?: string;
-  invoiceNumber?: string;
+/** 退費送出冪等鍵：同一次送出（含逾時重按）沿用同一鍵，後端回傳同一張退費單 */
+export function newRefundIdempotencyKey() {
+  return `rfk_${crypto.randomUUID().replace(/-/g, '')}`;
+}
+
+export async function executeTopupCancel(
+  orderId: string,
+  body: { quoteToken: string; reason: string; buyerEmail?: string },
+  idempotencyKey: string,
+) {
+  const { data } = await staffApi.post<ApiResponse<RefundRecord>>(
+    `/ops/topups/${refundRef(orderId)}/cancel`,
+    {
+      quoteToken: body.quoteToken,
+      reason: body.reason,
+      ...(body.buyerEmail?.trim() ? { buyerEmail: body.buyerEmail.trim() } : {}),
+    },
+    { headers: { 'Idempotency-Key': idempotencyKey } },
+  );
+  return data;
+}
+
+export type SubOrderRefundItem = { orderItemId: number; qty: number };
+
+export async function previewSubOrderRefund(
+  subOrderId: string,
+  params: { scope?: RefundScope; items?: SubOrderRefundItem[] },
+) {
+  const { data } = await staffApi.get<ApiResponse<RefundPreview>>(
+    `/ops/sub-orders/${refundRef(subOrderId)}/refund-preview`,
+    {
+      params: {
+        ...(params.scope ? { scope: params.scope } : {}),
+        ...(params.items?.length ? { items: JSON.stringify(params.items) } : {}),
+      },
+    },
+  );
+  return data;
+}
+
+export async function executeSubOrderRefund(
+  subOrderId: string,
+  body: { quoteToken: string; scope: RefundScope; items?: SubOrderRefundItem[]; reason: string; buyerEmail?: string },
+  idempotencyKey: string,
+) {
+  const { data } = await staffApi.post<ApiResponse<RefundRecord>>(
+    `/ops/sub-orders/${refundRef(subOrderId)}/refund`,
+    {
+      quoteToken: body.quoteToken,
+      scope: body.scope,
+      ...(body.items?.length ? { items: body.items } : {}),
+      reason: body.reason,
+      ...(body.buyerEmail?.trim() ? { buyerEmail: body.buyerEmail.trim() } : {}),
+    },
+    { headers: { 'Idempotency-Key': idempotencyKey } },
+  );
+  return data;
+}
+
+export async function fetchRefunds(params?: {
+  status?: string;
+  branchId?: number;
+  subOrderId?: string;
+  memberId?: number;
   take?: number;
 }) {
-  const { data } = await staffApi.get('/ops/allowances', { params });
+  const { data } = await staffApi.get<ApiResponse<RefundRecord[]>>('/ops/refunds', { params });
+  return data;
+}
+
+export async function fetchRefund(id: string) {
+  const { data } = await staffApi.get<ApiResponse<RefundRecord>>(`/ops/refunds/${refundRef(id)}`);
+  return data;
+}
+
+/** 分段檢查點重試：已退成的金流不再打、作廢先查遠端；回傳每步結果與退費單 */
+export async function retryRefundGateway(id: string, confirmGatewayNotRefunded = false) {
+  const { data } = await staffApi.post<ApiResponse<RefundGatewayRetryData>>(
+    `/ops/refunds/${refundRef(id)}/retry-gateway`,
+    { ...(confirmGatewayNotRefunded ? { confirmGatewayNotRefunded: true } : {}) },
+  );
+  return data;
+}
+
+export async function confirmYipayRefund(
+  id: string,
+  paymentId: string,
+  body: { rrn: string; authCode: string; cardLast4: string; terminalRef?: string },
+) {
+  const { data } = await staffApi.post<ApiResponse<RefundRecord>>(
+    `/ops/refunds/${refundRef(id)}/payments/${encodeURIComponent(paymentId)}/yipay-confirm`,
+    {
+      rrn: body.rrn.trim(),
+      authCode: body.authCode.trim().toUpperCase(),
+      cardLast4: body.cardLast4.trim(),
+      ...(body.terminalRef?.trim() ? { terminalRef: body.terminalRef.trim() } : {}),
+    },
+  );
+  return data;
+}
+
+export async function fallbackRefundToCash(
+  id: string,
+  paymentId: string,
+  body: { reason: string; confirmGatewayNotRefunded?: boolean },
+) {
+  const { data } = await staffApi.post<ApiResponse<RefundRecord>>(
+    `/ops/refunds/${refundRef(id)}/payments/${encodeURIComponent(paymentId)}/cash-fallback`,
+    { reason: body.reason, ...(body.confirmGatewayNotRefunded ? { confirmGatewayNotRefunded: true } : {}) },
+  );
+  return data;
+}
+
+/** ezPay 折讓結果不明之核對（DUTY+）：已開立帶 ezPayAllowanceNo；未開立必須 confirmEzPayNotIssued */
+export async function resolveRefundInvoice(id: string, body: RefundInvoiceResolveBody) {
+  const payload =
+    body.outcome === 'ISSUED'
+      ? { einvoiceId: body.einvoiceId, outcome: body.outcome, ezPayAllowanceNo: body.ezPayAllowanceNo.trim().toUpperCase(), reason: body.reason.trim() }
+      : { einvoiceId: body.einvoiceId, outcome: body.outcome, confirmEzPayNotIssued: true as const, reason: body.reason.trim() };
+  const { data } = await staffApi.post<ApiResponse<RefundRecord>>(`/ops/refunds/${refundRef(id)}/invoice-resolve`, payload);
+  return data;
+}
+
+export async function abortRefund(id: string, reason: string) {
+  const { data } = await staffApi.post<ApiResponse<RefundRecord>>(`/ops/refunds/${refundRef(id)}/abort`, { reason });
+  return data;
+}
+
+/** 客顯折讓預覽：金額／稅額由後端產生，綁 requestId＋previewToken（10 分鐘） */
+export async function fetchAllowanceSignPreview(refundId: string) {
+  const { data } = await staffApi.post<ApiResponse<AllowanceSignPreview>>(
+    `/ops/refunds/${refundRef(refundId)}/signature-preview`,
+    {},
+  );
+  return data;
+}
+
+/** 客顯親簽歸檔：multipart（previewToken、requestId、signature＝PNG Blob），簽名不轉 Base64 */
+export async function submitRefundSignature(
+  refundId: string,
+  body: { previewToken: string; requestId: string; signatureBlob: Blob },
+) {
+  const form = new FormData();
+  form.append('previewToken', body.previewToken);
+  form.append('requestId', body.requestId);
+  form.append('signature', body.signatureBlob, `${body.requestId}.png`);
+  // 勿手設 Content-Type，讓瀏覽器帶 multipart boundary
+  const { data } = await staffApi.post<ApiResponse<RefundRecord>>(`/ops/refunds/${refundRef(refundId)}/signature`, form);
+  return data;
+}
+
+export async function fetchAllowances(params?: {
+  from?: string;
+  to?: string;
+  branchId?: number;
+  allowanceNo?: string;
+  invoiceNumber?: string;
+  memberId?: number;
+  member?: string;
+  subOrderId?: string;
+  refundId?: string;
+  q?: string;
+  exportState?: AllowanceExportState;
+  take?: number;
+}) {
+  const { data } = await staffApi.get<ApiResponse<AllowanceListPayload>>('/ops/allowances', { params });
+  return data;
+}
+
+export type AllowanceExportState = 'ALL' | 'EXPORTED' | 'UNEXPORTED';
+
+export type AllowanceExportFilters = {
+  from: string;
+  to: string;
+  branchId?: number;
+  allowanceNo?: string;
+  invoiceNumber?: string;
+  member?: string;
+  subOrderId?: string;
+  exportState?: AllowanceExportState;
+  /** true 才寫入 exportedToAcctAt；false 只回對帳檔，可重複下載 */
+  markExported?: boolean;
+};
+
+/** 會計匯出：後端回 columns／rows 並標記首次匯出時間（前端只排版） */
+export async function exportAllowancesForAccounting(filters: AllowanceExportFilters) {
+  const { data } = await staffApi.post<ApiResponse<AllowanceExportPayload>>('/ops/allowances/export', filters);
+  return data;
+}
+
+/** id＝IAL… 或折讓號；purpose=print 才計入列印次數（客顯推送用 display） */
+export async function fetchAllowancePrintPayload(idOrNo: string, purpose: 'print' | 'display' = 'print') {
+  const { data } = await staffApi.get<ApiResponse<AllowancePrintPayload>>(
+    `/ops/allowances/${encodeURIComponent(String(idOrNo || '').trim())}/print-payload`,
+    { params: { purpose } },
+  );
   return data;
 }
 
@@ -1266,37 +1562,6 @@ export async function completeOpsMemberLeave(leaveId: number) {
   return data;
 }
 
-export async function opsCancelSale(
-  saleId: string,
-  reason?: string,
-  options?: { prefer?: 'void' | 'allowance' },
-) {
-  const { data } = await staffApi.post('/ops/cancel-sale', {
-    saleId,
-    ...(reason?.trim() ? { reason: reason.trim() } : {}),
-    ...(options?.prefer ? { prefer: options.prefer } : {}),
-  });
-  return data;
-}
-
-/** 取消私教課程購買：prefer void＝沖回｜allowance＝退費折讓 */
-export async function opsCancelPtPurchase(options: {
-  checkoutId?: string;
-  orderId?: string;
-  reason?: string;
-  prefer?: 'void' | 'allowance';
-}) {
-  const { data } = await staffApi.post('/ops/cancel-pt-purchase', {
-    ...(options.checkoutId?.trim()
-      ? { checkoutId: options.checkoutId.trim() }
-      : {}),
-    ...(options.orderId?.trim() ? { orderId: options.orderId.trim() } : {}),
-    ...(options.reason?.trim() ? { reason: options.reason.trim() } : {}),
-    ...(options.prefer ? { prefer: options.prefer } : {}),
-  });
-  return data;
-}
-
 export async function opsCancelGate(logId: number | string, reason?: string) {
   const { data } = await staffApi.post('/ops/cancel-gate', {
     logId,
@@ -1342,18 +1607,20 @@ export async function fetchBranches() {
 export async function createBranch(
   name: string,
   address?: string,
-  opts?: { code: string; invoiceSellerName?: string; invoiceSellerUbn?: string },
+  opts?: {
+    code: string;
+    type?: BranchType;
+    parentId?: number | null;
+    legalEntityId?: number | null;
+  },
 ) {
   const { data } = await staffApi.post<ApiResponse<Branch>>('/hq/branches', {
     name,
     address,
     code: opts?.code,
-    ...(opts?.invoiceSellerName !== undefined
-      ? { invoiceSellerName: opts.invoiceSellerName }
-      : {}),
-    ...(opts?.invoiceSellerUbn !== undefined
-      ? { invoiceSellerUbn: opts.invoiceSellerUbn }
-      : {}),
+    type: opts?.type,
+    parentId: opts?.parentId ?? null,
+    ...(opts?.legalEntityId !== undefined ? { legalEntityId: opts.legalEntityId } : {}),
   });
   return data;
 }
@@ -1363,10 +1630,11 @@ export async function updateHqBranch(
   payload: Partial<{
     name: string;
     code: string;
+    type: BranchType;
+    parentId: number | null;
     address: string | null;
     isActive: boolean;
-    invoiceSellerName: string | null;
-    invoiceSellerUbn: string | null;
+    legalEntityId: number | null;
   }>,
 ) {
   const { data } = await staffApi.patch<ApiResponse<Branch>>(`/hq/branches/${id}`, payload);
@@ -1626,6 +1894,10 @@ export async function createHqCoursePlan(payload: {
   price: number;
   sessions?: number | null;
   capacity?: number | null;
+  /** GROUP：單堂插班價（null＝不開放單堂） */
+  dropInPrice?: number | null;
+  /** GROUP：最低開班人數（0／null＝不設） */
+  minEnrollment?: number | null;
   description?: string | null;
   enableCardRecurring?: boolean;
   recurringPeriods?: number | null;
@@ -1659,6 +1931,8 @@ export async function updateHqCoursePlan(
     price: number;
     sessions: number | null;
     capacity: number | null;
+    dropInPrice: number | null;
+    minEnrollment: number | null;
     description: string | null;
     enableCardRecurring: boolean;
     recurringPeriods: number | null;
@@ -1694,7 +1968,8 @@ export async function fetchHqTrainers() {
 export async function createHqTrainer(payload: {
   name: string;
   phone: string;
-  role?: 'NORMAL' | 'MANAGER';
+  role?: TrainerRole;
+  level?: TrainerLevel;
   displayName?: string;
 }) {
   const { data } = await staffApi.post<ApiResponse<Trainer>>('/hq/trainers', payload);
@@ -1706,7 +1981,8 @@ export async function updateHqTrainer(
   payload: Partial<{
     name: string;
     phone: string;
-    role: 'NORMAL' | 'MANAGER';
+    role: TrainerRole;
+    level: TrainerLevel;
     isActive: boolean;
     staffId: number | null;
     displayName: string;
@@ -1718,86 +1994,319 @@ export async function updateHqTrainer(
 
 export async function assignTrainer(
   trainerId: number,
-  role: 'NORMAL' | 'MANAGER',
+  role: TrainerRole,
   branchIds: number[],
+  level?: TrainerLevel,
 ) {
-  const { data } = await staffApi.post('/hq/trainers/assign', { trainerId, role, branchIds });
-  return data;
-}
-
-export async function fetchHqProducts(branchId?: number) {
-  const { data } = await staffApi.get<ApiResponse<Product[]>>('/hq/products', {
-    params: branchId ? { branchId } : undefined,
+  const { data } = await staffApi.post('/hq/trainers/assign', {
+    trainerId,
+    role,
+    branchIds,
+    level,
   });
   return data;
 }
 
-export async function createHqProduct(payload: {
-  branchId: number;
-  sku: string;
+// ── HQ 進銷存／電子發票（ADMIN）──
+
+export type LegalEntityInput = {
+  code: string;
   name: string;
-  price: number;
-  cost?: number;
-  productKind?: 'PHYSICAL' | 'SERVICE';
-  safetyStock?: number | null;
-}) {
-  const { data } = await staffApi.post<ApiResponse<Product>>('/hq/products', payload);
+  ubn: string;
+  address: string | null;
+  phone: string | null;
+  ezpayMerchantId: string | null;
+  isActive: boolean;
+};
+
+export async function fetchHqLegalEntities() {
+  const { data } = await staffApi.get<ApiResponse<LegalEntity[]>>('/hq/legal-entities');
   return data;
 }
 
-export async function updateHqProduct(
-  id: number,
-  payload: Partial<{
-    name: string;
-    sku: string;
-    price: number;
-    cost: number;
-    isActive: boolean;
-    productKind: 'PHYSICAL' | 'SERVICE';
-    safetyStock: number | null;
-  }>,
-) {
-  const { data } = await staffApi.patch<ApiResponse<Product>>(`/hq/products/${id}`, payload);
+export async function createHqLegalEntity(payload: Partial<LegalEntityInput>) {
+  const { data } = await staffApi.post<ApiResponse<LegalEntity>>('/hq/legal-entities', payload);
   return data;
 }
 
-export async function fetchOpsInventoryProducts(branchId?: number) {
-  const { data } = await staffApi.get<ApiResponse<Product[]>>('/ops/inventory/products', {
-    params: branchId ? { branchId } : undefined,
+export async function updateHqLegalEntity(id: number, payload: Partial<LegalEntityInput>) {
+  const { data } = await staffApi.patch<ApiResponse<LegalEntity>>(`/hq/legal-entities/${id}`, payload);
+  return data;
+}
+
+/** 主檔不含庫存／成本：庫存走進貨／盤點，成本由驗收移動平均 */
+export type ProductMasterInput = {
+  sku: string;
+  barcode: string | null;
+  name: string;
+  invoiceName: string | null;
+  unit: string;
+  productKind: ProductKind;
+  taxType: TaxType;
+  listPrice: number;
+  isActive: boolean;
+};
+
+export async function fetchHqProducts(params?: { q?: string; activeOnly?: boolean }) {
+  const { data } = await staffApi.get<ApiResponse<ProductMaster[]>>('/hq/products', {
+    params: {
+      ...(params?.q ? { q: params.q } : {}),
+      ...(params?.activeOnly ? { active: '1' } : {}),
+    },
   });
   return data;
 }
 
-export async function createOpsPurchase(payload: {
+export async function createHqProduct(payload: Partial<ProductMasterInput>) {
+  const { data } = await staffApi.post<ApiResponse<ProductMaster>>('/hq/products', payload);
+  return data;
+}
+
+export async function updateHqProduct(id: number, payload: Partial<ProductMasterInput>) {
+  const { data } = await staffApi.patch<ApiResponse<ProductMaster>>(`/hq/products/${id}`, payload);
+  return data;
+}
+
+export async function fetchHqBranchStocks(params?: { branchId?: number; productId?: number; q?: string }) {
+  const { data } = await staffApi.get<ApiResponse<BranchStockRow[]>>('/hq/branch-stocks', { params });
+  return data;
+}
+
+/** 分店上架設定（售價／安全庫存／上架）；不可改 onHand */
+export async function upsertHqBranchStock(payload: {
   branchId: number;
-  supplier?: string;
-  note?: string;
-  items: { productId: number; qty: number; unitCost: number }[];
+  productId: number;
+  salePrice?: number | null;
+  safetyStock?: number | null;
+  isListed?: boolean;
 }) {
-  const { data } = await staffApi.post<ApiResponse<PurchaseOrder>>('/ops/inventory/purchases', payload);
+  const { data } = await staffApi.put<ApiResponse<BranchStockRow>>('/hq/branch-stocks', payload);
   return data;
 }
 
-export async function fetchOpsPurchases(branchId?: number) {
-  const { data } = await staffApi.get<ApiResponse<PurchaseOrder[]>>('/ops/inventory/purchases', {
-    params: branchId ? { branchId } : undefined,
+export async function fetchHqStockMovements(params?: {
+  branchId?: number;
+  productId?: number;
+  refType?: string;
+  from?: string;
+  to?: string;
+}) {
+  const { data } = await staffApi.get<ApiResponse<StockMovement[]>>('/hq/stock-movements', { params });
+  return data;
+}
+
+export type StockTransferResult = { transferId: string; items: { productId: number; qty: number; unitCost: number }[] };
+
+export async function createHqStockTransfer(payload: {
+  fromBranchId: number;
+  toBranchId: number;
+  items: { productId: number; qty: number }[];
+  note?: string;
+}) {
+  const { data } = await staffApi.post<ApiResponse<StockTransferResult>>('/hq/stock-transfers', payload);
+  return data;
+}
+
+export type SupplierInput = {
+  name: string;
+  ubn: string | null;
+  contactName: string | null;
+  phone: string | null;
+  email: string | null;
+  address: string | null;
+  paymentTermType: SupplierPaymentTerm;
+  paymentTermDays: number;
+  note: string | null;
+  isActive: boolean;
+};
+
+export async function fetchHqSuppliers(activeOnly = false) {
+  const { data } = await staffApi.get<ApiResponse<Supplier[]>>('/hq/suppliers', {
+    params: activeOnly ? { active: '1' } : undefined,
   });
+  return data;
+}
+
+export async function createHqSupplier(payload: Partial<SupplierInput>) {
+  const { data } = await staffApi.post<ApiResponse<Supplier>>('/hq/suppliers', payload);
+  return data;
+}
+
+export async function updateHqSupplier(id: number, payload: Partial<SupplierInput>) {
+  const { data } = await staffApi.patch<ApiResponse<Supplier>>(`/hq/suppliers/${id}`, payload);
+  return data;
+}
+
+export type PurchaseOrderLineInput = { productId: number; qty: number; unitCost: number; taxType?: TaxType };
+
+export async function fetchHqPurchaseOrders(params?: {
+  status?: string;
+  branchId?: number;
+  supplierId?: number;
+  legalEntityId?: number;
+}) {
+  const { data } = await staffApi.get<ApiResponse<PurchaseOrder[]>>('/hq/purchase-orders', { params });
+  return data;
+}
+
+export async function createHqPurchaseOrder(payload: {
+  branchId: number;
+  supplierId: number;
+  items: PurchaseOrderLineInput[];
+  expectedAt?: string | null;
+  note?: string | null;
+}) {
+  const { data } = await staffApi.post<ApiResponse<PurchaseOrder>>('/hq/purchase-orders', payload);
+  return data;
+}
+
+export async function updateHqPurchaseOrder(
+  id: string,
+  payload: Partial<{ supplierId: number; items: PurchaseOrderLineInput[]; expectedAt: string | null; note: string | null }>,
+) {
+  const { data } = await staffApi.patch<ApiResponse<PurchaseOrder>>(
+    `/hq/purchase-orders/${encodeURIComponent(id)}`,
+    payload,
+  );
+  return data;
+}
+
+/** order＝送出採購；cancel＝取消（必填原因）；close＝短交結案 */
+export async function transitionHqPurchaseOrder(id: string, action: 'order' | 'cancel' | 'close', reason?: string) {
+  const { data } = await staffApi.post<ApiResponse<PurchaseOrder>>(
+    `/hq/purchase-orders/${encodeURIComponent(id)}/${action}`,
+    reason ? { reason } : {},
+  );
+  return data;
+}
+
+export async function fetchHqPurchaseReceipts(params?: { branchId?: number; supplierId?: number; purchaseOrderId?: string }) {
+  const { data } = await staffApi.get<ApiResponse<PurchaseReceipt[]>>('/hq/purchase-receipts', { params });
+  return data;
+}
+
+/** 總部驗收：依採購單（進價預設取採購單）或無單進貨（需分店＋供應商＋進價） */
+export async function createHqPurchaseReceipt(payload: {
+  purchaseOrderId?: string;
+  branchId?: number;
+  supplierId?: number;
+  items: { poItemId?: number; productId?: number; qty: number; unitCost?: number }[];
+  supplierInvoiceNo?: string;
+  supplierInvoiceDate?: string;
+  note?: string;
+}) {
+  const { data } = await staffApi.post<ApiResponse<{ receipt: PurchaseReceipt; payable: SupplierPayable }>>(
+    '/hq/purchase-receipts',
+    payload,
+  );
+  return data;
+}
+
+export async function setHqReceiptSupplierInvoice(
+  receiptId: string,
+  payload: { supplierInvoiceNo: string; supplierInvoiceDate?: string },
+) {
+  const { data } = await staffApi.patch<ApiResponse<PurchaseReceipt>>(
+    `/hq/purchase-receipts/${encodeURIComponent(receiptId)}/supplier-invoice`,
+    payload,
+  );
+  return data;
+}
+
+/** status：UNPAID（未付＋部分付）／OPEN／PARTIAL／PAID／VOID */
+export async function fetchHqPayables(params?: { status?: string; legalEntityId?: number; supplierId?: number }) {
+  const { data } = await staffApi.get<ApiResponse<SupplierPayable[]>>('/hq/payables', { params });
+  return data;
+}
+
+export async function fetchHqPayableAging(legalEntityId?: number) {
+  const { data } = await staffApi.get<ApiResponse<PayableAgingRow[]>>('/hq/payables/aging', {
+    params: legalEntityId ? { legalEntityId } : undefined,
+  });
+  return data;
+}
+
+export async function voidHqPayable(id: string, reason: string) {
+  const { data } = await staffApi.post<ApiResponse<SupplierPayable>>(
+    `/hq/payables/${encodeURIComponent(id)}/void`,
+    { reason },
+  );
+  return data;
+}
+
+export async function fetchHqSupplierPayments(params?: { legalEntityId?: number; supplierId?: number }) {
+  const { data } = await staffApi.get<ApiResponse<SupplierPayment[]>>('/hq/supplier-payments', { params });
+  return data;
+}
+
+/** 沖銷合計須等於付款金額（後端驗證） */
+export async function createHqSupplierPayment(payload: {
+  legalEntityId: number;
+  supplierId: number;
+  amount: number;
+  method: SupplierPaymentMethod;
+  paidAt?: string;
+  reference?: string;
+  note?: string;
+  allocations: { payableId: string; amount: number }[];
+}) {
+  const { data } = await staffApi.post<ApiResponse<SupplierPayment>>('/hq/supplier-payments', payload);
+  return data;
+}
+
+export async function fetchHqEInvoices(params?: {
+  q?: string;
+  status?: string;
+  legalEntityId?: number;
+  branchId?: number;
+  category?: 'B2B' | 'B2C';
+  from?: string;
+  to?: string;
+}) {
+  const { data } = await staffApi.get<ApiResponse<EInvoiceRow[]>>('/hq/einvoices', { params });
+  return data;
+}
+
+export async function retryHqEInvoice(id: string) {
+  const { data } = await staffApi.post<ApiResponse<InvoiceIssueJobRow>>(
+    `/hq/einvoices/${encodeURIComponent(id)}/retry`,
+  );
+  return data;
+}
+
+export async function fetchHqEInvoiceLogs(id: string) {
+  const { data } = await staffApi.get<ApiResponse<EInvoiceLogRow[]>>(`/hq/einvoices/${encodeURIComponent(id)}/logs`);
+  return data;
+}
+
+/** 跨營業人 ezPay 呼叫紀錄；result 省略時後端只回 FAILED */
+export async function fetchHqEInvoiceCallLogs(params?: {
+  result?: '' | 'SUCCESS' | 'FAILED' | 'NOT_FOUND';
+  action?: 'ISSUE' | 'RECOVER' | 'VOID' | 'ALLOWANCE';
+  legalEntityId?: number;
+  from?: string;
+  to?: string;
+}) {
+  const { data } = await staffApi.get<ApiResponse<EInvoiceLogRow[]>>('/hq/einvoice-logs', { params });
+  return data;
+}
+
+// ── 門市進銷存（DUTY+，限可操作分店）──
+
+export async function fetchOpsStocks(params?: { branchId?: number; q?: string }) {
+  const { data } = await staffApi.get<ApiResponse<BranchStockRow[]>>('/ops/inventory/stocks', { params });
   return data;
 }
 
 export async function createOpsStockAdjustment(payload: {
+  branchId: number;
   productId: number;
   reason: 'LOSS' | 'GAIN' | 'COUNT';
   qty: number;
   note?: string | null;
 }) {
   const { data } = await staffApi.post<
-    ApiResponse<{
-      product: Product;
-      movement: StockMovement | null;
-      previousQty: number;
-      reason: string;
-    }>
+    ApiResponse<{ productId: number; onHand: number; previousQty: number; reason: string; movement: StockMovement | null }>
   >('/ops/inventory/stock-adjustments', payload);
   return data;
 }
@@ -1813,6 +2322,90 @@ export async function fetchOpsStockMovements(params?: {
   return data;
 }
 
+/** 待驗收採購單（ORDERED／PARTIAL） */
+export async function fetchOpsPendingPurchaseOrders(branchId?: number) {
+  const { data } = await staffApi.get<ApiResponse<PurchaseOrder[]>>('/ops/inventory/purchase-orders', {
+    params: branchId ? { branchId } : undefined,
+  });
+  return data;
+}
+
+/** 門市驗收只能依採購單、只送數量（進價以採購單為準） */
+export async function createOpsReceipt(payload: {
+  purchaseOrderId: string;
+  items: { poItemId: number; qty: number }[];
+  supplierInvoiceNo?: string;
+  supplierInvoiceDate?: string;
+  note?: string;
+}) {
+  const { data } = await staffApi.post<
+    ApiResponse<{ receiptId: string; purchaseOrderId: string; payableId: string; items: number }>
+  >('/ops/inventory/receipts', payload);
+  return data;
+}
+
+export async function fetchOpsReceipts(branchId?: number) {
+  const { data } = await staffApi.get<ApiResponse<OpsReceiptRow[]>>('/ops/inventory/receipts', {
+    params: branchId ? { branchId } : undefined,
+  });
+  return data;
+}
+
+/** 同營業人分店間調撥；跨統編 409 */
+export async function createOpsTransfer(payload: {
+  fromBranchId: number;
+  toBranchId: number;
+  items: { productId: number; qty: number }[];
+  note?: string;
+}) {
+  const { data } = await staffApi.post<ApiResponse<StockTransferResult>>('/ops/inventory/transfers', payload);
+  return data;
+}
+
+export async function fetchHqStaffPhoto(id: number) {
+  const { data } = await staffApi.get<ApiResponse<StaffAvatar | null>>(`/hq/staff/${id}/photo`);
+  return data;
+}
+
+/** 上傳員工照片；enrollFace=true 須員工已親簽有效之生物辨識電子同意書 */
+export async function uploadHqStaffPhoto(id: number, image: string, enrollFace: boolean) {
+  const { data } = await staffApi.post<ApiResponse<StaffPhotoStatus>>(`/hq/staff/${id}/photo`, {
+    image,
+    enrollFace,
+  });
+  return data;
+}
+
+export async function fetchStaffBiometricsConsentTemplate() {
+  const { data } = await staffApi.get<ApiResponse<StaffConsentTemplate>>('/hq/staff-consent/biometrics');
+  return data;
+}
+
+/** 目前有效之員工生物辨識簽署（含簽名影像）；未簽 data=null */
+export async function fetchHqStaffFaceConsent(id: number) {
+  const { data } = await staffApi.get<ApiResponse<StaffFaceConsent | null>>(`/hq/staff/${id}/face-consent`);
+  return data;
+}
+
+/** 員工親簽生物辨識同意書；bodyHash 須為目前條文版本 */
+export async function signHqStaffFaceConsent(id: number, signatureData: string, bodyHash: string) {
+  const { data } = await staffApi.post<
+    ApiResponse<{ id: number; version: string; signerName: string; signedAt: string }>
+  >(`/hq/staff/${id}/face-consent`, { signatureData, bodyHash });
+  return data;
+}
+
+export async function deleteHqStaffPhoto(id: number) {
+  const { data } = await staffApi.delete<ApiResponse<StaffPhotoStatus>>(`/hq/staff/${id}/photo`);
+  return data;
+}
+
+/** 撤回生物辨識同意（刪 Face8 特徵，保留頭像） */
+export async function revokeHqStaffFace(id: number) {
+  const { data } = await staffApi.delete<ApiResponse<StaffPhotoStatus>>(`/hq/staff/${id}/face`);
+  return data;
+}
+
 export async function fetchHqStaff() {
   const { data } = await staffApi.get<ApiResponse<StaffAccount[]>>('/hq/staff');
   return data;
@@ -1823,9 +2416,13 @@ export async function createHqStaff(payload: {
   password: string;
   name: string;
   displayName?: string;
-  role: 'STAFF' | 'DUTY' | 'MANAGER' | 'ADMIN';
+  role: StaffRole;
   branchId?: number | null;
   permissions: StaffPermission[];
+  employmentType: EmploymentType;
+  hireDate: string;
+  weeklyHours?: number | null;
+  laborActApplies?: boolean;
 }) {
   const { data } = await staffApi.post<ApiResponse<StaffAccount>>('/hq/staff', payload);
   return data;
@@ -1836,11 +2433,15 @@ export async function updateHqStaff(
   payload: Partial<{
     name: string;
     displayName: string;
-    role: 'STAFF' | 'DUTY' | 'MANAGER' | 'ADMIN';
+    role: StaffRole;
     branchId: number | null;
     permissions: StaffPermission[];
     isActive: boolean;
     password: string;
+    employmentType: EmploymentType;
+    hireDate: string | null;
+    weeklyHours: number | null;
+    laborActApplies: boolean;
   }>,
 ) {
   const { data } = await staffApi.patch<ApiResponse<StaffAccount>>(`/hq/staff/${id}`, payload);
@@ -1881,8 +2482,8 @@ export async function fetchOpsYipayReconcile(params?: {
         pendingCount: number;
         pendingAmount: number;
         orphanCount: number;
-        pending: unknown[];
-        orphans: unknown[];
+        pending: Array<{ id: string; targetType: string; targetId: string; amount: number; rrn?: string | null; status: string }>;
+        orphans: Array<{ id: string; targetType: string; targetId: string; amount: number; rrn?: string | null; status: string }>;
       };
       edcCompare: {
         edcCount: number;
@@ -1944,6 +2545,11 @@ export type InvoiceIssueJobRow = {
   invoiceNumber?: string | null;
   checkoutId?: string | null;
   updatedAt?: string;
+  /** 原始電子發票狀態（status 為佇列相容值） */
+  einvoiceStatus?: string;
+  category?: 'B2B' | 'B2C';
+  branchId?: number | null;
+  legalEntity?: { id: number; code: string; name: string } | null;
 };
 
 export async function fetchOpsInvoiceJobs(params?: {
@@ -1973,7 +2579,7 @@ export async function retryOpsInvoiceJob(jobId: string) {
 
 export async function openOpsShift(body: {
   branchId: number;
-  slot: 'MORNING' | 'MIDDAY' | 'EVENING';
+  slot: 'MORNING' | 'EVENING' | 'MIDDAY';
   note?: string;
 }) {
   const { data } = await staffApi.post('/ops/shift/open', body);
@@ -2088,8 +2694,10 @@ export async function fetchPtDashboard() {
   return data;
 }
 
+/** 團課期班開班：價格／堂數／最低開班人數快照自 GROUP 課程方案，展開堂數須等於方案堂數 */
 export async function scheduleGroupClass(payload: {
-  title: string;
+  coursePlanId: number;
+  title?: string;
   venueId: number;
   stationId?: number;
   /** 期班開始日 YYYY-MM-DD */
@@ -2100,10 +2708,75 @@ export async function scheduleGroupClass(payload: {
   weekdays: number[];
   startTime: string;
   endTime: string;
-  capacity: number;
+  /** 省略＝沿用課程方案人數上限 */
+  capacity?: number;
   trainerId: number;
+  /** 報名截止 YYYY-MM-DD（省略＝開課前 2 日） */
+  enrollDeadline?: string;
 }) {
   const { data } = await staffApi.post('/pt/schedule-group-class', payload);
+  return data;
+}
+
+export async function fetchGroupSeriesAdmin(includeEnded = false) {
+  const { data } = await staffApi.get<ApiResponse<GroupAdminSeries[]>>('/pt/group-series', {
+    params: includeEnded ? { includeEnded: '1' } : undefined,
+  });
+  return data;
+}
+
+export async function fetchGroupSeriesRoster(seriesId: number) {
+  const { data } = await staffApi.get<ApiResponse<GroupSeriesRoster>>(`/pt/group-series/${seriesId}/roster`);
+  return data;
+}
+
+/** 取消期班（限 ADMIN）：已報名者未履約部分全額退費 */
+export async function cancelGroupSeries(seriesId: number, reason: string) {
+  const { data } = await staffApi.post<
+    ApiResponse<{ removedClasses: number; refunded: unknown[]; failed: unknown[] }>
+  >(`/pt/group-series/${seriesId}/cancel`, { reason });
+  return data;
+}
+
+// ── 櫃檯團課 ──
+export async function fetchOpsGroupSellable(params: { branchId?: number; memberId?: number }) {
+  const { data } = await staffApi.get<ApiResponse<GroupSellableSeries[]>>('/ops/group/sellable', { params });
+  return data;
+}
+
+export async function fetchOpsGroupSeriesDetail(seriesId: number, memberId?: number) {
+  const { data } = await staffApi.get<ApiResponse<GroupSeriesDetail>>(`/ops/group/series/${seriesId}`, {
+    params: memberId ? { memberId } : undefined,
+  });
+  return data;
+}
+
+export async function fetchOpsMemberGroup(memberId: number) {
+  const { data } = await staffApi.get<ApiResponse<GroupMemberOverview>>(`/ops/group/members/${memberId}`);
+  return data;
+}
+
+export async function opsJoinGroupWaitlist(payload: { memberId: number; seriesId: number }) {
+  const { data } = await staffApi.post<ApiResponse<{ id: number; position: number }>>(
+    '/ops/group/waitlist',
+    payload,
+  );
+  return data;
+}
+
+export async function fetchOpsGroupRefundPreview(enrollmentId: number) {
+  const { data } = await staffApi.get<ApiResponse<GroupRefundPreview>>(
+    `/ops/group/enrollments/${enrollmentId}/refund-preview`,
+  );
+  return data;
+}
+
+/** 團課退費（DUTY+）：金額由後端依消保公式計算，只送原因 */
+export async function opsRefundGroupEnrollment(enrollmentId: number, reason: string) {
+  const { data } = await staffApi.post<ApiResponse<{ refundAmount: number; fee: number }>>(
+    `/ops/group/enrollments/${enrollmentId}/refund`,
+    { reason },
+  );
   return data;
 }
 
@@ -2334,6 +3007,19 @@ export function fetchTrainerReport(params: ReportQuery) {
 
 export async function fetchReportBranches() {
   const { data } = await staffApi.get<ApiResponse<Branch[]>>('/hq/reports/branches');
+  return data;
+}
+
+/** 門市銷貨對帳（ADMIN）；from／to 為台灣日 YYYY-MM-DD，branchId 省略＝全部門市 */
+export async function fetchSalesReconciliation(params: { from: string; to: string; branchId?: number; includeCancelled?: boolean }) {
+  const { data } = await staffApi.get<ApiResponse<SalesReconciliation>>('/hq/reports/sales-reconciliation', {
+    params: {
+      from: params.from,
+      to: params.to,
+      ...(params.branchId ? { branchId: params.branchId } : {}),
+      ...(params.includeCancelled === false ? { includeCancelled: '0' } : {}),
+    },
+  });
   return data;
 }
 
@@ -2699,28 +3385,63 @@ export async function submitMemberClassLeave(payload: { reservationId: number; r
   return data;
 }
 
-export async function fetchMemberMakeupSlots() {
-  const { data } = await memberApi.get<
-    ApiResponse<{
-      slots: {
-        id: number;
-        classId: number;
-        capacity: number;
-        registered: number;
-        remaining: number;
-        class?: { id: number; title: string; startAt: string; trainer?: { name: string } };
-      }[];
-      myRegistrations: { makeupSlotId: number; status: string }[];
-    }>
-  >('/member/makeup-slots');
+// ── 會員團課（付費期班）：金額由後端依剩餘堂數計價，禁止帶 amount／memberId ──
+export async function fetchMemberGroupSeries(branchId?: number) {
+  const { data } = await memberApi.get<ApiResponse<GroupSellableSeries[]>>('/member/group/series', {
+    params: branchId ? { branchId } : undefined,
+  });
   return data;
 }
 
-export async function submitMemberMakeupRegister(payload: {
-  makeupSlotId: number;
-  originalReservationId?: number;
+export async function fetchMemberGroupSeriesDetail(seriesId: number) {
+  const { data } = await memberApi.get<ApiResponse<GroupSeriesDetail>>(`/member/group/series/${seriesId}`);
+  return data;
+}
+
+export async function fetchMemberGroupOverview() {
+  const { data } = await memberApi.get<ApiResponse<GroupMemberOverview>>('/member/group/me');
+  return data;
+}
+
+export async function enrollMemberGroup(payload: {
+  seriesId: number;
+  kind: GroupEnrollKind;
+  classId?: number;
+  payMethod: 'CARD' | 'LINEPAY';
 }) {
-  const { data } = await memberApi.post<ApiResponse>('/member/makeup-register', payload);
+  const { data } = await memberApi.post<ApiResponse<GroupEnrollResult>>('/member/group/enroll', payload);
+  return data;
+}
+
+export async function joinMemberGroupWaitlist(seriesId: number) {
+  const { data } = await memberApi.post<ApiResponse<{ id: number; position: number }>>(
+    '/member/group/waitlist',
+    { seriesId },
+  );
+  return data;
+}
+
+export async function cancelMemberGroupWaitlist(waitlistId: number) {
+  const { data } = await memberApi.post<ApiResponse>(`/member/group/waitlist/${waitlistId}/cancel`);
+  return data;
+}
+
+export async function requestMemberGroupLeave(reservationId: number) {
+  const { data } = await memberApi.post<
+    ApiResponse<{ kind: 'MAKEUP_CREDIT' | 'MAKEUP_RESTORED'; creditId: number; expiresAt?: string }>
+  >(`/member/group/reservations/${reservationId}/leave`, {});
+  return data;
+}
+
+export async function fetchMemberMakeupOptions(creditId: number) {
+  const { data } = await memberApi.get<
+    ApiResponse<{ credit: { id: number; expiresAt: string }; options: GroupMakeupOption[] }>
+  >(`/member/group/makeup-credits/${creditId}/options`);
+  return data;
+}
+
+export async function bookMemberGroupMakeup(payload: { creditId: number; classId: number }) {
+  const { data } = await memberApi.post<ApiResponse>('/member/group/makeup', payload);
   return data;
 }
 
@@ -2990,38 +3711,59 @@ export async function grantHqInbodyVoucher(payload: { memberId: number; qty?: nu
 }
 
 // ── HQ HR ──
+/** 區間考勤（台北日期，預設近 7 日）；遲到／早退／曠職等旗標由後端比對已生效班表 */
 export async function fetchHqHrAttendance(params?: {
-  staffId?: number;
   from?: string;
   to?: string;
-  take?: number;
+  branchId?: number;
+  staffId?: number;
+  flag?: AttendanceFlag | 'ABSENT';
 }) {
-  const { data } = await staffApi.get<ApiResponse<StaffAttendanceRow[]>>('/hq/hr/attendance', {
-    params,
-  });
+  const { data } = await staffApi.get<ApiResponse<AttendanceOverview>>('/hq/hr/attendance', { params });
   return data;
 }
 
+/** 總部補登（必填原因；未填下班＝上班中） */
 export async function createHqHrAttendance(payload: {
   staffId: number;
-  punchIn?: string;
+  punchIn: string;
   punchOut?: string;
   branchId?: number;
-  note?: string;
+  /** 綁定該員工之已生效班次（自曠職列補登時帶入） */
+  scheduleId?: number;
+  reason: string;
 }) {
-  const { data } = await staffApi.post<ApiResponse<StaffAttendanceRow>>('/hq/hr/attendance', payload);
+  const { data } = await staffApi.post<ApiResponse<AttendanceRecord>>('/hq/hr/attendance', payload);
   return data;
 }
 
-export async function fetchHqHrLeaves(params?: { staffId?: number; status?: string; take?: number }) {
-  const { data } = await staffApi.get<ApiResponse<StaffLeaveRow[]>>('/hq/hr/leaves', { params });
+/** 總部更正（必填原因，留存更正者） */
+export async function correctHqHrAttendance(
+  id: number,
+  payload: { punchIn?: string; punchOut?: string | null; reason: string },
+) {
+  const { data } = await staffApi.patch<ApiResponse<AttendanceRecord>>(`/hq/hr/attendance/${id}`, payload);
   return data;
 }
 
+export async function fetchHqHrLeaves(params?: {
+  status?: LeaveStatus;
+  staffId?: number;
+  branchId?: number;
+  from?: string;
+  to?: string;
+}) {
+  const { data } = await staffApi.get<ApiResponse<LeaveOverview>>('/hq/hr/leaves', { params });
+  return data;
+}
+
+/** HQ 代建請假（直接核准）；特休／國休由後端檢查額度 */
 export async function createHqHrLeave(payload: {
   staffId: number;
   startAt: string;
   endAt: string;
+  leaveType: LeaveType;
+  hours?: number;
   reason?: string;
   proofUrl?: string;
 }) {
@@ -3029,41 +3771,108 @@ export async function createHqHrLeave(payload: {
   return data;
 }
 
-export async function patchHqHrLeave(id: number, payload: { status: 'APPROVED' | 'REJECTED' }) {
+export async function fetchRosterConfigs() {
+  const { data } = await staffApi.get<ApiResponse<RosterBranchConfig[]>>('/staff/roster/configs');
+  return data;
+}
+
+/** 早／晚班場務人力後端強制 ≥ 2；週期起算日已有排班期後不可改 */
+export async function updateRosterConfig(
+  branchId: number,
+  payload: { cycleAnchorDate: string; morningHeadcount: number; eveningHeadcount: number },
+) {
+  const { data } = await staffApi.put<ApiResponse<RosterView['config']>>(`/staff/roster/configs/${branchId}`, payload);
+  return data;
+}
+
+/** 含 date 之 28 日四週變形排班檢視（合規檢查由後端計算） */
+export async function fetchRoster(branchId: number, date?: string) {
+  const { data } = await staffApi.get<ApiResponse<RosterView>>('/staff/roster', { params: { branchId, date } });
+  return data;
+}
+
+export async function createRosterPeriod(branchId: number, startDate: string) {
+  const { data } = await staffApi.post<ApiResponse<RosterView>>('/staff/roster/periods', { branchId, startDate });
+  return data;
+}
+
+export async function generateRosterPeriod(periodId: number) {
+  const { data } = await staffApi.post<ApiResponse<RosterView>>(`/staff/roster/periods/${periodId}/generate`);
+  return data;
+}
+
+export async function setRosterCell(periodId: number, payload: { staffId: number; date: string; value: RosterCellCode | null }) {
+  const { data } = await staffApi.put<ApiResponse<RosterView>>(`/staff/roster/periods/${periodId}/cells`, payload);
+  return data;
+}
+
+export async function publishRosterPeriod(periodId: number) {
+  const { data } = await staffApi.post<ApiResponse<RosterView>>(`/staff/roster/periods/${periodId}/publish`);
+  return data;
+}
+
+export async function unpublishRosterPeriod(periodId: number, reason: string) {
+  const { data } = await staffApi.post<ApiResponse<RosterView>>(`/staff/roster/periods/${periodId}/unpublish`, { reason });
+  return data;
+}
+
+export async function fetchHqHolidays(year: number) {
+  const { data } = await staffApi.get<ApiResponse<HolidayCalendar>>('/hq/hr/holidays', { params: { year } });
+  return data;
+}
+
+export async function createHqHoliday(payload: { date: string; name: string }) {
+  const { data } = await staffApi.post<ApiResponse<PublicHoliday>>('/hq/hr/holidays', payload);
+  return data;
+}
+
+export async function renameHqHoliday(id: number, name: string) {
+  const { data } = await staffApi.patch<ApiResponse<PublicHoliday>>(`/hq/hr/holidays/${id}`, { name });
+  return data;
+}
+
+/** 補入後端內建之該年預設國定假日（已存在日期略過） */
+export async function seedHqDefaultHolidays(year: number) {
+  const { data } = await staffApi.post<ApiResponse<{ count: number }>>('/hq/hr/holidays/defaults', { year });
+  return data;
+}
+
+export async function deleteHqHoliday(id: number) {
+  const { data } = await staffApi.delete<ApiResponse>(`/hq/hr/holidays/${id}`);
+  return data;
+}
+
+/** 審核：待審 → 核准／拒絕；已核准 → 撤銷（拒絕與撤銷必填 note） */
+export async function patchHqHrLeave(
+  id: number,
+  payload: { status: 'APPROVED' | 'REJECTED' | 'CANCELLED'; note?: string },
+) {
   const { data } = await staffApi.patch<ApiResponse<StaffLeaveRow>>(`/hq/hr/leaves/${id}`, payload);
   return data;
 }
 
+/** 總部班表總覽（from/to 為台北日期 YYYY-MM-DD，預設今日起 14 日） */
 export async function fetchHqHrSchedules(params?: {
   staffId?: number;
   branchId?: number;
   from?: string;
   to?: string;
-  take?: number;
+  source?: ScheduleSource;
+  includeOff?: boolean;
 }) {
-  const { data } = await staffApi.get<ApiResponse<StaffScheduleRow[]>>('/hq/hr/schedules', {
-    params,
+  const { includeOff, ...rest } = params ?? {};
+  const { data } = await staffApi.get<ApiResponse<ScheduleOverview>>('/hq/hr/schedules', {
+    params: { ...rest, includeOff: includeOff ? '1' : undefined },
   });
   return data;
 }
 
-export async function createHqHrSchedule(payload: {
-  staffId: number;
-  startAt: string;
-  endAt: string;
-  branchId?: number;
-  slotType?: string;
-  note?: string;
-}) {
-  const { data } = await staffApi.post<ApiResponse<StaffScheduleRow>>('/hq/hr/schedules', payload);
-  return data;
-}
-
+/** 總部臨時排班：僅限不列四週排班編制之員工（場務／實習教練回 409 USE_ROSTER） */
 export async function patchHqHrSchedule(
   id: number,
-  payload: Partial<{ startAt: string; endAt: string; branchId: number; slotType: string; note: string }>,
+  payload: Partial<{ startAt: string; endAt: string; branchId: number | null; note: string }>,
 ) {
-  const { data } = await staffApi.patch<ApiResponse<StaffScheduleRow>>(
+  const { data } = await staffApi.patch<ApiResponse<ScheduleOverviewRow>>(
     `/hq/hr/schedules/${id}`,
     payload,
   );
@@ -3075,20 +3884,189 @@ export async function deleteHqHrSchedule(id: number) {
   return data;
 }
 
+/** 工資核算匯出：月度考勤標記／總數＋請假時數（後端彙整；CSV 由前端依 columns 組檔） */
+export async function fetchHqPayrollExport(params: { month: string; branchId?: number }) {
+  const { data } = await staffApi.get<ApiResponse<PayrollExport>>('/hq/hr/payroll-export', { params });
+  return data;
+}
+
+// ── 薪資系統（HQ ADMIN；金額一律後端計算） ──
+export async function fetchPayrollConfig() {
+  const { data } = await staffApi.get<ApiResponse<PayrollConfigData>>('/hq/payroll/config');
+  return data;
+}
+
+export async function updatePayrollConfig(rates: Record<string, number | string>) {
+  const { data } = await staffApi.put<ApiResponse<PayrollConfigData>>('/hq/payroll/config', rates);
+  return data;
+}
+
+export async function fetchPayProfiles() {
+  const { data } = await staffApi.get<ApiResponse<PayProfileList>>('/hq/payroll/profiles');
+  return data;
+}
+
+export async function savePayProfile(staffId: number, payload: Partial<StaffPayProfileData>) {
+  const { data } = await staffApi.put<ApiResponse<StaffPayProfileData>>(`/hq/payroll/profiles/${staffId}`, payload);
+  return data;
+}
+
+export async function deletePayProfile(staffId: number) {
+  const { data } = await staffApi.delete<ApiResponse>(`/hq/payroll/profiles/${staffId}`);
+  return data;
+}
+
+export async function fetchPayrollRuns() {
+  const { data } = await staffApi.get<ApiResponse<{ items: PayrollRunSummary[] }>>('/hq/payroll/runs');
+  return data;
+}
+
+export async function createPayrollRun(month: string) {
+  const { data } = await staffApi.post<ApiResponse<PayrollRunDetail>>('/hq/payroll/runs', { month });
+  return data;
+}
+
+export async function fetchPayrollRun(id: number) {
+  const { data } = await staffApi.get<ApiResponse<PayrollRunDetail>>(`/hq/payroll/runs/${id}`);
+  return data;
+}
+
+export async function deletePayrollRun(id: number) {
+  const { data } = await staffApi.delete<ApiResponse>(`/hq/payroll/runs/${id}`);
+  return data;
+}
+
+export async function payrollRunAction(id: number, action: 'recalculate' | 'finalize') {
+  const { data } = await staffApi.post<ApiResponse<PayrollRunDetail>>(`/hq/payroll/runs/${id}/${action}`);
+  return data;
+}
+
+export async function reopenPayrollRun(id: number, reason: string) {
+  const { data } = await staffApi.post<ApiResponse<PayrollRunDetail>>(`/hq/payroll/runs/${id}/reopen`, { reason });
+  return data;
+}
+
+export async function decideRunOvertime(id: number, mode: 'SUGGESTED' | 'REJECT') {
+  const { data } = await staffApi.put<ApiResponse<PayrollRunDetail>>(`/hq/payroll/runs/${id}/overtime`, { mode });
+  return data;
+}
+
+export async function decideItemOvertime(
+  id: number,
+  itemId: number,
+  payload: { mode?: 'SUGGESTED' | 'REJECT'; decisions?: { key: string; approvedMinutes: number | null }[] },
+) {
+  const { data } = await staffApi.put<ApiResponse<PayrollRunDetail>>(`/hq/payroll/runs/${id}/items/${itemId}/overtime`, payload);
+  return data;
+}
+
+export async function addPayrollAdjustment(
+  id: number,
+  itemId: number,
+  payload: { type: PayrollAdjustmentType; amount: number; label?: string; note?: string },
+) {
+  const { data } = await staffApi.post<ApiResponse<PayrollRunDetail>>(`/hq/payroll/runs/${id}/items/${itemId}/adjustments`, payload);
+  return data;
+}
+
+export async function removePayrollAdjustment(id: number, itemId: number, adjId: string) {
+  const { data } = await staffApi.delete<ApiResponse<PayrollRunDetail>>(`/hq/payroll/runs/${id}/items/${itemId}/adjustments/${adjId}`);
+  return data;
+}
+
+// ── 員工本人薪資單（僅已結算） ──
+export async function fetchMyPayslips() {
+  const { data } = await staffApi.get<ApiResponse<{ items: MyPayslipSummary[] }>>('/staff/hr/payslips');
+  return data;
+}
+
+export async function fetchMyPayslip(month: string) {
+  const { data } = await staffApi.get<ApiResponse<MyPayslipDetail>>(`/staff/hr/payslips/${month}`);
+  return data;
+}
+
+// ── 員工通知匣＋LINE 推播綁定（本人） ──
+export async function fetchMyNotifications() {
+  const { data } = await staffApi.get<ApiResponse<StaffNotificationInbox>>('/staff/notifications');
+  return data;
+}
+
+/** ids 省略＝全部已讀 */
+export async function markMyNotificationsRead(ids?: number[]) {
+  const { data } = await staffApi.post<ApiResponse<{ updated: number }>>('/staff/notifications/read', ids ? { ids } : {});
+  return data;
+}
+
+export async function fetchMyLineStatus() {
+  const { data } = await staffApi.get<ApiResponse<StaffLineStatus>>('/staff/notifications/line');
+  return data;
+}
+
+/** 取得 LINE Login 授權網址（state 綁本人，10 分鐘內單次有效） */
+export async function createMyLineBindUrl() {
+  const { data } = await staffApi.post<ApiResponse<{ url: string }>>('/staff/notifications/line/bind-url');
+  return data;
+}
+
+export async function bindMyLine(payload: { code: string; state: string }) {
+  const { data } = await staffApi.post<ApiResponse<StaffLineStatus>>('/staff/notifications/line/bind', payload);
+  return data;
+}
+
+export async function setMyLineNotify(notifyEnabled: boolean) {
+  const { data } = await staffApi.patch<ApiResponse<StaffLineStatus>>('/staff/notifications/line', { notifyEnabled });
+  return data;
+}
+
+export async function unbindMyLine() {
+  const { data } = await staffApi.delete<ApiResponse<StaffLineStatus>>('/staff/notifications/line');
+  return data;
+}
+
+export async function sendMyLineTest() {
+  const { data } = await staffApi.post<ApiResponse<{ notification: StaffNotificationItem | null }>>(
+    '/staff/notifications/line/test',
+  );
+  return data;
+}
+
 // ── 員工 HR 自助 ──
-export async function staffHrPunchIn(payload?: { branchId?: number }) {
-  const { data } = await staffApi.post<ApiResponse<StaffAttendanceRow>>('/staff/hr/punch-in', payload);
+/** 上班打卡：後端依班表值勤窗綁定班次與分店，班外 409 NOT_ON_DUTY／請假 409 ON_LEAVE */
+export async function staffHrPunchIn() {
+  const { data } = await staffApi.post<
+    ApiResponse<StaffAttendanceRow & { staleClosedId: number | null; shift: ScheduleBrief | null; duty: StaffDutyStatus }>
+  >('/staff/hr/punch-in', {});
+  return data;
+}
+
+/** 我的出勤：打卡狀態、今日／下一班、近 30 日考勤（旗標由後端計算） */
+export async function fetchMyAttendance() {
+  const { data } = await staffApi.get<ApiResponse<MyAttendance>>('/staff/hr/my-attendance');
+  return data;
+}
+
+export async function fetchMyLeaves() {
+  const { data } = await staffApi.get<ApiResponse<MyLeaves>>('/staff/hr/my-leaves');
+  return data;
+}
+
+export async function cancelMyLeave(id: number) {
+  const { data } = await staffApi.post<ApiResponse>(`/staff/hr/my-leaves/${id}/cancel`);
   return data;
 }
 
 export async function staffHrPunchOut() {
-  const { data } = await staffApi.post<ApiResponse<StaffAttendanceRow>>('/staff/hr/punch-out');
+  const { data } = await staffApi.post<ApiResponse<StaffAttendanceRow & { duty: StaffDutyStatus }>>(
+    '/staff/hr/punch-out',
+  );
   return data;
 }
 
 export async function staffHrLeaveRequest(payload: {
   startAt: string;
   endAt: string;
+  leaveType?: LeaveType;
+  hours?: number;
   reason?: string;
   proofUrl?: string;
 }) {
@@ -3103,7 +4081,65 @@ export async function fetchStaffHrMySchedule(params?: { from?: string; to?: stri
   return data;
 }
 
-// ── HQ 教練拆帳 ──
+export async function fetchMyRosterOverview() {
+  const { data } = await staffApi.get<ApiResponse<MyRosterOverview>>('/staff/hr/off-requests');
+  return data;
+}
+
+export async function submitMyOffRequest(payload: { cycleStartDate: string; dates: string[]; note?: string }) {
+  const { data } = await staffApi.put<ApiResponse<MyRosterOverview>>('/staff/hr/off-requests', payload);
+  return data;
+}
+
+export async function respondRosterAck(payload: {
+  cycleStartDate: string;
+  status: RosterAckStatus;
+  message?: string;
+}) {
+  const { data } = await staffApi.post<ApiResponse<MyRosterOverview>>('/staff/hr/roster-ack', payload);
+  return data;
+}
+
+// ── 週班表（教練 → FM／店長核准；店長・GM・FM → ADMIN 核准） ──
+export async function fetchMyCoachPlans() {
+  const { data } = await staffApi.get<ApiResponse<MyCoachPlans>>('/staff/hr/week-plans');
+  return data;
+}
+
+export async function saveMyCoachPlan(
+  weekStart: string,
+  payload: { regularOffDate: string | null; restDayDate: string | null; slots: CoachPlanSlot[]; note?: string },
+) {
+  const { data } = await staffApi.put<ApiResponse<CoachWeekPlan>>(`/staff/hr/week-plans/${weekStart}`, payload);
+  return data;
+}
+
+export async function submitMyCoachPlan(weekStart: string) {
+  const { data } = await staffApi.post<ApiResponse<CoachWeekPlan>>(`/staff/hr/week-plans/${weekStart}/submit`);
+  return data;
+}
+
+export async function withdrawMyCoachPlan(weekStart: string) {
+  const { data } = await staffApi.post<ApiResponse<CoachWeekPlan>>(`/staff/hr/week-plans/${weekStart}/withdraw`);
+  return data;
+}
+
+export async function fetchCoachPlanReviews(params?: {
+  status?: CoachPlanStatus | 'ALL';
+  kind?: WeekPlanRole;
+  branchId?: number;
+  from?: string;
+}) {
+  const { data } = await staffApi.get<ApiResponse<CoachPlanReviewList>>('/staff/week-plans', { params });
+  return data;
+}
+
+export async function reviewCoachPlan(id: number, action: 'approve' | 'reject' | 'reopen', reason?: string) {
+  const { data } = await staffApi.post<ApiResponse>(`/staff/week-plans/${id}/${action}`, { reason });
+  return data;
+}
+
+// ── HQ 教練業績獎金（底薪於薪資設定；獎金併入薪資批次） ──
 export async function fetchHqCoachCommissionRules(trainerId?: number) {
   const { data } = await staffApi.get<ApiResponse<CoachCommissionRule[]>>(
     '/hq/coach/commission-rules',
@@ -3112,61 +4148,34 @@ export async function fetchHqCoachCommissionRules(trainerId?: number) {
   return data;
 }
 
-export async function createHqCoachCommissionRule(payload: {
-  trainerId?: number;
-  courseKind?: string;
-  payModel?: string;
-  baseSalary?: number;
-  tierRates?: unknown;
-  hourlyRate?: number;
-  perHeadRate?: number;
+export async function putHqCoachCommissionRule(payload: {
+  trainerId: number | null;
+  courseKind: CoachCourseKind;
+  tierRates?: CoachTierRate[] | null;
+  sessionBonus?: number | null;
+  perHeadRate?: number | null;
 }) {
-  const { data } = await staffApi.post<ApiResponse<CoachCommissionRule>>(
-    '/hq/coach/commission-rules',
-    payload,
+  const { data } = await staffApi.put<ApiResponse<CoachCommissionRule>>('/hq/coach/commission-rules', payload);
+  return data;
+}
+
+export async function deleteHqCoachCommissionRule(id: number) {
+  const { data } = await staffApi.delete<ApiResponse>(`/hq/coach/commission-rules/${id}`);
+  return data;
+}
+
+export async function fetchHqCoachPerformance(month: string) {
+  const { data } = await staffApi.get<ApiResponse<{ month: string; items: HqCoachPerformanceItem[] }>>(
+    '/hq/coach/performance',
+    { params: { month } },
   );
   return data;
 }
 
-export async function patchHqCoachCommissionRule(
-  id: number,
-  payload: Partial<{
-    courseKind: string;
-    payModel: string;
-    baseSalary: number;
-    tierRates: unknown;
-    isActive: boolean;
-  }>,
-) {
-  const { data } = await staffApi.patch<ApiResponse<CoachCommissionRule>>(
-    `/hq/coach/commission-rules/${id}`,
-    payload,
-  );
-  return data;
-}
-
-export async function fetchHqCoachCommissionLedger(params?: {
-  trainerId?: number;
-  from?: string;
-  to?: string;
-  take?: number;
-}) {
-  const { data } = await staffApi.get<ApiResponse<CoachCommissionLedger[]>>(
-    '/hq/coach/commission-ledger',
-    { params },
-  );
-  return data;
-}
-
-export async function runHqCoachCommissionLedger(payload: {
-  trainerId: number;
-  periodStart: string;
-  periodEnd: string;
-}) {
-  const { data } = await staffApi.post<ApiResponse<CoachCommissionLedger>>(
-    '/hq/coach/commission-ledger/run',
-    payload,
-  );
+export async function fetchTrainerMyPerformance(month: string, viewAsTrainerId?: number) {
+  const { data } = await staffApi.get<ApiResponse<TrainerMyPerformance>>('/trainer/performance', {
+    params: { month, ...(viewAsTrainerId ? { viewAsTrainerId } : {}) },
+  });
   return data;
 }
 
@@ -3390,11 +4399,6 @@ export async function cancelMemberIdPhotoDeleteRequest(requestId: string) {
     `/member/id-photo/delete-request/${encodeURIComponent(requestId)}/cancel`,
   );
   return data;
-}
-
-/** @deprecated 改用 requestMemberIdPhotoDelete */
-export async function deleteMemberIdPhoto(_side: IdPhotoSide = 'front') {
-  throw new Error('證件清除須經櫃檯核准');
 }
 
 /** 認證後證件影像路徑（需帶 token 用 blob fetch） */

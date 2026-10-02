@@ -1,40 +1,43 @@
-// lib/staffAccess.js — 員工分店範圍與模組權限
+// lib/staffAccess.js — 員工分店範圍與模組權限（職位定義一律取自 orgStructure.js）
 import { staffBranchLabel } from './branchLabel.js';
 import { resolveDisplayName } from './displayName.js';
+import {
+  STAFF_PERMISSIONS,
+  RANK_DUTY,
+  RANK_STORE_MANAGER,
+  canonicalRole,
+  isCrossBranchRole,
+  positionPermissions,
+  positionRank,
+  staffBranchScope,
+} from './orgStructure.js';
 
-export const STAFF_PERMISSIONS = ['ops', 'pt', 'trainer'];
+export { STAFF_PERMISSIONS };
 
-/** 職位層級：STAFF < DUTY < MANAGER < ADMIN */
-export const STAFF_ROLES = ['STAFF', 'DUTY', 'MANAGER', 'ADMIN'];
+export const roleRank = positionRank;
 
-const ROLE_RANK = {
-  STAFF: 1,
-  DUTY: 2,
-  MANAGER: 3,
-  ADMIN: 4,
-};
-
-export function roleRank(role) {
-  return ROLE_RANK[String(role || '').toUpperCase()] || 0;
-}
-
-/** DUTY（值星）以上可操作交易異動 */
+/** DUTY（值班）以上可操作交易異動 */
 export function hasDutyRankOrAbove(user) {
-  return roleRank(user?.role) >= ROLE_RANK.DUTY;
+  return positionRank(user?.role) >= RANK_DUTY;
 }
 
-/** MANAGER（店長）以上 */
+/** STORE_MANAGER（店長；相容舊 MANAGER）以上 */
 export function hasManagerRankOrAbove(user) {
-  return roleRank(user?.role) >= ROLE_RANK.MANAGER;
+  return positionRank(user?.role) >= RANK_STORE_MANAGER;
 }
 
+/** 總公司 ADMIN：僅用於 /api/hq 與教練工作區代看，禁止用於分店範圍 */
 export function isAdminUser(user) {
-  return user?.role === 'ADMIN';
+  return canonicalRole(user?.role) === 'ADMIN';
+}
+
+/** 跨店職位（ADMIN／GM／FM）：不受分店範圍限制 */
+export function isCrossBranchUser(user) {
+  return isCrossBranchRole(user?.role);
 }
 
 export function resolvePermissions(staff) {
-  if (staff?.role === 'ADMIN') return [...STAFF_PERMISSIONS];
-  return Array.isArray(staff?.permissions) ? staff.permissions : [];
+  return positionPermissions(staff?.role, staff?.permissions);
 }
 
 export function hasPermission(user, perm) {
@@ -42,37 +45,60 @@ export function hasPermission(user, perm) {
   return Array.isArray(user?.permissions) && user.permissions.includes(perm);
 }
 
+/** 非跨店員工可操作之分店 ID（JWT branchIds；舊憑證退回 branchId） */
+export function staffBranchIds(user) {
+  if (Array.isArray(user?.branchIds) && user.branchIds.length > 0) {
+    return user.branchIds.map(Number).filter((n) => Number.isInteger(n) && n > 0);
+  }
+  return user?.branchId ? [Number(user.branchId)] : [];
+}
+
+export function canAccessBranch(user, branchId) {
+  if (isCrossBranchUser(user)) return true;
+  const bid = parseInt(branchId, 10);
+  return Number.isInteger(bid) && staffBranchIds(user).includes(bid);
+}
+
 export function assertBranchAccess(req, branchId) {
-  if (isAdminUser(req.user)) return;
-  const staffBranchId = req.user?.branchId;
-  if (!staffBranchId) {
+  if (isCrossBranchUser(req.user)) return;
+  if (staffBranchIds(req.user).length === 0) {
     const err = new Error('⛔ 帳號未綁定分店，請洽管理員');
     err.statusCode = 403;
     throw err;
   }
-  const bid = parseInt(branchId, 10);
-  if (!Number.isInteger(bid) || bid !== staffBranchId) {
+  if (!canAccessBranch(req.user, branchId)) {
     const err = new Error('⛔ 無權操作其他分店資料');
     err.statusCode = 403;
     throw err;
   }
 }
 
+function scopeIdsOrNone(user) {
+  const ids = staffBranchIds(user);
+  return ids.length > 0 ? ids : [-1];
+}
+
 export function branchListWhere(req) {
-  if (isAdminUser(req.user)) return { isActive: true };
-  if (!req.user?.branchId) return { id: -1, isActive: true };
-  return { id: req.user.branchId, isActive: true };
+  if (isCrossBranchUser(req.user)) return { isActive: true };
+  return { id: { in: scopeIdsOrNone(req.user) }, isActive: true };
 }
 
 export function promotionListWhere(req) {
   const base = { isActive: true };
-  if (isAdminUser(req.user)) return base;
-  if (!req.user?.branchId) return { ...base, branchId: -1 };
-  return { ...base, branchId: req.user.branchId };
+  if (isCrossBranchUser(req.user)) return base;
+  return { ...base, branchId: { in: scopeIdsOrNone(req.user) } };
 }
 
+/** 以 branchId 篩選之資料（商品、報表等）；跨店回傳 {} */
+export function branchScopedWhere(req, field = 'branchId') {
+  if (isCrossBranchUser(req.user)) return {};
+  return { [field]: { in: scopeIdsOrNone(req.user) } };
+}
+
+/**
+ * 員工帳號 → 登入回應（staff 須 include branch{ id,name,code,children{ id,isActive } }）
+ */
 export function toStaffAuthPayload(staff, { trainerId = null } = {}) {
-  const permissions = resolvePermissions(staff);
   const displayName = resolveDisplayName(staff);
   return {
     id: staff.id,
@@ -81,49 +107,67 @@ export function toStaffAuthPayload(staff, { trainerId = null } = {}) {
     /** 真實姓名（總部／內部） */
     realName: staff.name,
     displayName,
-    role: staff.role,
+    role: canonicalRole(staff.role) || staff.role,
     branchId: staff.branchId ?? null,
+    branchIds: staffBranchScope(staff.branch),
     branchName: staffBranchLabel(staff.branch),
-    permissions,
+    permissions: resolvePermissions(staff),
     trainerId: trainerId ?? staff.trainerProfile?.id ?? null,
+    photoUpdatedAt: staff.photoUpdatedAt ?? null,
   };
 }
 
 export function toJwtPayload(staff, { trainerId = null } = {}) {
   return {
     id: staff.id,
-    role: staff.role,
+    role: canonicalRole(staff.role) || staff.role,
     type: 'staff',
     branchId: staff.branchId ?? null,
+    branchIds: staffBranchScope(staff.branch),
     permissions: resolvePermissions(staff),
     trainerId: trainerId ?? staff.trainerProfile?.id ?? null,
   };
 }
 
+/** 登入／me 查詢員工時之 include（供 toJwtPayload 計算分店範圍） */
+export const staffAuthInclude = {
+  branch: {
+    select: {
+      id: true,
+      name: true,
+      code: true,
+      children: { select: { id: true, isActive: true } },
+    },
+  },
+  trainerProfile: { select: { id: true, isActive: true } },
+};
+
+/**
+ * 建立／更新員工之職位、分店、模組正規化（分店類型相容性另由 positionBranchError 檢查）
+ */
 export function validateStaffCreateInput({ role, branchId, permissions }) {
   const errors = [];
-  const normalizedRole = String(role || 'STAFF').toUpperCase();
-
-  if (!STAFF_ROLES.includes(normalizedRole)) {
-    errors.push('role 必須為 STAFF、DUTY、MANAGER 或 ADMIN');
+  const normalizedRole = canonicalRole(role || 'STAFF');
+  if (!normalizedRole) {
+    errors.push('role 必須為 ADMIN、GM、FM、STORE_MANAGER、DUTY、STAFF 或 TRAINER');
+    return { role: null, branchId: null, permissions: [], errors };
   }
 
+  const invalid = (Array.isArray(permissions) ? permissions : []).filter(
+    (p) => !STAFF_PERMISSIONS.includes(p),
+  );
+  if (invalid.length > 0) errors.push(`無效權限：${invalid.join(', ')}`);
+
+  const bid = branchId ? Number(branchId) : null;
   if (normalizedRole === 'ADMIN') {
-    return { role: normalizedRole, branchId: branchId ?? null, permissions: [], errors };
+    return { role: normalizedRole, branchId: null, permissions: [], errors };
+  }
+  if (!isCrossBranchRole(normalizedRole) && !bid) {
+    errors.push('STORE_MANAGER／DUTY／STAFF／TRAINER 必須綁定所屬分店 branchId');
   }
 
-  if (!branchId) {
-    errors.push('STAFF/DUTY/MANAGER 必須綁定分店 branchId');
-  }
+  const perms = positionPermissions(normalizedRole, permissions);
+  if (perms.length === 0) errors.push('至少需勾選一項模組權限（ops / pt / trainer）');
 
-  const perms = Array.isArray(permissions) ? permissions : [];
-  const invalid = perms.filter((p) => !STAFF_PERMISSIONS.includes(p));
-  if (invalid.length > 0) {
-    errors.push(`無效權限：${invalid.join(', ')}`);
-  }
-  if (perms.length === 0) {
-    errors.push('至少需勾選一項模組權限（ops / pt / trainer）');
-  }
-
-  return { role: normalizedRole, branchId: branchId ?? null, permissions: perms, errors };
+  return { role: normalizedRole, branchId: bid, permissions: perms, errors };
 }

@@ -5,6 +5,7 @@ import {
 } from './coursePlan.js';
 import { assertMemberSignedCoursePlanContracts } from './memberContract.js';
 import { staffBranchLabel } from './branchLabel.js';
+import { isManagerTrainer } from './orgStructure.js';
 
 function httpError(message, statusCode = 400) {
   const err = new Error(message);
@@ -40,7 +41,7 @@ export async function buildPtCheckoutLines(tx, {
     throw httpError('找不到此教練或教練已停用', 404);
   }
   const trainerBranchIds = new Set(trainer.branches.map((b) => b.branchId));
-  const isManager = trainer.role === 'MANAGER';
+  const isManager = isManagerTrainer(trainer);
 
   const lines = [];
   let amount = 0;
@@ -66,7 +67,7 @@ export async function buildPtCheckoutLines(tx, {
       );
     }
     if (plan.requiresMemberContract) {
-      await assertMemberSignedCoursePlanContracts(memberId, plan.id);
+      await assertMemberSignedCoursePlanContracts(memberId, plan.id, tx);
     }
 
     const secondPersonOnSite = Boolean(plan.enableSecondPerson) && Boolean(row.secondPersonOnSite);
@@ -127,20 +128,6 @@ export async function fulfillPtCheckoutLines(tx, {
   const created = [];
 
   for (const line of lines) {
-    const contract = await tx.pTContract.create({
-      data: {
-        memberId,
-        trainerId,
-        totalSessions: line.totalSessions,
-        usedSessions: 0,
-        pricePaid: line.lineTotal,
-        isActive: true,
-        source: 'PURCHASE',
-        ...(line.coursePlanId ? { coursePlanId: line.coursePlanId } : {}),
-        ...(line.branchId ? { branchId: line.branchId } : {}),
-      },
-    });
-
     let orderId = null;
     if (!opts.skipOrders) {
       orderId = generateOrderId();
@@ -155,10 +142,26 @@ export async function fulfillPtCheckoutLines(tx, {
             ` | 學員 ${memberName || memberId}`,
           payMethod,
           status,
+          branchId: line.branchId ?? null,
           checkoutSessionId: opts.checkoutSessionId || null,
         },
       });
     }
+
+    const contract = await tx.pTContract.create({
+      data: {
+        memberId,
+        trainerId,
+        totalSessions: line.totalSessions,
+        usedSessions: 0,
+        pricePaid: line.lineTotal,
+        isActive: true,
+        source: 'PURCHASE',
+        orderId,
+        ...(line.coursePlanId ? { coursePlanId: line.coursePlanId } : {}),
+        ...(line.branchId ? { branchId: line.branchId } : {}),
+      },
+    });
 
     created.push({ contractId: contract.id, orderId, ...line });
   }

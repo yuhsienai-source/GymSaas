@@ -20,6 +20,15 @@ model Branch {
   name        String    @unique // 正式名稱（會員介面顯示）如: "和平店"
   /// 員工端關聯顯示用代碼（如 HP）；會員介面仍用 name
   code        String?   @unique
+  /// 分店類型：GYM 健身房／CLASS 教室／ACADEMY 學院（規則見 lib/orgStructure.js）
+  type        String    @default("GYM")
+  /// 隸屬上層分店（僅一層：CLASS → GYM）
+  parentId    Int?
+  parent      Branch?   @relation("BranchHierarchy", fields: [parentId], references: [id], onDelete: Restrict)
+  children    Branch[]  @relation("BranchHierarchy")
+  rosterConfig  BranchRosterConfig?
+  rosterPeriods RosterPeriod[]
+  rosterOffRequests RosterOffRequest[]
   address     String?     // 👈 補上這個欄位 (加上 ? 代表允許為空，避免影響舊資料)
   /// 場館介紹（文字）
   introText   String?     @db.Text
@@ -29,10 +38,9 @@ model Branch {
   introVideos Json?
   /// 是否對外顯示即時人數
   showOccupancy Boolean   @default(true)
-  /// 折讓單／發票列印抬頭（營業人名稱）；未設則回退環境變數或「體育客」
-  invoiceSellerName String?
-  /// 折讓單抬頭統編（8 碼）
-  invoiceSellerUbn  String?
+  /// 所屬營業人（獨立統編／ezPay 商店）；發票、進貨、應付皆歸此營業人
+  legalEntityId Int?
+  legalEntity   LegalEntity? @relation(fields: [legalEntityId], references: [id], onDelete: Restrict)
   isActive    Boolean   @default(true)
   createdAt   DateTime    @default(now())
   updatedAt   DateTime    @updatedAt
@@ -46,8 +54,11 @@ model Branch {
   trainers    TrainerBranch[]
 
   // 進銷存
-  products        Product[]
+  stocks          BranchStock[]
+  stockMovements  StockMovement[]
   purchaseOrders  PurchaseOrder[]
+  purchaseReceipts PurchaseReceipt[]
+  orders          Order[]
   saleOrders      SaleOrder[]
   checkoutSessions CheckoutSession[]
   shiftHandovers  ShiftHandover[]
@@ -61,6 +72,36 @@ model Branch {
   announcements   Announcement[]
   faqItems        FaqItem[]
   memberGroups    MemberGroup[]
+
+  @@index([parentId])
+  @@index([legalEntityId])
+}
+
+/// 營業人：獨立統編＝獨立 ezPay 商店。HashKey／HashIV 只在 env（EZPAY_{code}_HASH_KEY／_HASH_IV），禁止入庫
+model LegalEntity {
+  id              Int      @id @default(autoincrement())
+  /// env 前綴（大寫英數，如 HP）
+  code            String   @unique
+  /// 營業人名稱（發票／折讓單抬頭）
+  name            String
+  /// 統一編號 8 碼
+  ubn             String   @unique
+  address         String?
+  phone           String?
+  /// ezPay 商店代號（MerchantID，非機密）
+  ezpayMerchantId String?  @unique
+  isActive        Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  branches         Branch[]
+  einvoices        EInvoice[]
+  allowances       InvoiceAllowance[]
+  saleOrders       SaleOrder[]
+  purchaseOrders   PurchaseOrder[]
+  purchaseReceipts PurchaseReceipt[]
+  payables         SupplierPayable[]
+  supplierPayments SupplierPayment[]
 }
 
 model Venue {
@@ -187,6 +228,9 @@ model Member {
   venueBookings      VenueBooking[]
   familyCardMembers  FamilyCardMember[]
   memberPointsLedger MemberPointsLedger[]
+  groupEnrollments   GroupEnrollment[]
+  groupWaitlist      GroupWaitlist[]
+  groupMakeupCredits GroupMakeupCredit[]
   lotteryEntries     LotteryEntry[]
   inBodyVouchers     InBodyVoucher[]
   giftCardsPurchased GiftCard[] @relation("GiftCardPurchaser")
@@ -371,6 +415,12 @@ model CheckInLog {
   // 本次消費金額：出場時才會計算並寫入
   fee Float @default(0.0)
 
+  /// 最近一次出場刷卡時錢包不足之差額（未扣款、仍在場、閘機不開門；補儲值後重刷一次全額扣款並歸 0）
+  shortfallAmt  Float @default(0.0)
+  /// 出場實扣拆分（取消進出場時依此原路退回）
+  deductedCash  Float @default(0.0)
+  deductedBonus Float @default(0.0)
+
   // ACTIVE | CANCELLED（櫃檯取消進出場／沖銷費用）
   status String @default("ACTIVE")
 
@@ -469,6 +519,10 @@ model CoursePlan {
   price       Float     // 方案售價；COMPENSATION 強制 0
   sessions    Int?      // 堂數（私教／套票）；COMPENSATION 必須 > 0
   capacity    Int?      // 團體課建議人數上限（參考）
+  /// 團課單堂價（空＝不開放單堂）；期班價＝price、每期堂數＝sessions
+  dropInPrice Float?
+  /// 團課最低開班人數（0／空＝不設）
+  minEnrollment Int?
   description String?
   requiresMemberContract Boolean @default(false) // 需簽署會員合約
   enableCardRecurring Boolean @default(false) // 啟用信用卡定期定額
@@ -498,6 +552,7 @@ model CoursePlan {
   cardSubscriptions CardSubscription[]
   ptContracts       PTContract[]
   hqCompensationLogs HqCompensationLog[]
+  classSeries       ClassSeries[]
 
   @@index([kind, isActive])
 }
@@ -629,6 +684,29 @@ model MemberContractSignature {
   @@index([memberId, status])
 }
 
+/// 員工電子同意書簽署（與會員合約分離；append-only，撤回只標記 revokedAt）
+model StaffConsentSignature {
+  id               Int       @id @default(autoincrement())
+  staffId          Int
+  staff            Staff     @relation(fields: [staffId], references: [id], onDelete: Restrict)
+  /// BIOMETRICS
+  kind             String
+  version          String
+  /// 簽署當下條文 SHA-256
+  bodyHash         String
+  signerName       String
+  signatureData    String    @db.Text // data:image/png;base64,...
+  /// 見證／經辦員工（由 JWT 取得）
+  witnessStaffId   Int?
+  ipAddress        String?
+  userAgent        String?   @db.Text
+  signedAt         DateTime  @default(now())
+  revokedAt        DateTime?
+  revokedByStaffId Int?
+
+  @@index([staffId, kind, signedAt])
+}
+
 // ==========================================
 // 4. 教練與權限系統
 // ==========================================
@@ -644,6 +722,8 @@ model Trainer {
   photoUrl    String?
   phone       String    @unique
   role        String    @default("NORMAL") // NORMAL(一般教練), MANAGER(主管教練)
+  /// 教練等級：GOLD(金牌), SILVER(銀牌)
+  level       String    @default("SILVER")
   isActive    Boolean   @default(true)
   /// 綁定員工帳號：教練端僅能操作本人資料；總部 ADMIN 可跨教練
   staffId     Int?      @unique
@@ -715,7 +795,14 @@ model PTContract {
 
   expiresAt     DateTime? // 合約到期日
   isActive      Boolean   @default(true)
+  /// 購案訂單（退費依此精準定位合約；補償贈送為 null）
+  orderId       String?   @unique
+  order         Order?    @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  /// 退費停用時間（RefundRequest 結案）
+  refundedAt    DateTime?
   createdAt     DateTime  @default(now())
+
+  classes       Class[]
 
   @@index([branchId])
   @@index([coursePlanId])
@@ -749,13 +836,118 @@ model ClassSeries {
   /// HH:mm
   endTime   String
   isActive  Boolean  @default(true)
+  /// 付費期班：綁 GROUP 課程方案；舊資料可空（不可售）
+  coursePlanId Int?
+  coursePlan   CoursePlan? @relation(fields: [coursePlanId], references: [id], onDelete: SetNull)
+  /// 開班時快照：整期價／單堂價（空＝不開放）／總堂數／最低開班人數
+  termPrice     Float?
+  dropInPrice   Float?
+  sessionCount  Int?
+  minEnrollment Int      @default(0)
+  /// 開班人數判定截止（未達最低人數由總部取消並全額退費）
+  enrollDeadline DateTime?
+  /// OPEN | CANCELLED
+  status        String   @default("OPEN")
+  cancelledAt   DateTime?
+  cancelReason  String?
+  cancelledByStaffId Int?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  classes Class[]
+  classes     Class[]
+  enrollments GroupEnrollment[]
+  waitlist    GroupWaitlist[]
 
   @@index([trainerId, startDate])
   @@index([venueId, startDate])
+  @@index([coursePlanId, status])
+}
+
+/// 團課報名（整期 TERM／單堂 DROP_IN）；一筆報名＝一張 GRP 訂單＝一張發票
+model GroupEnrollment {
+  id        Int      @id @default(autoincrement())
+  memberId  Int
+  member    Member   @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  seriesId  Int
+  series    ClassSeries @relation(fields: [seriesId], references: [id], onDelete: Cascade)
+  /// TERM | DROP_IN
+  kind      String
+  /// DROP_IN 之單堂
+  classId   Int?
+  /// PENDING(待付款保留名額) | ACTIVE | EXPIRED(逾時未付) | CANCELLED(未付款取消) | REFUNDED
+  status    String   @default("PENDING")
+  sessionsTotal Int
+  unitPrice Float
+  price     Float
+  orderId   String?  @unique
+  checkoutSessionId String?
+  /// POS | ONLINE
+  source    String
+  holdExpiresAt DateTime?
+  paidAt    DateTime?
+  createdByStaffId Int?
+  waitlistId Int?
+  /// COOLING_OFF | STANDARD | SERIES_CANCELLED | DROP_IN
+  refundKind   String?
+  refundAmount Float?
+  refundFee    Float?
+  consumedSessions Int?
+  refundReason String?
+  refundedAt   DateTime?
+  refundedByStaffId Int?
+  /// 退款管道明細 { WALLET_CASH, LINEPAY, MANUAL }
+  refundBreakdown Json?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  reservations  Reservation[]
+  makeupCredits GroupMakeupCredit[]
+
+  @@index([memberId, status])
+  @@index([seriesId, status])
+  @@index([status, holdExpiresAt])
+  @@index([checkoutSessionId])
+}
+
+/// 期班額滿候補：依序遞補、限時付款
+model GroupWaitlist {
+  id        Int      @id @default(autoincrement())
+  seriesId  Int
+  series    ClassSeries @relation(fields: [seriesId], references: [id], onDelete: Cascade)
+  memberId  Int
+  member    Member   @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  /// WAITING | OFFERED | ENROLLED | EXPIRED | CANCELLED
+  status    String   @default("WAITING")
+  offeredAt DateTime?
+  offerExpiresAt DateTime?
+  /// MEMBER | STAFF
+  source    String   @default("MEMBER")
+  createdByStaffId Int?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([seriesId, status, createdAt])
+  @@index([memberId, status])
+}
+
+/// 依規定請假（開課 ≥24h）取得之補課權：同課程方案其他期班有空位之單堂
+model GroupMakeupCredit {
+  id            Int      @id @default(autoincrement())
+  memberId      Int
+  member        Member   @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  enrollmentId  Int
+  enrollment    GroupEnrollment @relation(fields: [enrollmentId], references: [id], onDelete: Cascade)
+  coursePlanId  Int?
+  sourceReservationId Int @unique
+  /// AVAILABLE | USED | EXPIRED | REVOKED
+  status        String   @default("AVAILABLE")
+  expiresAt     DateTime
+  usedReservationId Int? @unique
+  usedAt        DateTime?
+  createdAt     DateTime @default(now())
+
+  @@index([memberId, status])
+  @@index([enrollmentId])
 }
 
 model Class {
@@ -775,6 +967,10 @@ model Class {
   /// 所屬期班（團課期班展開之單堂）；私教／諮詢為 null
   seriesId Int?
   series   ClassSeries? @relation(fields: [seriesId], references: [id], onDelete: Cascade)
+
+  /// 私教扣堂之合約（教練業績依此合約單堂價計算）；舊資料可空
+  ptContractId Int?
+  ptContract   PTContract? @relation(fields: [ptContractId], references: [id], onDelete: SetNull)
 
   startAt DateTime
   endAt   DateTime
@@ -805,10 +1001,15 @@ model Reservation {
   /// MEMBER | LINE | TRAINER | CONSULT_GUEST
   source         String        @default("TRAINER")
   bookedAt       DateTime      @default(now())
+  /// 團課報名（整期／單堂）；補課預約為 null、以 makeupCreditId 追溯
+  enrollmentId   Int?
+  enrollment     GroupEnrollment? @relation(fields: [enrollmentId], references: [id], onDelete: SetNull)
+  makeupCreditId Int?
 
   classLeave     ClassLeave?
   attendance     ClassAttendance?
 
+  @@index([enrollmentId])
   @@index([classId, status])
   @@index([memberId, status])
   @@index([consultGuestId])
@@ -859,24 +1060,27 @@ model Order {
   recurringAmountFinal Float?
   /// PayUNi CreditHash（約定扣款 Token）
   creditHash    String?
-  carrierNum    String?  // 發票載具（手機條碼／自然人憑證）
-  buyerUbn      String?  // 公司統編（B2B）
-  loveCode      String?  // 發票捐贈碼（愛心碼）
   status        String   @default("PENDING") // 狀態：PENDING, PAID, FAILED
   merchantNo    String?  // 統一金流端產生的交易序號
-  invoiceNumber String?  // ezPay 回傳的電子發票字軌號碼
-  /// PENDING | ISSUED | FAILED | SKIPPED（非同步開票佇列）
-  invoiceStatus String?
+  /// 提供服務分店（發票開立營業人＝此分店之 LegalEntity）；發票本體見 EInvoice(refId=id)
+  branchId      Int?
+  branch        Branch?  @relation(fields: [branchId], references: [id])
   /// 合併結帳工作階段（CHK…）
   checkoutSessionId String?
+  /// 計時儲值入帳快照（本金／運動金）；原單取消只能依此回收，禁止改由 itemDesc 或 Promotion 反推
+  grantedCash   Int?
+  grantedBonus  Int?
+  /// 已退款累計（含稅，經 RefundRequest 結案寫入）
+  refundedAmount Int     @default(0)
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
 
   // 關聯設定：一筆訂單屬於一個會員
   member        Member   @relation(fields: [memberId], references: [id])
+  ptContract    PTContract?
 
-  @@index([invoiceNumber])
   @@index([checkoutSessionId])
+  @@index([branchId])
   @@index([status, createdAt])
   @@index([memberId, createdAt])
 }
@@ -974,82 +1178,272 @@ model CardSubscriptionCharge {
 }
 
 // ==========================================
-// 7. 進銷存：商品 / 庫存流水 / 進貨 / 銷貨（與 Promotion 儲值分離）
+// 7. 進銷存：商品主檔 / 分店庫存 / 庫存流水 / 供應商 / 採購 / 驗收 / 應付（與 Promotion 儲值分離）
+// 金額一律整數元（Int）；成本單價 Decimal(12,4)（移動平均）
 // ==========================================
+/// 商品主檔（全公司共用；售價／庫存在 BranchStock）
 model Product {
   id          Int      @id @default(autoincrement())
-  branchId    Int
-  branch      Branch   @relation(fields: [branchId], references: [id], onDelete: Cascade)
-  sku         String
+  sku         String   @unique
+  /// 國際條碼（掃碼槍）
+  barcode     String?  @unique
   name        String
+  /// 發票品名（≤30 字；未設用 name）
+  invoiceName String?
+  unit        String   @default("個")
   /// PHYSICAL=實體控庫存 | SERVICE=服務類不控庫存（禁進貨／盤點／安全庫存預警）
   productKind String   @default("PHYSICAL")
-  price       Float // 售價（後端權威，前端禁自填金額）
-  cost        Float    @default(0) // 參考成本
-  stockQty    Int      @default(0)
-  /// 安全庫存（僅 PHYSICAL）；低於等於時 HQ 預警。SERVICE 必須為 null
-  safetyStock Int?
+  /// TAXABLE 應稅 | TAX_FREE 免稅
+  taxType     String   @default("TAXABLE")
+  /// 建議售價（含稅；分店未設 salePrice 時採用）
+  listPrice   Int      @default(0)
   isActive    Boolean  @default(true)
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
-  movements     StockMovement[]
-  purchaseItems PurchaseItem[]
-  saleItems     SaleItem[]
-
-  @@unique([branchId, sku])
+  stocks             BranchStock[]
+  movements          StockMovement[]
+  purchaseOrderItems PurchaseOrderItem[]
+  receiptItems       PurchaseReceiptItem[]
+  saleItems          SaleItem[]
 }
 
+/// 分店庫存（上架、售價、現量、移動平均成本）；onHand 只能經 StockMovement 交易異動
+model BranchStock {
+  id          Int      @id @default(autoincrement())
+  branchId    Int
+  branch      Branch   @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  productId   Int
+  product     Product  @relation(fields: [productId], references: [id], onDelete: Restrict)
+  /// 分店售價（含稅）；null＝採 Product.listPrice
+  salePrice   Int?
+  onHand      Int      @default(0)
+  /// 移動平均成本（未稅）
+  avgCost     Decimal  @default(0) @db.Decimal(12, 4)
+  /// 安全庫存（僅 PHYSICAL）
+  safetyStock Int?
+  /// 是否於本店 POS 上架
+  isListed    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([branchId, productId])
+  @@index([productId])
+}
+
+/// 庫存流水（帶號；balanceAfter＝異動後現量）
 model StockMovement {
-  id        Int      @id @default(autoincrement())
-  productId Int
-  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
-  type      String // IN | OUT | ADJUST
-  qty       Int // 正整數；方向由 type 決定（STOCKTAKE 校正差額可為 0）
-  unitCost  Float?
-  refType   String? // PURCHASE | SALE | SALE_CANCEL | LOSS(盤損) | GAIN(盤盈) | STOCKTAKE(盤點校正) | ADJUST
-  refId     String?
-  note      String?
-  staffId   Int?
-  createdAt DateTime @default(now())
+  id           Int      @id @default(autoincrement())
+  branchId     Int
+  branch       Branch   @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  productId    Int
+  product      Product  @relation(fields: [productId], references: [id], onDelete: Restrict)
+  /// 帶號數量：入庫正、出庫負（盤點無差異可為 0）
+  qtyDelta     Int
+  balanceAfter Int
+  /// 未稅單位成本快照
+  unitCost     Decimal? @db.Decimal(12, 4)
+  /// RECEIPT | SALE | SALE_CANCEL | LOSS | GAIN | STOCKTAKE | TRANSFER_OUT | TRANSFER_IN | OPENING
+  refType      String
+  refId        String?
+  refLineId    Int?
+  reason       String?
+  staffId      Int?
+  createdAt    DateTime @default(now())
+
+  @@index([branchId, productId, createdAt])
+  @@index([refType, refId])
 }
 
+/// 供應商（全公司共用；應付帳款依營業人分帳）
+model Supplier {
+  id              Int      @id @default(autoincrement())
+  name            String
+  /// 供應商統編（可空：個人／國外）
+  ubn             String?  @unique
+  contactName     String?
+  phone           String?
+  email           String?
+  address         String?
+  /// NET 驗收後 N 日 | EOM 月結 N 日（次月起算）| COD 貨到付款
+  paymentTermType String   @default("NET")
+  paymentTermDays Int      @default(30)
+  note            String?
+  isActive        Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  purchaseOrders PurchaseOrder[]
+  receipts       PurchaseReceipt[]
+  payables       SupplierPayable[]
+  payments       SupplierPayment[]
+}
+
+/// 採購單（POH…）：DRAFT → ORDERED → PARTIAL → RECEIVED → CLOSED；DRAFT／ORDERED 可 CANCELLED
 model PurchaseOrder {
-  id         String   @id // POH...
-  branchId   Int
-  branch     Branch   @relation(fields: [branchId], references: [id], onDelete: Cascade)
-  supplier   String?
-  status     String   @default("RECEIVED") // 本階段進貨即入庫
-  totalCost  Float    @default(0)
-  note       String?
-  staffId    Int?
-  createdAt  DateTime @default(now())
-  items      PurchaseItem[]
+  id               String      @id
+  legalEntityId    Int
+  legalEntity      LegalEntity @relation(fields: [legalEntityId], references: [id], onDelete: Restrict)
+  branchId         Int
+  branch           Branch      @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  supplierId       Int
+  supplier         Supplier    @relation(fields: [supplierId], references: [id], onDelete: Restrict)
+  status           String      @default("DRAFT")
+  expectedAt       DateTime?
+  /// 未稅小計／稅額／含稅總額（後端依明細計算）
+  subtotal         Int         @default(0)
+  taxAmount        Int         @default(0)
+  total            Int         @default(0)
+  note             String?
+  createdByStaffId Int?
+  orderedAt        DateTime?
+  closedAt         DateTime?
+  cancelReason     String?
+  createdAt        DateTime    @default(now())
+  updatedAt        DateTime    @updatedAt
+
+  items    PurchaseOrderItem[]
+  receipts PurchaseReceipt[]
+
+  @@index([branchId, status])
+  @@index([supplierId, status])
 }
 
-model PurchaseItem {
+model PurchaseOrderItem {
   id              Int           @id @default(autoincrement())
   purchaseOrderId String
   purchaseOrder   PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
   productId       Int
-  product         Product       @relation(fields: [productId], references: [id])
-  qty             Int
-  unitCost        Float
-  lineCost        Float
+  product         Product       @relation(fields: [productId], references: [id], onDelete: Restrict)
+  qtyOrdered      Int
+  qtyReceived     Int           @default(0)
+  /// 未稅進價
+  unitCost        Decimal       @db.Decimal(12, 4)
+  /// TAXABLE | TAX_FREE（進項稅）
+  taxType         String        @default("TAXABLE")
+
+  receiptItems PurchaseReceiptItem[]
+
+  @@unique([purchaseOrderId, productId])
+}
+
+/// 驗收入庫單（PRC…）：一次到貨一張；入庫即產生應付
+model PurchaseReceipt {
+  id                  String          @id
+  purchaseOrderId     String?
+  purchaseOrder       PurchaseOrder?  @relation(fields: [purchaseOrderId], references: [id], onDelete: Restrict)
+  legalEntityId       Int
+  legalEntity         LegalEntity     @relation(fields: [legalEntityId], references: [id], onDelete: Restrict)
+  branchId            Int
+  branch              Branch          @relation(fields: [branchId], references: [id], onDelete: Restrict)
+  supplierId          Int
+  supplier            Supplier        @relation(fields: [supplierId], references: [id], onDelete: Restrict)
+  /// 供應商開立之進項發票號（可後補）
+  supplierInvoiceNo   String?
+  supplierInvoiceDate DateTime?
+  subtotal            Int             @default(0)
+  taxAmount           Int             @default(0)
+  total               Int             @default(0)
+  receivedAt          DateTime        @default(now())
+  staffId             Int?
+  note                String?
+  createdAt           DateTime        @default(now())
+
+  items   PurchaseReceiptItem[]
+  payable SupplierPayable?
+
+  @@index([branchId, receivedAt])
+  @@index([supplierId, receivedAt])
+}
+
+model PurchaseReceiptItem {
+  id        Int                @id @default(autoincrement())
+  receiptId String
+  receipt   PurchaseReceipt    @relation(fields: [receiptId], references: [id], onDelete: Cascade)
+  poItemId  Int?
+  poItem    PurchaseOrderItem? @relation(fields: [poItemId], references: [id], onDelete: Restrict)
+  productId Int
+  product   Product            @relation(fields: [productId], references: [id], onDelete: Restrict)
+  qty       Int
+  unitCost  Decimal            @db.Decimal(12, 4)
+  taxType   String             @default("TAXABLE")
+}
+
+/// 應付帳款（APY…）：一張驗收單一筆；RETURN／ADJUST 可為負
+model SupplierPayable {
+  id                String          @id
+  legalEntityId     Int
+  legalEntity       LegalEntity     @relation(fields: [legalEntityId], references: [id], onDelete: Restrict)
+  supplierId        Int
+  supplier          Supplier        @relation(fields: [supplierId], references: [id], onDelete: Restrict)
+  receiptId         String?         @unique
+  receipt           PurchaseReceipt? @relation(fields: [receiptId], references: [id], onDelete: Restrict)
+  /// PURCHASE | RETURN | ADJUST
+  type              String          @default("PURCHASE")
+  supplierInvoiceNo String?
+  amount            Int
+  paidAmount        Int             @default(0)
+  dueDate           DateTime
+  /// OPEN | PARTIAL | PAID | VOID
+  status            String          @default("OPEN")
+  note              String?
+  voidReason        String?
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+
+  allocations SupplierPaymentAllocation[]
+
+  @@unique([supplierId, supplierInvoiceNo])
+  @@index([legalEntityId, status, dueDate])
+}
+
+/// 付款（APM…）：可沖銷多筆應付
+model SupplierPayment {
+  id            String      @id
+  legalEntityId Int
+  legalEntity   LegalEntity @relation(fields: [legalEntityId], references: [id], onDelete: Restrict)
+  supplierId    Int
+  supplier      Supplier    @relation(fields: [supplierId], references: [id], onDelete: Restrict)
+  amount        Int
+  /// TRANSFER | CASH | CHECK
+  method        String      @default("TRANSFER")
+  paidAt        DateTime    @default(now())
+  reference     String?
+  note          String?
+  staffId       Int?
+  createdAt     DateTime    @default(now())
+
+  allocations SupplierPaymentAllocation[]
+
+  @@index([legalEntityId, paidAt])
+}
+
+model SupplierPaymentAllocation {
+  id        Int             @id @default(autoincrement())
+  paymentId String
+  payment   SupplierPayment @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  payableId String
+  payable   SupplierPayable @relation(fields: [payableId], references: [id], onDelete: Restrict)
+  amount    Int
+
+  @@unique([paymentId, payableId])
 }
 
 model SaleOrder {
   id            String   @id // SAL...
   branchId      Int
   branch        Branch   @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  /// 開立營業人（＝分店 LegalEntity 快照）
+  legalEntityId Int
+  legalEntity   LegalEntity @relation(fields: [legalEntityId], references: [id], onDelete: Restrict)
   memberId      Int?
   member        Member?  @relation(fields: [memberId], references: [id])
   payMethod     String // 複合：CASH+CARD+VOUCHER 等
   payBreakdown  Json? // { CASH: 100, CARD: 200, WALLET_CASH: 0, VOUCHER: 50 }
   voucherCode   String? // 抵用券條碼
   status        String   @default("PENDING") // PENDING | PAID | CANCELLED
-  amount        Float // 訂單總額
-  cardAmount    Float    @default(0) // 刷卡待收／已收部分（複合時）
+  amount        Int // 訂單總額（含稅）
+  cardAmount    Int      @default(0) // 刷卡待收／已收部分（複合時）
   cardMode      String?  @default("LUMP") // LUMP | INSTALLMENT | RECURRING
   cardInst      Int?
   periodType    String?
@@ -1057,26 +1451,21 @@ model SaleOrder {
   creditHash    String?
   itemDesc      String
   merchantNo    String?
-  invoiceNumber String?
-  /// PENDING | ISSUED | FAILED | SKIPPED
-  invoiceStatus String?
-  carrierNum    String? // 發票載具（手機條碼／自然人憑證）
-  buyerUbn      String? // 公司統編（B2B）
-  loveCode      String? // 發票捐贈碼（愛心碼）
   staffId       Int?
-  /// 合併結帳工作階段（CHK…）；有值時發票由 CheckoutSession 統一開立
+  /// 合併結帳工作階段（CHK…）
   checkoutSessionId String?
+  /// 已退款累計（含稅）；全部品項退完才改 CANCELLED
+  refundedAmount Int     @default(0)
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
   items         SaleItem[]
 
   @@index([branchId, status, createdAt])
   @@index([checkoutSessionId])
-  @@index([invoiceNumber])
 }
 
 // ==========================================
-// 臨櫃合併結帳：商品 + 購案同一筆付款／發票（PayUNi MerTradeNo = CHK…）
+// 臨櫃合併結帳：商品 + 購案同一筆付款；發票依子單分腿開立（EInvoice）
 // ==========================================
 model CheckoutSession {
   id              String   @id // CHK...
@@ -1101,14 +1490,8 @@ model CheckoutSession {
   /// 結帳當下選定的 PayUNi 續期 Hash（方案欄或 env map）
   payuniPeriodHash String?
   creditHash      String?
-  carrierNum      String?
-  buyerUbn        String?
-  loveCode        String?
   status          String   @default("PENDING") // PENDING | PAID | FAILED | CANCELLED
   merchantNo      String?
-  invoiceNumber   String?
-  /// PENDING | ISSUED | FAILED | SKIPPED
-  invoiceStatus   String?
   saleOrderId     String?  @unique
   orderId         String?  @unique
   /// 私教課程購物車快照：[{ coursePlanId, name, qty, unitPrice, lineTotal, sessions, totalSessions, branchId }]
@@ -1131,16 +1514,165 @@ model SaleItem {
   productId   Int
   product     Product   @relation(fields: [productId], references: [id])
   name        String // 成交快照
-  unitPrice   Float
+  unitPrice   Int // 含稅
   qty         Int
-  lineTotal   Float
+  lineTotal   Int
+  /// TAXABLE | TAX_FREE（成交快照）
+  taxType     String    @default("TAXABLE")
+  /// 銷貨成本快照（移動平均，未稅）
+  unitCost    Decimal?  @db.Decimal(12, 4)
+  /// 已退貨數量（DB CHECK 0 ≤ refundedQty ≤ qty）
+  refundedQty Int       @default(0)
 }
 
-/// ezPay 折讓單稽核／列印用快照（開立成功後寫入）
+// ==========================================
+// 8. ezPay 電子發票：開立營業人＝提供服務／出貨分店之 LegalEntity
+// ==========================================
+/// 開票請求（交易當下買受人選項；一單據一筆，子單由 CHK 繼承）
+model InvoiceRequest {
+  /// SAL… / TYK… / GRP… / CRS… / CHK…
+  refId      String   @id
+  /// ORDER | SALE | CHECKOUT
+  refType    String
+  buyerName  String?
+  buyerUbn   String?
+  carrierNum String?
+  loveCode   String?
+  buyerEmail String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
+
+/// 電子發票（一筆＝一張）；開票失敗留 FAILED 由佇列重試，禁止沖回已收款
+model EInvoice {
+  id                String       @id // EIV…
+  /// 開立營業人；分店未綁營業人時暫空，佇列處理時依 branchId 重新解析
+  legalEntityId     Int?
+  legalEntity       LegalEntity? @relation(fields: [legalEntityId], references: [id], onDelete: Restrict)
+  /// 提供服務分店快照
+  branchId          Int?
+  /// ORDER | SALE | CHECKOUT（舊版合併單一發票）
+  refType           String
+  refId             String
+  /// SALE | PROMO | PT | GROUP | ORDER | ALL
+  leg               String      @default("ALL")
+  /// 同 ref+leg 作廢後重開序號
+  seq               Int         @default(1)
+  checkoutSessionId String?
+  memberId          Int?
+  /// ezPay 自訂編號（≤20 英數_；同營業人唯一）
+  merchantOrderNo   String
+  /// B2C | B2B
+  category          String
+  buyerName         String?
+  buyerUbn          String?
+  buyerEmail        String?
+  /// 0 手機條碼 | 1 自然人憑證
+  carrierType       String?
+  carrierNum        String?
+  loveCode          String?
+  printFlag         String      @default("N")
+  /// 1 應稅 | 3 免稅 | 9 混合
+  taxType           String      @default("1")
+  taxRate           Int         @default(5)
+  /// 銷售額（未稅）
+  salesAmount       Int
+  taxAmount         Int
+  totalAmount       Int
+  itemDesc          String
+  /// PENDING | ISSUING | ISSUED | FAILED | VOIDED（已開立後作廢）| CANCELLED（未開立即取消）
+  status            String      @default("PENDING")
+  invoiceNumber     String?     @unique
+  randomNum         String?
+  ezpayTransNo      String?
+  issuedAt          DateTime?
+  /// 發票期別（雙月起月 YYYYMM）
+  periodKey         String?
+  allowanceTotal    Int         @default(0)
+  voidedAt          DateTime?
+  voidReason        String?
+  voidedByStaffId   Int?
+  retryCount        Int         @default(0)
+  nextRetryAt       DateTime?
+  lastError         String?
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+
+  items      EInvoiceItem[]
+  allowances InvoiceAllowance[]
+  logs       EInvoiceLog[]
+
+  @@unique([legalEntityId, merchantOrderNo])
+  @@index([refId, leg])
+  @@index([checkoutSessionId])
+  @@index([status, nextRetryAt])
+  @@index([legalEntityId, issuedAt])
+}
+
+model EInvoiceItem {
+  id         Int      @id @default(autoincrement())
+  einvoiceId String
+  einvoice   EInvoice @relation(fields: [einvoiceId], references: [id], onDelete: Cascade)
+  lineNo     Int
+  name       String
+  qty        Int
+  unit       String   @default("式")
+  /// B2C 含稅、B2B 未稅（與送 ezPay 一致）
+  unitPrice  Int
+  amount     Int
+  /// 1 應稅 | 3 免稅
+  taxType    String   @default("1")
+  productId  Int?
+  /// 銷貨明細來源（退貨折讓逐行對應）
+  saleItemId Int?
+  /// 已折讓數量／含稅金額累計（逐行稽核；退貨數量上限以 SaleItem.refundedQty 為準）
+  allowedQty    Int   @default(0)
+  allowedAmount Int   @default(0)
+  allowanceItems InvoiceAllowanceItem[]
+
+  @@index([einvoiceId])
+  @@index([saleItemId])
+}
+
+/// ezPay 呼叫紀錄（每次開立／查詢補登／作廢／折讓一筆，僅追加）；供總部查錯，禁止寫入 HashKey／HashIV 或加密內容
+model EInvoiceLog {
+  id            Int       @id @default(autoincrement())
+  einvoiceId    String?
+  einvoice      EInvoice? @relation(fields: [einvoiceId], references: [id], onDelete: SetNull)
+  refId         String?
+  legalEntityId Int?
+  merchantId    String?
+  /// ISSUE | RECOVER（查詢補登）| VOID | ALLOWANCE
+  action        String
+  /// SUCCESS | FAILED | NOT_FOUND
+  result        String
+  /// 該張發票第幾次開立嘗試
+  attempt       Int?
+  manual        Boolean   @default(false)
+  staffId       Int?
+  /// 系統錯誤代碼（EZPAY_NETWORK、EZPAY_REJECTED、EZPAY_CHECKCODE_MISMATCH…）
+  errorCode     String?
+  /// ezPay 回傳 Status（SUCCESS、INV10003、LIB10003…）
+  ezpayStatus   String?
+  message       String?
+  invoiceNumber String?
+  durationMs    Int?
+  createdAt     DateTime  @default(now())
+
+  @@index([einvoiceId, createdAt])
+  @@index([result, createdAt])
+  @@index([legalEntityId, createdAt])
+}
+
+/// ezPay 折讓單（開立成功後寫入；稽核／列印）
 model InvoiceAllowance {
-  id              String   @id // IAL…
+  id              String       @id // IAL…
   /// ezPay 折讓號
-  allowanceNo     String   @unique
+  allowanceNo     String       @unique
+  einvoiceId      String?
+  einvoice        EInvoice?    @relation(fields: [einvoiceId], references: [id], onDelete: Restrict)
+  legalEntityId   Int?
+  legalEntity     LegalEntity? @relation(fields: [legalEntityId], references: [id], onDelete: Restrict)
   invoiceNumber   String
   merchantOrderNo String
   orderId         String?
@@ -1148,30 +1680,254 @@ model InvoiceAllowance {
   memberId        Int?
   memberName      String?
   itemDesc        String?
-  untaxedAmt      Float
-  taxAmt          Float
-  totalAmt        Float
-  remainAmt       Float?
+  untaxedAmt      Int
+  taxAmt          Int
+  totalAmt        Int
+  remainAmt       Int?
   buyerEmail      String?
-  /// REFUND | CANCEL_SALE | SUB_CANCEL | MANUAL
-  source          String   @default("REFUND")
+  /// TOPUP_VOID | SUB_ORDER_REFUND | REFUND | CANCEL_SALE | CANCEL_PT | SUB_CANCEL | GROUP_REFUND | MANUAL
+  source          String       @default("REFUND")
+  /// ISSUED | VOIDED
+  status          String       @default("ISSUED")
   staffId         Int?
   /// 列印用營業人（開立當下快照）
   sellerName      String?
   sellerUbn       String?
   sellerAddress   String?
-  createdAt       DateTime @default(now())
+  /// 退費單（RFD…）與子單（SAL／TYK／CRS…）
+  refundId        String?
+  subOrderId      String?
+  /// 原發票分店快照（查詢範圍）
+  branchId        Int?
+  /// 原發票開立日與期別（列印字軌／對帳）
+  invoiceIssuedAt  DateTime?
+  invoicePeriodKey String?
+  /// B2B | B2C；買受人僅 B2B 存名稱／統編
+  category        String?
+  buyerUbn        String?
+  buyerName       String?
+  reason          String?
+  /// 顧客親簽（RefundSignature.id）
+  signatureId     String?
+  /// 列印次數（僅 print-payload?purpose=print 遞增；>1 為補印）
+  printCount           Int       @default(0)
+  lastPrintedAt        DateTime?
+  lastPrintedByStaffId Int?
+  /// 首次會計匯出（POST /ops/allowances/export 寫入，之後不覆寫）
+  exportedToAcctAt     DateTime?
+  exportedByStaffId    Int?
+  items           InvoiceAllowanceItem[]
+  createdAt       DateTime     @default(now())
 
   @@index([invoiceNumber])
+  @@index([einvoiceId])
   @@index([orderId])
   @@index([createdAt])
+  @@index([refundId])
+  @@index([branchId, createdAt])
+  @@index([memberId, createdAt])
+  @@index([exportedToAcctAt])
+}
+
+/// 折讓明細快照（送 ezPay 之品項；單價／金額一律未稅）
+model InvoiceAllowanceItem {
+  id             Int              @id @default(autoincrement())
+  allowanceId    String
+  allowance      InvoiceAllowance @relation(fields: [allowanceId], references: [id], onDelete: Cascade)
+  einvoiceItemId Int?
+  einvoiceItem   EInvoiceItem?    @relation(fields: [einvoiceItemId], references: [id], onDelete: SetNull)
+  saleItemId     Int?
+  lineNo         Int
+  name           String
+  qty            Int
+  unit           String           @default("式")
+  unitPrice      Int
+  amount         Int
+  taxAmt         Int
+  /// 含稅（amount + taxAmt）
+  grossAmount    Int
+  /// 1 應稅 | 3 免稅
+  taxType        String           @default("1")
+
+  @@index([allowanceId])
+}
+
+// ==========================================
+// 9. 交易取消／退費（RefundRequest）：分段狀態機；外部金流與 ezPay 一律在交易外呼叫
+// ==========================================
+/// 退費單：PAYMENT_PENDING → AWAITING_TERMINAL → INVOICE_PENDING → SIGNATURE_PENDING → COMPLETED（失敗分支可重試／中止）
+model RefundRequest {
+  id                  String   @id // RFD…
+  /// TOPUP_VOID | SALE_RETURN | ORDER_REFUND
+  kind                String
+  /// SALE | ORDER
+  refType             String
+  /// 子單號（SAL… / TYK… / CRS…）
+  refId               String
+  checkoutSessionId   String?
+  branchId            Int?
+  memberId            Int?
+  /// FULL | UNUSED | ITEMS
+  scope               String
+  /// 退貨品項快照 [{ orderItemId, name, qty, unitPrice, gross, taxType, productId }]
+  lines               Json?
+  /// 後端試算快照（公式、已使用、手續費）
+  calc                Json?
+  /// 應退含稅總額（含抵用券不退現部分）
+  grossAmount         Int
+  feeAmount           Int      @default(0)
+  consumedValue       Int      @default(0)
+  /// 實際退回顧客（不含 FORFEITED）
+  payoutAmount        Int      @default(0)
+  /// 子單是否全額退（發票判定用）
+  fullRefund          Boolean  @default(false)
+  /// VOID | ALLOWANCE | CANCEL_UNISSUED | NONE（INVOICE_PENDING 時才決定）
+  invoiceAction       String?
+  /// 處理結果 [{ einvoiceId, invoiceNumber, action, allowanceId?, allowanceNo? }]
+  invoiceResults      Json?
+  /// B2B 須顧客親簽才可結案
+  signatureRequired   Boolean  @default(false)
+  signatureId         String?
+  walletCashReversed  Float    @default(0)
+  walletBonusReversed Float    @default(0)
+  walletCashCredited  Float    @default(0)
+  /// 必填退折讓原因
+  reason              String
+  buyerEmail          String?
+  staffId             Int
+  /// 前端每次送出產生之冪等鍵（Header Idempotency-Key）；重送回傳同一張退費單
+  idempotencyKey      String?  @unique
+  /// PAYMENT_PENDING | AWAITING_TERMINAL | PAYMENT_FAILED | INVOICE_PENDING | INVOICE_FAILED | SIGNATURE_PENDING | GATEWAY_RETRYING | COMPLETED | ABORTED
+  status              String
+  lastError           String?
+  completedAt         DateTime?
+  abortedAt           DateTime?
+  abortReason         String?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  payments   RefundPayment[]
+  signatures RefundSignature[]
+
+  @@index([refType, refId])
+  @@index([branchId, createdAt])
+  @@index([status, createdAt])
+  @@index([memberId, createdAt])
+}
+
+/// 退費單之單一退款管道
+model RefundPayment {
+  id              String        @id // RFP…
+  refundId        String
+  refund          RefundRequest @relation(fields: [refundId], references: [id], onDelete: Cascade)
+  /// CASH | WALLET_CASH | LINEPAY | PAYUNI | YIPAY | VOUCHER
+  method          String
+  amount          Int
+  /// PENDING | PROCESSING | AWAITING_TERMINAL | REFUNDED | FAILED | FORFEITED
+  /// REVERSED＝中止時沖回（現金須向顧客收回）｜CANCELLED＝改臨櫃現金或中止時未執行之腿
+  status          String
+  /// 原交易序號（LINE Pay transactionId／PayUNi TradeNo）
+  originalRef     String?
+  /// 退款序號（LINE Pay refundTransactionId／PayUNi 回傳）
+  providerRef     String?
+  /// 乙禾端末退貨憑證
+  rrn             String?
+  authCode        String?
+  cardLast4       String?
+  terminalRef     String?
+  origCaptureId   String?
+  /// 現金退款綁定之交班（ShiftHandover.id）
+  shiftHandoverId String?
+  attempts        Int           @default(0)
+  lastError       String?
+  staffId         Int?
+  refundedAt      DateTime?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  @@index([refundId])
+  @@index([method, status])
+  @@index([shiftHandoverId])
+}
+
+/// 折讓顧客親簽（影像存私有儲存，禁止公開路徑／DB base64）
+model RefundSignature {
+  id         String        @id // RSG…
+  refundId   String
+  refund     RefundRequest @relation(fields: [refundId], references: [id], onDelete: Cascade)
+  storageKey String
+  sha256     String
+  /// 客顯簽署請求（ALLOWANCE_SIGN_REQUEST.requestId）與顧客所見折讓內容摘要（previewToken 內 digest）
+  requestId     String?
+  previewDigest String?
+  /// 經辦（Staff JWT）
+  staffId    Int
+  ipAddress  String?
+  userAgent  String?
+  signedAt   DateTime      @default(now())
+
+  @@index([refundId])
+}
+
+/// 雙錢包異動流水（append-only；唯一寫入口 lib/walletMutation.js，一次異動一列、雙錢包前後水位；DB CHECK before＋delta＝after、after ≥ 0）
+model WalletLedger {
+  id           Int      @id @default(autoincrement())
+  memberId     Int
+  /// 異動類別（WALLET_TX）：TOPUP_GRANT | WALLET_PAY | POS_PENDING_ABORT_RESTORE | GATE_CHECKOUT | GATE_FEE_REFUND | TOPUP_VOID | REFUND_REVERSE | REFUND_CREDIT | REFUND_ABORT | GROUP_REFUND | HQ_COMPENSATION | GIFT_CARD_REDEEM
+  reasonCode   String
+  branchId     Int?
+  cashBefore   Float?
+  cashDelta    Float?
+  cashAfter    Float?
+  bonusBefore  Float?
+  bonusDelta   Float?
+  bonusAfter   Float?
+  /// 異動說明（必填；稽核用）
+  reason       String?
+  /// 舊制單錢包列（CASH | BONUS）；新制列為 null
+  wallet       String?
+  delta        Float?
+  balanceAfter Float?
+  /// ORDER | SALE | CHECKOUT | CHECKIN | GROUP_ENROLLMENT | HQ_COMPENSATION | GIFT_CARD …
+  refType      String?
+  refId        String?
+  refundId     String?
+  staffId      Int?
+  createdAt    DateTime @default(now())
+
+  @@index([memberId, createdAt])
+  @@index([refundId])
+  @@index([refType, refId])
+}
+
+/// 交易異動稽核（append-only；前後狀態快照）
+model TransactionAuditLog {
+  id        Int      @id @default(autoincrement())
+  /// TOPUP_CANCEL | SUB_ORDER_REFUND | REFUND_PAYMENT | REFUND_YIPAY_CONFIRM | REFUND_INVOICE | REFUND_INVOICE_RESOLVE | REFUND_GATEWAY_CONFIRM | REFUND_RETRY | REFUND_ABORT | REFUND_SIGNATURE_PREVIEW | REFUND_SIGNATURE | REFUND_COMPLETE | ALLOWANCE_PRINT | ALLOWANCE_EXPORT
+  action    String
+  refundId  String?
+  refType   String?
+  refId     String?
+  staffId   Int?
+  staffRole String?
+  branchId  Int?
+  reason    String?
+  before    Json?
+  after     Json?
+  clientIp  String?
+  createdAt DateTime @default(now())
+
+  @@index([refundId, createdAt])
+  @@index([refType, refId])
+  @@index([branchId, createdAt])
+  @@index([action, createdAt])
 }
 
 // 廠館員工與管理員表
 model Staff {
   id        Int      @id @default(autoincrement())
   
-  // 登入憑證 (嚴格禁止使用員工私人 LINE 綁定，一律配發內部帳號)
+  // 登入憑證 (嚴格禁止使用員工私人 LINE 綁定登入，一律配發內部帳號；LINE 僅可綁作推播收件，見 lineUserId)
   account   String   @unique
   password  String   // 這裡之後會存 bcrypt 加密後的雜湊值，絕對不存明碼
   
@@ -1181,11 +1937,11 @@ model Staff {
   /// 對外／側欄顯示名稱；預設匿名
   displayName String @default("匿名")
   
-  // 權限控管：ADMIN 總部 / MANAGER 店長 / DUTY 值星 / STAFF 櫃檯
-  // 交易異動僅 DUTY 以上
+  /// 職位（定義見 lib/orgStructure.js）：ADMIN／GM／FM／STORE_MANAGER（舊 MANAGER）／DUTY／STAFF／TRAINER
+  /// 交易異動僅 DUTY 以上
   role      String   @default("STAFF")
 
-  // 綁定分店（ADMIN 可為 null 表示全連鎖；STAFF/DUTY/MANAGER 必填）
+  /// 綁定分店（ADMIN／GM／FM 可為 null；其餘必填，且須符合分店類型）
   branchId  Int?
   branch    Branch?  @relation(fields: [branchId], references: [id])
 
@@ -1194,6 +1950,40 @@ model Staff {
   
   // 帳號狀態 (離職或調職時直接設為 false，保留操作歷史不刪除帳號)
   isActive  Boolean  @default(true)
+
+  /// 勞動條件（lib/laborLaw.js）：FULL_TIME 正職 | PART_TIME 兼職（部分工時）| INTERN 實習
+  employmentType  String    @default("FULL_TIME")
+  /// 到職日（年資、特休起算）
+  hireDate        DateTime? @db.Date
+  /// 約定每週正常工時；兼職必填（<40）、實習選填，正職視為 40
+  weeklyHours     Float?
+  /// 實習無勞雇關係（學校課程實習／建教生）者 false，不適用勞基法假別
+  laborActApplies Boolean   @default(true)
+
+  /// 員工照片（私有儲存 key；原圖供人臉辨識、縮圖供頭像），禁止公開目錄
+  photoKey       String?
+  photoThumbKey  String?
+  photoUpdatedAt DateTime?
+  /// Face8 員工群組 faceId（PAPAGO_STAFF_GROUP_ID，與會員群組分離）
+  papagoFaceId   String?   @unique
+  faceEnrolledAt DateTime?
+  /// 生物辨識電子同意（最近一次有效簽署；撤回時清空並刪除 Face8 特徵）；簽署證據見 StaffConsentSignature
+  faceConsentAt        DateTime?
+  faceConsentByStaffId Int?
+  consentSignatures    StaffConsentSignature[]
+  rosterOffRequests    RosterOffRequest[]
+  rosterAcks           RosterAcknowledgement[]
+  coachWeekPlans       CoachWeekPlan[]
+
+  /// LINE 推播收件（員工本人以 LINE Login 自願綁定）；僅作通知，**禁止**用於登入或身分驗證
+  lineUserId        String?   @unique
+  lineDisplayName   String?
+  lineBoundAt       DateTime?
+  lineNotifyEnabled Boolean   @default(true)
+  notifications     StaffNotification[]
+
+  payProfile   StaffPayProfile?
+  payrollItems PayrollItem[]
 
   /// 若此員工為教練，一對一綁定 Trainer 個人工作區
   trainerProfile Trainer?
@@ -1248,7 +2038,7 @@ model ShiftHandover {
   endedAt         DateTime?
   /// OPEN | CLOSED
   status          String   @default("OPEN")
-  /// MORNING | MIDDAY | EVENING（早／中／晚）
+  /// MORNING | EVENING（早 07:00–15:30／晚 15:30–00:00）；MIDDAY 僅歷史相容
   slot            String?
   /// 開班錢櫃底金（預設沿用上一班實點）
   openingFloat    Float    @default(0)
@@ -1527,18 +2317,21 @@ model CoachCommissionRule {
   trainer     Trainer? @relation(fields: [trainerId], references: [id], onDelete: Cascade)
   /// PRIVATE | GROUP
   courseKind  String   @default("PRIVATE")
-  /// PERFORMANCE | HOURLY | PER_HEAD
+  /// 已停用：獎金組成由 tierRates／sessionBonus／perHeadRate 決定（lib/coachPerformance.js）
   payModel    String   @default("PERFORMANCE")
+  /// 已停用：教練底薪一律於薪資設定（StaffPayProfile）維護，禁止於此重複
   baseSalary  Float    @default(0)
-  /// 階段百分比 JSON：[{ minRevenue, rate }]
+  /// 私教業績階梯抽成 JSON：[{ minRevenue, rate }]（達標級距之比例適用當月全部執行業績）
   tierRates   Json?
-  /// 固定鐘點費（HOURLY）
+  /// 已停用：固定鐘點制（僅付上課鐘點）不符僱傭關係，改為 sessionBonus 另計
   hourlyRate  Float?
-  /// 人頭抽成（PER_HEAD）
+  /// 授課獎金（每堂；私教＝每執行堂、團課＝每開課堂）
+  sessionBonus Float?
+  /// 團課人頭獎金（每到課人次）
   perHeadRate Float?
-  /// 扣除：刷卡手續費率、發票稅率等
+  /// 已停用：刷卡手續費等營業成本不得轉嫁教練
   deductRates Json?
-  /// 考核分數影響係數
+  /// 已停用
   scoreFactor Json?
   isActive    Boolean  @default(true)
   createdAt   DateTime @default(now())
@@ -1573,8 +2366,21 @@ model StaffAttendance {
   punchOut  DateTime?
   note      String?
   createdAt DateTime @default(now())
+  /// SELF 員工自助打卡 | HQ 總部補登
+  source             String    @default("SELF")
+  createdByStaffId   Int?
+  /// 上班卡逾 16 小時未下班，已由下一次上班打卡結案，待更正
+  missedPunchOut     Boolean   @default(false)
+  correctedByStaffId Int?
+  correctedAt        DateTime?
+  correctionReason   String?
+  /// 打卡綁定之值勤班次（自助上班打卡須落在已生效班表值勤窗；總部補登可選填）；班表重排刪列時置空，改回就近配對
+  scheduleId         Int?
+  schedule           StaffSchedule? @relation(fields: [scheduleId], references: [id], onDelete: SetNull)
 
   @@index([staffId, punchIn])
+  @@index([branchId, punchIn])
+  @@index([scheduleId])
 }
 
 model StaffLeave {
@@ -1583,13 +2389,32 @@ model StaffLeave {
   staff     Staff    @relation(fields: [staffId], references: [id], onDelete: Cascade)
   startAt   DateTime
   endAt     DateTime
+  /// lib/laborLaw.js LEAVE_TYPES；ANNUAL／NATIONAL_HOLIDAY 扣抵額度
+  leaveType String   @default("OTHER")
+  /// 請假時數（特休／國休以時數扣抵；1 日 = 8 小時）
+  hours     Float?
   reason    String?
   proofUrl  String?
-  /// PENDING | APPROVED | REJECTED
+  /// PENDING | APPROVED | REJECTED | CANCELLED（已核准後撤銷，額度回補）
   status    String   @default("PENDING")
   createdAt DateTime @default(now())
+  /// 總部代登者；null＝員工本人申請
+  createdByStaffId  Int?
+  reviewedByStaffId Int?
+  reviewedAt        DateTime?
+  /// 拒絕／撤銷必填
+  reviewNote        String?
 
   @@index([staffId, status])
+  @@index([staffId, leaveType, startAt])
+}
+
+/// 勞工國定假日曆（勞基法 §37；農曆節日逐年由 HQ 維護）
+model PublicHoliday {
+  id        Int      @id @default(autoincrement())
+  date      DateTime @unique @db.Date
+  name      String
+  createdAt DateTime @default(now())
 }
 
 model StaffSchedule {
@@ -1599,13 +2424,248 @@ model StaffSchedule {
   branchId  Int?
   startAt   DateTime
   endAt     DateTime
-  /// SHIFT | OFF
+  /// SHIFT 出勤 | REGULAR_OFF 例假 | REST_DAY 休息日 | OFF 排休 | FREE 教練週班表出勤（轉正教練提報、店長核准）
   slotType  String   @default("SHIFT")
   note      String?
   createdAt DateTime @default(now())
+  /// 總部指派之臨時排班：建立者（由 Staff JWT 取得）
+  createdByStaffId Int?
 
+  /// 四週變形排班（lib/shiftRoster.js）；null＝一般／自由排班
+  rosterPeriodId Int?
+  rosterPeriod   RosterPeriod? @relation(fields: [rosterPeriodId], references: [id], onDelete: Cascade)
+  /// 排班日（台北日期）
+  workDate       DateTime?     @db.Date
+  /// MORNING | EVENING（slotType=SHIFT 時）
+  shiftCode      String?
+
+  /// 教練週班表（lib/coachSchedule.js）；僅 APPROVED 之班表生效
+  coachPlanId    Int?
+  coachPlan      CoachWeekPlan? @relation(fields: [coachPlanId], references: [id], onDelete: Cascade)
+
+  attendances    StaffAttendance[]
+
+  @@unique([rosterPeriodId, staffId, workDate])
   @@index([staffId, startAt])
   @@index([branchId, startAt])
+  @@index([coachPlanId])
+}
+
+/// 轉正教練週班表（週一～週日）：教練提報出勤時段＋例假／休息日 → 店長以上核准才生效
+/// 勞基法 §30／§34／§35／§36 檢查見 lib/coachSchedule.js；有 ERROR 禁止送審與核准
+model CoachWeekPlan {
+  id                Int       @id @default(autoincrement())
+  staffId           Int
+  staff             Staff     @relation(fields: [staffId], references: [id], onDelete: Cascade)
+  branchId          Int?
+  /// 週一（台北日期）
+  weekStart         DateTime  @db.Date
+  /// DRAFT | SUBMITTED | APPROVED | REJECTED
+  status            String    @default("DRAFT")
+  regularOffDate    DateTime? @db.Date
+  restDayDate       DateTime? @db.Date
+  note              String?
+  submittedAt       DateTime?
+  reviewedAt        DateTime?
+  reviewedByStaffId Int?
+  /// 退回／撤回核准之原因（必填）
+  reviewNote        String?
+  /// 審核歷程 [{ at, action, actorStaffId, reason? }]
+  history           Json?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  slots StaffSchedule[]
+
+  @@unique([staffId, weekStart])
+  @@index([branchId, status, weekStart])
+}
+
+/// 分店四週變形排班設定：週期錨點（28 日固定起算）與每班場務最低人力（不得低於 2）
+model BranchRosterConfig {
+  branchId         Int      @id
+  branch           Branch   @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  cycleAnchorDate  DateTime @db.Date
+  morningHeadcount Int      @default(2)
+  eveningHeadcount Int      @default(2)
+  updatedAt        DateTime @updatedAt
+}
+
+/// 四週（28 日）排班期；DRAFT 可編修／自動排班，PUBLISHED 須通過合規檢查
+model RosterPeriod {
+  id                 Int       @id @default(autoincrement())
+  branchId           Int
+  branch             Branch    @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  startDate          DateTime  @db.Date
+  /// DRAFT | PUBLISHED
+  status             String    @default("DRAFT")
+  createdByStaffId   Int?
+  publishedAt        DateTime?
+  publishedByStaffId Int?
+  note               String?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  entries StaffSchedule[]
+  acks    RosterAcknowledgement[]
+
+  @@unique([branchId, startDate])
+}
+
+/// 員工班表確認回覆（發布後 72 小時內）；撤回重發會產生新版本，須重新確認
+model RosterAcknowledgement {
+  id                Int          @id @default(autoincrement())
+  rosterPeriodId    Int
+  rosterPeriod      RosterPeriod @relation(fields: [rosterPeriodId], references: [id], onDelete: Cascade)
+  staffId           Int
+  staff             Staff        @relation(fields: [staffId], references: [id], onDelete: Cascade)
+  /// 回覆對應之發布版本（RosterPeriod.publishedAt）
+  periodPublishedAt DateTime
+  /// CONFIRMED | DISPUTED
+  status            String
+  message           String?
+  /// 逾 72 小時未回覆由排程自動視為同意（respondedAt＝期限時間）
+  autoConfirmed     Boolean      @default(false)
+  respondedAt       DateTime     @default(now())
+
+  @@unique([rosterPeriodId, staffId, periodPublishedAt])
+}
+
+/// 員工排假申請（每人每週期一筆；指定希望休假之日期），排班期發布後鎖定
+model RosterOffRequest {
+  id             Int        @id @default(autoincrement())
+  branchId       Int
+  branch         Branch     @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  staffId        Int
+  staff          Staff      @relation(fields: [staffId], references: [id], onDelete: Cascade)
+  cycleStartDate DateTime   @db.Date
+  dates          DateTime[] @db.Date
+  note           String?
+  submittedAt    DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  @@unique([branchId, staffId, cycleStartDate])
+  @@index([branchId, cycleStartDate])
+}
+
+/// 員工通知匣＋LINE 推播佇列（lib/staffNotificationService.js）；推播失敗排程重試，站內仍可查看
+model StaffNotification {
+  id        Int       @id @default(autoincrement())
+  staffId   Int
+  staff     Staff     @relation(fields: [staffId], references: [id], onDelete: Cascade)
+  /// ROSTER_PUBLISHED | ROSTER_UNPUBLISHED | ROSTER_ACK_DISPUTED | ROSTER_ACK_REMINDER | ROSTER_AUTO_CONFIRMED |
+  /// OFF_REQUEST_SUBMITTED | OFF_REQUEST_REMINDER | OFF_REQUEST_CLOSED | LEAVE_REQUESTED | LEAVE_REVIEWED | LEAVE_CONFLICT |
+  /// PAYSLIP_READY | PAYSLIP_REOPENED | COACH_PLAN_SUBMITTED | COACH_PLAN_APPROVED | COACH_PLAN_REJECTED |
+  /// COACH_PLAN_REOPENED | TEST
+  type      String
+  title     String
+  body      String
+  /// 前端相對路徑（如 /staff/my-roster）
+  link      String?
+  /// 同一事件同一收件人只發一次（type:...:staffId）
+  dedupeKey String?   @unique
+  /// PENDING | SENT | SKIPPED（未綁定／關閉／未設定 Token）| FAILED
+  status    String    @default("PENDING")
+  attempts  Int       @default(0)
+  lastError String?
+  sentAt    DateTime?
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([staffId, createdAt])
+  @@index([status, createdAt])
+}
+
+/// 工資核算匯出稽核紀錄
+model PayrollExportLog {
+  id                 Int      @id @default(autoincrement())
+  month              String
+  branchId           Int?
+  staffCount         Int
+  generatedByStaffId Int?
+  createdAt          DateTime @default(now())
+
+  @@index([month])
+}
+
+/// 員工薪資設定（lib/payrollService.js）；金額單位新臺幣元
+model StaffPayProfile {
+  staffId             Int      @id
+  staff               Staff    @relation(fields: [staffId], references: [id], onDelete: Cascade)
+  /// MONTHLY 月薪 | HOURLY 時薪
+  payType             String   @default("MONTHLY")
+  monthlySalary       Int?
+  hourlyWage          Int?
+  /// 固定津貼 [{ label, amount }]
+  allowances          Json?
+  /// 勞保投保薪資（null＝未投保）
+  laborInsuredSalary  Int?
+  /// 健保投保金額（null＝未於本公司投保）
+  healthInsuredSalary Int?
+  /// 健保眷屬人數（自付計費上限 3 口）
+  healthDependents    Int      @default(0)
+  /// 勞退月提繳工資（null＝不提繳）
+  pensionWage         Int?
+  /// 員工自提勞退比例 0～0.06
+  pensionSelfRate     Float    @default(0)
+  note                String?
+  updatedByStaffId    Int?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+}
+
+/// 薪資費率設定（單列 id=1；未設定之鍵沿用 lib/payrollRules.js 預設）
+model PayrollConfig {
+  id               Int      @id @default(1)
+  rates            Json
+  updatedByStaffId Int?
+  updatedAt        DateTime @updatedAt
+}
+
+/// 月薪資結算批次（每月一批；FINALIZED 後員工可見薪資單，撤銷須附原因）
+model PayrollRun {
+  id                 Int           @id @default(autoincrement())
+  month              String        @unique
+  /// DRAFT | FINALIZED
+  status             String        @default("DRAFT")
+  /// 計算當下之費率快照
+  config             Json
+  warnings           Json?
+  createdByStaffId   Int?
+  calculatedAt       DateTime      @default(now())
+  finalizedAt        DateTime?
+  finalizedByStaffId Int?
+  /// 結算／撤銷紀錄 [{ action, at, byStaffId, reason? }]
+  history            Json?
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
+  items              PayrollItem[]
+}
+
+/// 個人薪資單；lines 由後端計算（lib/payrollRules.js），overtime／adjustments 為總部核定與手動項
+model PayrollItem {
+  id             Int        @id @default(autoincrement())
+  runId          Int
+  run            PayrollRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  staffId        Int
+  staff          Staff      @relation(fields: [staffId], references: [id])
+  profile        Json
+  facts          Json
+  /// 加班建議與核定 [{ key, attendanceId, date, kind, suggestedMinutes, approvedMinutes|null, decidedByStaffId, decidedAt }]
+  overtime       Json
+  /// 手動項 [{ id, type, label, amount, note, byStaffId, at }]
+  adjustments    Json
+  lines          Json
+  grossPay       Int        @default(0)
+  deductionTotal Int        @default(0)
+  netPay         Int        @default(0)
+  employerCost   Int        @default(0)
+  warnings       Json?
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  @@unique([runId, staffId])
+  @@index([staffId])
 }
 
 // ==========================================
@@ -1796,35 +2856,3 @@ model YipayTerminalCapture {
   @@index([rrn])
   @@index([branchId, createdAt])
 }
-
-/// ezPay 開票非同步任務（分腿可重試；CHK 開票失敗不沖回已收款）
-model InvoiceIssueJob {
-  id            String   @id @default(cuid())
-  /// CHECKOUT | ORDER | SALE
-  refType       String
-  /// CHK… / TYK… / SAL… / CRS…
-  refId         String
-  /// SALE | PROMO | PT | ORDER | ALL
-  leg           String
-  amount        Float
-  itemDesc      String
-  buyerName     String?
-  carrierNum    String?
-  buyerUbn      String?
-  loveCode      String?
-  /// 來源合併結帳（稽核／回寫 SPLIT）
-  checkoutId    String?
-  /// PENDING | SUCCESS | FAILED
-  status        String   @default("PENDING")
-  retryCount    Int      @default(0)
-  lastError     String?
-  invoiceNumber String?
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
-
-  @@unique([refId, leg])
-  @@index([status, retryCount])
-  @@index([refId])
-  @@index([checkoutId, status])
-}
-

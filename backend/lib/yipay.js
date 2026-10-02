@@ -9,14 +9,10 @@ import {
   resolveRecurringPeriodDays,
 } from './promotion.js';
 import { createSubscriptionFromPaidOrder } from './cardSubscription.js';
-import { issueInvoice } from './ezpay.js';
-import { enqueueInvoiceJob } from './invoiceQueue.js';
+import { issueSaleInvoice, issueOrderInvoice, invoiceSummaryMap } from './einvoice.js';
 import { markYipayCaptureConfirmed } from './yipayCapture.js';
 import { buildCardCheckoutRequest, resolveBindVerifyAmount } from './payuni.js';
-import {
-  deductSaleStock,
-  tryIssueSaleInvoice,
-} from './inventory.js';
+import { deductSaleStock } from './inventory.js';
 
 function httpError(message, statusCode = 400) {
   const err = new Error(message);
@@ -81,32 +77,9 @@ function tryBuildPeriodBind(session, checkoutId) {
   }
 }
 
-/** 獨立訂單開票（與 ops tryIssueOrderInvoice 對齊；lib 不可 import routes） */
-async function tryIssueYipayOrderInvoice(order, buyerName) {
-  const invoiceResult = await issueInvoice({
-    id: order.id,
-    amount: order.amount,
-    itemDesc: order.itemDesc,
-    buyerName: buyerName || '體育客顧客',
-    carrierNum: order.carrierNum || null,
-    buyerUbn: order.buyerUbn || null,
-    loveCode: order.loveCode || null,
-  });
-
-  if (invoiceResult.Status === 'SUCCESS') {
-    const invoiceData = JSON.parse(invoiceResult.Result);
-    await prisma.order.update({
-      where: { id: order.id },
-      data: { invoiceNumber: invoiceData.InvoiceNumber },
-    });
-    console.log(`🧾 乙禾訂單 ${order.id} 發票：${invoiceData.InvoiceNumber}`);
-    return invoiceData.InvoiceNumber;
-  }
-  const message = invoiceResult.Message || String(invoiceResult);
-  console.error(`❌ 乙禾訂單 ${order.id} 發票失敗:`, message);
-  const err = new Error(`電子發票開立失敗：${message}`);
-  err.statusCode = 502;
-  throw err;
+async function invoiceNumberOf(refId, bySession = false) {
+  const map = await invoiceSummaryMap([refId], { bySession });
+  return map.get(refId)?.invoiceNumber || null;
 }
 
 /**
@@ -126,7 +99,7 @@ export async function confirmYipayCheckout(checkoutId, { terminalRef, staffId } 
       checkoutId: id,
       saleId: session.saleOrderId,
       orderId: session.orderId,
-      invoiceNumber: session.invoiceNumber,
+      invoiceNumber: await invoiceNumberOf(id, true),
       invoices: [],
     };
     // 已入帳但尚未約定續期：仍可重開 PayUNi 頁（補綁 CreditHash）
@@ -162,15 +135,6 @@ export async function confirmYipayCheckout(checkoutId, { terminalRef, staffId } 
     targetId: id,
     terminalRef: sanitizeTerminalRef(terminalRef),
   }).catch(() => {});
-
-  // 部分開票失敗：軟拆已寫 InvoiceIssueJob；若完全沒票則再觸發 CHK 重拆
-  if (fulfilled.partial || !fulfilled.invoiceNumber) {
-    await enqueueInvoiceJob({
-      targetType: 'CHECKOUT',
-      targetId: id,
-      buyerName: session.memberName || null,
-    }).catch((e) => console.error('enqueue invoice CHK', e.message));
-  }
 
   const result = {
     alreadyPaid: false,
@@ -215,7 +179,7 @@ export async function confirmYipaySale(saleId, { terminalRef, staffId } = {}) {
     return {
       alreadyPaid: true,
       saleId: id,
-      invoiceNumber: sale.invoiceNumber,
+      invoiceNumber: await invoiceNumberOf(id),
     };
   }
   if (sale.status !== 'PENDING') {
@@ -248,49 +212,23 @@ export async function confirmYipaySale(saleId, { terminalRef, staffId } = {}) {
     await deductSaleStock(tx, fresh, staffId || sale.staffId);
   });
 
-  const paidSale = await prisma.saleOrder.findUnique({
-    where: { id },
-    include: {
-      items: true,
-      member: { select: { id: true, name: true } },
-    },
-  });
+  await markYipayCaptureConfirmed({
+    targetType: 'SALE',
+    targetId: id,
+    terminalRef: sanitizeTerminalRef(terminalRef),
+  }).catch(() => {});
 
-  try {
-    const invoiceNumber = await tryIssueSaleInvoice(paidSale, paidSale?.member?.name);
-    await markYipayCaptureConfirmed({
-      targetType: 'SALE',
-      targetId: id,
-      terminalRef: sanitizeTerminalRef(terminalRef),
-    }).catch(() => {});
-    return {
-      alreadyPaid: false,
-      saleId: id,
-      invoiceNumber,
-      terminalRef: sanitizeTerminalRef(terminalRef),
-    };
-  } catch (invoiceError) {
-    // 乙禾已請款：保留 PAID，開票改非同步重試（避免沖回造成現金孤兒）
-    await enqueueInvoiceJob({
-      targetType: 'SALE',
-      targetId: id,
-      buyerName: paidSale?.member?.name || null,
-    }).catch(() => {});
-    await markYipayCaptureConfirmed({
-      targetType: 'SALE',
-      targetId: id,
-      terminalRef: sanitizeTerminalRef(terminalRef),
-    }).catch(() => {});
-    console.error(`乙禾銷貨 ${id} 發票暫緩:`, invoiceError.message);
-    return {
-      alreadyPaid: false,
-      saleId: id,
-      invoiceNumber: null,
-      invoiceDeferred: true,
-      invoiceMessage: invoiceError.message,
-      terminalRef: sanitizeTerminalRef(terminalRef),
-    };
-  }
+  // 乙禾已請款：開票失敗只入佇列（不沖回）
+  const inv = await issueSaleInvoice(id);
+  return {
+    alreadyPaid: false,
+    saleId: id,
+    invoiceNumber: inv.invoiceNumber,
+    invoiceOutcome: inv.code,
+    invoiceDeferred: inv.code === 'PARTIAL_INVOICE',
+    ...(inv.code === 'PARTIAL_INVOICE' ? { invoiceMessage: inv.message } : {}),
+    terminalRef: sanitizeTerminalRef(terminalRef),
+  };
 }
 
 /**
@@ -306,7 +244,7 @@ export async function confirmYipayOrder(orderId, { terminalRef } = {}) {
   });
   if (!order) throw httpError('找不到訂單', 404);
   if (order.status === 'PAID') {
-    return { alreadyPaid: true, orderId: id, invoiceNumber: order.invoiceNumber };
+    return { alreadyPaid: true, orderId: id, invoiceNumber: await invoiceNumberOf(id) };
   }
   if (order.status !== 'PENDING') {
     throw httpError(`訂單狀態為 ${order.status}，無法確認乙禾刷卡`);
@@ -345,6 +283,7 @@ export async function confirmYipayOrder(orderId, { terminalRef } = {}) {
         await fulfillPromotionPurchase(tx, order.memberId, promotion, {
           qty,
           durationDaysOverride: durationDaysOverride ?? undefined,
+          orderId: order.id,
         });
       }
     }
@@ -362,38 +301,20 @@ export async function confirmYipayOrder(orderId, { terminalRef } = {}) {
     }
   }
 
-  try {
-    await tryIssueYipayOrderInvoice(order, order.member?.name);
-    await markYipayCaptureConfirmed({
-      targetType: 'ORDER',
-      targetId: id,
-      terminalRef: sanitizeTerminalRef(terminalRef),
-    }).catch(() => {});
-  } catch (invoiceError) {
-    console.error(`乙禾訂單 ${id} 發票暫緩（保留入帳）:`, invoiceError.message);
-    await enqueueInvoiceJob({
-      targetType: 'ORDER',
-      targetId: id,
-      buyerName: order.member?.name || null,
-    }).catch(() => {});
-    await markYipayCaptureConfirmed({
-      targetType: 'ORDER',
-      targetId: id,
-      terminalRef: sanitizeTerminalRef(terminalRef),
-    }).catch(() => {});
-  }
+  await markYipayCaptureConfirmed({
+    targetType: 'ORDER',
+    targetId: id,
+    terminalRef: sanitizeTerminalRef(terminalRef),
+  }).catch(() => {});
 
-  const refreshed = await prisma.order.findUnique({
-    where: { id },
-    select: { invoiceNumber: true, status: true, invoiceStatus: true },
-  });
-
+  const inv = await issueOrderInvoice(id);
+  const summary = (await invoiceSummaryMap([id])).get(id);
   return {
     alreadyPaid: false,
     orderId: id,
-    invoiceNumber: refreshed?.invoiceNumber || null,
-    invoiceDeferred: !refreshed?.invoiceNumber,
-    invoiceStatus: refreshed?.invoiceStatus || null,
+    invoiceNumber: inv.invoiceNumber,
+    invoiceDeferred: inv.code === 'PARTIAL_INVOICE',
+    invoiceStatus: summary?.invoiceStatus || null,
     terminalRef: sanitizeTerminalRef(terminalRef),
   };
 }

@@ -1,4 +1,4 @@
-import { type FormEvent, useCallback, useEffect, useState } from 'react';
+import { type FormEvent, useEffect, useState } from 'react';
 import { Alert, Button, Card, Field, Input } from '../ui';
 import { useToast } from '../../contexts/ToastContext';
 import { useStaffAuth } from '../../contexts/StaffAuthContext';
@@ -66,38 +66,54 @@ export default function OpsMemberAdminPanel({
   const [previewBusy, setPreviewBusy] = useState<IdPhotoSide | null>(null);
   const [viewReason, setViewReason] = useState('');
 
-  const loadNotes = useCallback(async () => {
-    if (!member) return;
-    try {
-      const res = await fetchOpsMemberNotes(member.id);
-      if (res.status === 'success' && res.data) setNotes(res.data);
-    } catch {
-      /* ignore */
-    }
-  }, [member]);
+  const memberId = member?.id ?? null;
 
-  const loadIdPhotos = useCallback(async () => {
-    if (!member) return;
-    try {
-      const res = await fetchOpsMemberIdPhotos(member.id);
-      if (res.status === 'success' && res.data) {
+  /** 切換會員時立即清掉前一位的證件預覽（短效 URL）與調閱原因 */
+  const [previewMemberId, setPreviewMemberId] = useState(memberId);
+  if (previewMemberId !== memberId) {
+    setPreviewMemberId(memberId);
+    setPreview({ front: null, back: null });
+    setPreviewMeta({});
+    setViewReason('');
+  }
+
+  const [notesKey, setNotesKey] = useState(0);
+  const loadNotes = () => setNotesKey((k) => k + 1);
+  useEffect(() => {
+    if (memberId == null) return;
+    let cancelled = false;
+    fetchOpsMemberNotes(memberId)
+      .then((res) => {
+        if (!cancelled && res.status === 'success' && res.data) setNotes(res.data);
+      })
+      .catch(() => {
+        /* ignore */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [memberId, notesKey]);
+
+  const [idPhotosKey, setIdPhotosKey] = useState(0);
+  const loadIdPhotos = () => setIdPhotosKey((k) => k + 1);
+  useEffect(() => {
+    if (memberId == null) return;
+    let cancelled = false;
+    fetchOpsMemberIdPhotos(memberId)
+      .then((res) => {
+        if (cancelled || res.status !== 'success' || !res.data) return;
         setIdMeta({
           sides: res.data.sides || {},
           pendingDeletes: res.data.pendingDeletes || [],
         });
-      }
-    } catch {
-      setIdMeta(null);
-    }
-  }, [member]);
-
-  useEffect(() => {
-    void loadNotes();
-    void loadIdPhotos();
-    setPreview({ front: null, back: null });
-    setPreviewMeta({});
-    setViewReason('');
-  }, [loadNotes, loadIdPhotos]);
+      })
+      .catch(() => {
+        if (!cancelled) setIdMeta(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [memberId, idPhotosKey]);
 
   async function openPresignedPreview(side: IdPhotoSide) {
     if (!member) return;
@@ -261,6 +277,7 @@ export default function OpsMemberAdminPanel({
       {posDisplay && staffId != null && (
         <div style={{ marginTop: '1rem' }}>
           <OpsIdPhotoAssistPanel
+            key={member.id}
             member={member}
             branchCode={branchCode}
             staffId={staffId}

@@ -1,7 +1,61 @@
-// lib/trainerTimeOff.js — 教練排休／不可預約時段
+// lib/trainerTimeOff.js — 教練排課可用性：出勤班表內、非請假、非「不開放預約」時段
+/**
+ * 教練為僱傭關係：休假一律走週班表例假／休息日或請假系統；TrainerTimeOff 僅為工時內不開放預約（行政、備課等）。
+ */
 import prisma from './prisma.js';
+import { EFFECTIVE_WORK_SLOT_WHERE } from './staffScheduleService.js';
 
-export const TIME_OFF_REASONS = ['休假', '外出', '私人', '其他'];
+export const TIME_OFF_REASONS = ['行政作業', '備課', '外出公務', '其他'];
+const LEAVE_LIKE_REASONS = ['休假', '私人', '請假', '排休'];
+
+function httpError(message, statusCode, code) {
+  const err = new Error(message);
+  err.statusCode = statusCode;
+  if (code) err.code = code;
+  return err;
+}
+
+/**
+ * 排課／預約前檢查（交易內呼叫）：
+ * 1. 教練須綁定在職員工帳號（僱傭關係）→ 409 COACH_NOT_EMPLOYED
+ * 2. 時段須完全落在已生效班表（核准週班表／已發布四週排班／總部臨時排班）→ 409 OUTSIDE_WORK_SCHEDULE
+ * 3. 不得與已核准請假重疊 → 409 COACH_ON_LEAVE
+ * 4. 不得與不開放預約時段重疊 → 409
+ * @param {import('@prisma/client').Prisma.TransactionClient | typeof prisma} db
+ */
+export async function assertTrainerBookable(db, trainerId, startAt, endAt) {
+  const trainer = await db.trainer.findUnique({
+    where: { id: Number(trainerId) },
+    select: { id: true, staffId: true, staff: { select: { id: true, isActive: true } } },
+  });
+  if (!trainer) throw httpError('找不到教練', 404);
+  if (!trainer.staffId || !trainer.staff?.isActive) {
+    throw httpError('教練未綁定在職員工帳號（僱傭關係），不得排課或預約；請洽總部綁定', 409, 'COACH_NOT_EMPLOYED');
+  }
+  const slots = await db.staffSchedule.findMany({
+    where: { AND: [EFFECTIVE_WORK_SLOT_WHERE, { staffId: trainer.staffId, startAt: { lt: endAt }, endAt: { gt: startAt } }] },
+    select: { startAt: true, endAt: true },
+    orderBy: { startAt: 'asc' },
+  });
+  let cursor = new Date(startAt).getTime();
+  for (const s of slots) {
+    if (s.startAt.getTime() > cursor) break;
+    cursor = Math.max(cursor, s.endAt.getTime());
+  }
+  if (cursor < new Date(endAt).getTime()) {
+    throw httpError(
+      '課程時段不在教練已核准之出勤班表內；班表外授課屬未經同意之延長工時，請先調整班表',
+      409,
+      'OUTSIDE_WORK_SCHEDULE',
+    );
+  }
+  const leave = await db.staffLeave.findFirst({
+    where: { staffId: trainer.staffId, status: 'APPROVED', startAt: { lt: endAt }, endAt: { gt: startAt } },
+    select: { id: true },
+  });
+  if (leave) throw httpError('教練該時段已核准請假，請改選其他時段', 409, 'COACH_ON_LEAVE');
+  await assertTrainerNotOnTimeOff(db, trainer.id, startAt, endAt);
+}
 
 export function overlapWhere(startAt, endAt) {
   return {
@@ -16,7 +70,7 @@ export function serializeTimeOff(row) {
     trainerId: row.trainerId,
     startAt: row.startAt,
     endAt: row.endAt,
-    reason: row.reason || '休假',
+    reason: row.reason || '其他',
     note: row.note || null,
     createdByStaffId: row.createdByStaffId ?? null,
     createdAt: row.createdAt,
@@ -28,35 +82,30 @@ export function parseTimeOffRange(startAt, endAt) {
   const start = new Date(startAt);
   const end = new Date(endAt);
   if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
-    const err = new Error('排休時間格式無效');
-    err.statusCode = 400;
-    throw err;
+    throw httpError('時段格式無效', 400);
   }
   if (start >= end) {
-    const err = new Error('排休結束時間必須晚於開始時間');
-    err.statusCode = 400;
-    throw err;
+    throw httpError('結束時間必須晚於開始時間', 400);
   }
-  const maxMs = 31 * 24 * 60 * 60 * 1000;
-  if (end.getTime() - start.getTime() > maxMs) {
-    const err = new Error('單筆排休最長 31 天，請拆成多筆');
-    err.statusCode = 400;
-    throw err;
+  if (end.getTime() - start.getTime() > 24 * 60 * 60 * 1000) {
+    throw httpError('不開放預約時段單筆最長 24 小時；休假請改用請假或週班表例假／休息日', 400);
   }
   return { start, end };
 }
 
 export function normalizeTimeOffReason(raw) {
-  const v = String(raw || '休假').trim().slice(0, 20);
-  if (!v) return '休假';
-  return TIME_OFF_REASONS.includes(v) ? v : v;
+  const v = String(raw || '其他').trim().slice(0, 20) || '其他';
+  if (LEAVE_LIKE_REASONS.includes(v)) {
+    throw httpError('休假請於「我的出勤」申請請假，或於週班表指定例假／休息日', 400, 'USE_LEAVE');
+  }
+  return v;
 }
 
 /**
- * 若時段與教練排休重疊則拋 409
+ * 若時段與教練不開放預約時段重疊則拋 409
  * @param {import('@prisma/client').Prisma.TransactionClient | typeof prisma} db
  */
-export async function assertTrainerNotOnTimeOff(db, trainerId, startAt, endAt) {
+async function assertTrainerNotOnTimeOff(db, trainerId, startAt, endAt) {
   const hit = await db.trainerTimeOff.findFirst({
     where: {
       trainerId: Number(trainerId),
@@ -65,10 +114,11 @@ export async function assertTrainerNotOnTimeOff(db, trainerId, startAt, endAt) {
     orderBy: { startAt: 'asc' },
   });
   if (hit) {
-    const err = new Error(
-      `教練排休中：${hit.reason || '休假'}（${hit.startAt.toLocaleString('zh-TW')} ~ ${hit.endAt.toLocaleString('zh-TW')}），請改選其他時段`,
+    const err = httpError(
+      `教練該時段不開放預約：${hit.reason || '其他'}（${hit.startAt.toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' })} ~ ${hit.endAt.toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' })}），請改選其他時段`,
+      409,
+      'COACH_UNAVAILABLE',
     );
-    err.statusCode = 409;
     err.timeOff = serializeTimeOff(hit);
     throw err;
   }
@@ -134,7 +184,7 @@ export async function createTrainerTimeOff({
   });
   if (classHit) {
     const err = new Error(
-      `此時段已有課程「${classHit.title}」，請先調整課表或改選排休時間`,
+      `此時段已有課程「${classHit.title}」，請先調整課表或改選其他時段`,
     );
     err.statusCode = 409;
     throw err;
@@ -144,7 +194,7 @@ export async function createTrainerTimeOff({
     where: { trainerId: tid, ...overlapWhere(start, end) },
   });
   if (dup) {
-    const err = new Error('與既有排休時段重疊');
+    const err = new Error('與既有不開放預約時段重疊');
     err.statusCode = 409;
     throw err;
   }
@@ -172,12 +222,12 @@ export async function updateTrainerTimeOff({
 } = {}) {
   const existing = await prisma.trainerTimeOff.findUnique({ where: { id: Number(id) } });
   if (!existing) {
-    const err = new Error('找不到排休紀錄');
+    const err = new Error('找不到不開放預約時段');
     err.statusCode = 404;
     throw err;
   }
   if (trainerId != null && existing.trainerId !== Number(trainerId)) {
-    const err = new Error('無權修改此排休');
+    const err = new Error('無權修改此不開放預約時段');
     err.statusCode = 403;
     throw err;
   }
@@ -191,7 +241,7 @@ export async function updateTrainerTimeOff({
     select: { id: true, title: true },
   });
   if (classHit) {
-    const err = new Error(`此時段已有課程「${classHit.title}」，無法改為此排休`);
+    const err = new Error(`此時段已有課程「${classHit.title}」，無法設為不開放預約`);
     err.statusCode = 409;
     throw err;
   }
@@ -204,7 +254,7 @@ export async function updateTrainerTimeOff({
     },
   });
   if (dup) {
-    const err = new Error('與既有排休時段重疊');
+    const err = new Error('與既有不開放預約時段重疊');
     err.statusCode = 409;
     throw err;
   }
@@ -229,12 +279,12 @@ export async function updateTrainerTimeOff({
 export async function deleteTrainerTimeOff({ id, trainerId } = {}) {
   const existing = await prisma.trainerTimeOff.findUnique({ where: { id: Number(id) } });
   if (!existing) {
-    const err = new Error('找不到排休紀錄');
+    const err = new Error('找不到不開放預約時段');
     err.statusCode = 404;
     throw err;
   }
   if (trainerId != null && existing.trainerId !== Number(trainerId)) {
-    const err = new Error('無權刪除此排休');
+    const err = new Error('無權刪除此不開放預約時段');
     err.statusCode = 403;
     throw err;
   }

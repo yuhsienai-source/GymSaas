@@ -140,7 +140,7 @@ export function buildOtpMailCopy(opts) {
           </tr>
           <tr>
             <td style="border-top:1px solid ${BORDER};padding:18px 28px;font:400 12px/1.5 Arial,sans-serif;color:${MUTED};">
-              © ${escapeHtml(BRAND_NAME)}　會員中心驗證信　請勿直接回覆
+              © ${escapeHtml(BRAND_NAME)}&#12288;會員中心驗證信&#12288;請勿直接回覆
             </td>
           </tr>
         </table>

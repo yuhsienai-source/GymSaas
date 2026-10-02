@@ -1,4 +1,4 @@
-import { type FormEvent, useMemo, useState } from 'react';
+import { type FormEvent, useMemo, useRef, useState } from 'react';
 import { Alert, Badge, Button, Card, EmptyState, Field, Input, Select } from '../../ui';
 import {
   createTrainerTimeOff,
@@ -30,33 +30,21 @@ function defaultRange() {
   return { start: toLocalInputValue(start), end: toLocalInputValue(end) };
 }
 
-function fullDayRange(ymd: string) {
-  // 台北全日：00:00–隔日 00:00（以本機 datetime-local 填入）
-  return {
-    start: `${ymd}T00:00`,
-    end: (() => {
-      const d = new Date(`${ymd}T00:00:00`);
-      d.setDate(d.getDate() + 1);
-      return toLocalInputValue(d);
-    })(),
-  };
-}
-
+/** 工時內不開放預約（行政／備課等）；休假一律走請假或週班表例假／休息日 */
 export default function TrainerTimeOffPanel({
   items,
-  reasons = ['休假', '外出', '私人', '其他'],
+  reasons = ['行政作業', '備課', '外出公務', '其他'],
   viewAsTrainerId,
   onChanged,
 }: Props) {
   const { toast } = useToast();
   const defaults = useMemo(() => defaultRange(), []);
-  const [mode, setMode] = useState<'range' | 'day'>('range');
-  const [day, setDay] = useState(() => new Date().toISOString().slice(0, 10));
   const [startAt, setStartAt] = useState(defaults.start);
   const [endAt, setEndAt] = useState(defaults.end);
-  const [reason, setReason] = useState(reasons[0] || '休假');
+  const [reason, setReason] = useState(reasons[0] || '行政作業');
   const [note, setNote] = useState('');
   const [busy, setBusy] = useState(false);
+  const inFlightRef = useRef(false);
 
   const [nowMs] = useState(() => Date.now());
 
@@ -75,39 +63,41 @@ export default function TrainerTimeOffPanel({
 
   async function handleCreate(e: FormEvent) {
     e.preventDefault();
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
     setBusy(true);
     try {
-      const range = mode === 'day' ? fullDayRange(day) : { start: startAt, end: endAt };
       const res = await createTrainerTimeOff({
-        startAt: new Date(range.start).toISOString(),
-        endAt: new Date(range.end).toISOString(),
+        startAt: new Date(startAt).toISOString(),
+        endAt: new Date(endAt).toISOString(),
         reason,
         note: note.trim() || undefined,
         viewAsTrainerId: viewAsTrainerId === '' ? undefined : viewAsTrainerId,
         trainerId: viewAsTrainerId === '' ? undefined : viewAsTrainerId,
       });
-      toast(res.message || '已登記排休', 'success');
+      toast(res.message || '已登記不開放預約時段', 'success');
       setNote('');
       await onChanged();
     } catch (err) {
-      toast(getErrorMessage(err, '新增排休失敗'), 'error');
+      toast(getErrorMessage(err, '新增失敗'), 'error');
     } finally {
+      inFlightRef.current = false;
       setBusy(false);
     }
   }
 
   async function handleDelete(id: number) {
-    if (!window.confirm('確定取消此筆排休？')) return;
+    if (!window.confirm('確定取消此不開放預約時段？')) return;
     setBusy(true);
     try {
       const res = await deleteTrainerTimeOff(
         id,
         viewAsTrainerId === '' ? undefined : Number(viewAsTrainerId),
       );
-      toast(res.message || '已取消排休', 'success');
+      toast(res.message || '已取消', 'success');
       await onChanged();
     } catch (err) {
-      toast(getErrorMessage(err, '取消排休失敗'), 'error');
+      toast(getErrorMessage(err, '取消失敗'), 'error');
     } finally {
       setBusy(false);
     }
@@ -116,53 +106,18 @@ export default function TrainerTimeOffPanel({
   return (
     <div className="form-stack coach-timeoff">
       <Alert tone="info">
-        排休時段會封鎖團課／私教排課；會員可查詢所屬教練排休以避開預約。與既有課程重疊時無法登錄。
+        可預約時段＝已核准之週班表出勤時段 − 已核准請假 − 此處登記之不開放預約時段（行政、備課、外出公務等仍屬工作時間）。
+        休假請於「我的出勤」申請請假，或於「我的排班」週班表指定例假／休息日。與既有課程重疊時無法登錄。
       </Alert>
 
-      <Card title="新增排休" subtitle="可選時段或全日">
+      <Card title="新增不開放預約時段" subtitle="單筆最長 24 小時">
         <form onSubmit={handleCreate} className="form-stack">
-          <div className="coach-timeoff__mode">
-            <button
-              type="button"
-              className={`coach-timeoff__chip ${mode === 'range' ? 'is-active' : ''}`}
-              onClick={() => setMode('range')}
-            >
-              自訂時段
-            </button>
-            <button
-              type="button"
-              className={`coach-timeoff__chip ${mode === 'day' ? 'is-active' : ''}`}
-              onClick={() => setMode('day')}
-            >
-              全日排休
-            </button>
-          </div>
-
-          {mode === 'day' ? (
-            <Field label="日期">
-              <Input type="date" value={day} onChange={(e) => setDay(e.target.value)} required />
-            </Field>
-          ) : (
-            <>
-              <Field label="開始">
-                <Input
-                  type="datetime-local"
-                  value={startAt}
-                  onChange={(e) => setStartAt(e.target.value)}
-                  required
-                />
-              </Field>
-              <Field label="結束">
-                <Input
-                  type="datetime-local"
-                  value={endAt}
-                  onChange={(e) => setEndAt(e.target.value)}
-                  required
-                />
-              </Field>
-            </>
-          )}
-
+          <Field label="開始">
+            <Input type="datetime-local" value={startAt} onChange={(e) => setStartAt(e.target.value)} required />
+          </Field>
+          <Field label="結束">
+            <Input type="datetime-local" value={endAt} onChange={(e) => setEndAt(e.target.value)} required />
+          </Field>
           <Field label="原因">
             <Select value={reason} onChange={(e) => setReason(e.target.value)}>
               {reasons.map((r) => (
@@ -176,19 +131,19 @@ export default function TrainerTimeOffPanel({
             <Input
               value={note}
               onChange={(e) => setNote(e.target.value)}
-              placeholder="例：外出研習／家庭事務"
+              placeholder="例：月會、器材盤點、外出研習"
               maxLength={200}
             />
           </Field>
           <Button type="submit" loading={busy} disabled={busy}>
-            登記排休
+            登記
           </Button>
         </form>
       </Card>
 
-      <Card title="即將到來的排休" subtitle={`${upcoming.length} 筆`}>
+      <Card title="即將到來的不開放預約時段" subtitle={`${upcoming.length} 筆`}>
         {upcoming.length === 0 ? (
-          <EmptyState icon="🌴" title="目前沒有排休" desc="登錄後，排課與會員預約會自動避開" />
+          <EmptyState icon="🗂️" title="目前沒有不開放預約時段" desc="登錄後，排課與會員預約會自動避開" />
         ) : (
           <ul className="coach-timeoff__list">
             {upcoming.map((t) => (

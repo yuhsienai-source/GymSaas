@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { QRCodeSVG } from 'qrcode.react';
 import MemberLayout from '../../components/layout/MemberLayout';
 import {
@@ -246,7 +247,12 @@ export default function MemberDashboardPage() {
       )}
       {contractLocked && (
         <Alert tone="error">
-          ⚖️ 入會契約未簽署：門禁碼已鎖定。請至個人資料／櫃檯完成定型化契約簽署後再試。
+          <div className="form-stack" style={{ gap: '0.65rem' }}>
+            <span>入會契約未簽署：門禁碼已鎖定。請先完成定型化契約簽署後再進場。</span>
+            <Link to="/member/profile" className="btn btn--primary btn--sm" style={{ alignSelf: 'flex-start' }}>
+              前往個人資料查看契約
+            </Link>
+          </div>
         </Alert>
       )}
 
@@ -292,7 +298,12 @@ export default function MemberDashboardPage() {
           {profile?.isAlert ? (
             <EmptyState icon="🚫" title="門禁 QR 已停用" desc="此帳號需人工查驗或使用人臉" />
           ) : contractLocked ? (
-            <EmptyState icon="📝" title="契約未簽署" desc={qrError || '請先完成入會契約'} />
+            <div className="form-stack" style={{ alignItems: 'center', textAlign: 'center' }}>
+              <EmptyState icon="📝" title="契約未簽署" desc={qrError || '請先完成入會契約'} />
+              <Link to="/member/profile" className="btn btn--primary btn--md">
+                前往個人資料查看契約
+              </Link>
+            </div>
           ) : qrToken ? (
             <div className="qr-hero__ring-wrap">
               <ProgressRing value={timeLeft} max={ttl} />

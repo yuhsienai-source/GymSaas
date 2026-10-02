@@ -23,17 +23,17 @@ import {
   verifyAndBindDeviceResetEmail,
 } from '../lib/deviceReset.js';
 import { clientIp, clientUserAgent } from '../lib/memberDeviceAudit.js';
+import {
+  assertLineLoginConfig,
+  buildLineAuthorizeUrl,
+  lineProfileFromCode,
+} from '../lib/lineLogin.js';
 
 const router = express.Router();
 
 const JWT_SECRET = process.env.JWT_SECRET;
-const LINE_CHANNEL_ID = process.env.LINE_CHANNEL_ID;
-const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
 const LINE_CALLBACK_URL = process.env.LINE_CALLBACK_URL;
 
-const LINE_AUTH_URL = 'https://access.line.me/oauth2/v2.1/authorize';
-const LINE_TOKEN_URL = 'https://api.line.me/oauth2/v2.1/token';
-const LINE_VERIFY_URL = 'https://api.line.me/oauth2/v2.1/verify';
 const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
 const AUTH_CODE_TTL_MS = 90 * 1000;
 const loginStateStore = new Map();
@@ -158,91 +158,12 @@ function consumeAuthCode(authCode) {
 }
 
 function assertLineConfig() {
-  if (!LINE_CHANNEL_ID || !LINE_CHANNEL_SECRET || !LINE_CALLBACK_URL) {
-    const err = new Error('LINE OAuth 環境變數未設定（LINE_CHANNEL_ID / SECRET / CALLBACK_URL）');
-    err.statusCode = 500;
-    throw err;
-  }
+  assertLineLoginConfig(LINE_CALLBACK_URL);
   if (!JWT_SECRET) {
     const err = new Error('JWT_SECRET 未設定');
     err.statusCode = 500;
     throw err;
   }
-}
-
-async function exchangeCodeForTokens(code) {
-  assertLineConfig();
-
-  const body = new URLSearchParams({
-    grant_type: 'authorization_code',
-    code,
-    redirect_uri: LINE_CALLBACK_URL,
-    client_id: LINE_CHANNEL_ID,
-    client_secret: LINE_CHANNEL_SECRET,
-  });
-
-  const tokenResponse = await fetch(LINE_TOKEN_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body,
-  });
-
-  const tokenData = await tokenResponse.json();
-
-  if (!tokenResponse.ok || !tokenData.id_token) {
-    const err = new Error(
-      tokenData.error_description || tokenData.error || '無法以 code 換取 LINE ID Token',
-    );
-    err.statusCode = 401;
-    throw err;
-  }
-
-  return tokenData;
-}
-
-async function verifyLineIdToken(idToken) {
-  const verifyBody = new URLSearchParams({
-    id_token: idToken,
-    client_id: LINE_CHANNEL_ID,
-  });
-
-  const verifyRes = await fetch(LINE_VERIFY_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: verifyBody,
-  });
-
-  const claims = await verifyRes.json();
-
-  if (!verifyRes.ok || !claims.sub) {
-    const err = new Error(claims.error_description || claims.error || 'LINE ID Token 驗證失敗');
-    err.statusCode = 401;
-    throw err;
-  }
-
-  if (claims.aud !== LINE_CHANNEL_ID) {
-    const err = new Error('ID Token aud 與 CHANNEL_ID 不符');
-    err.statusCode = 401;
-    throw err;
-  }
-
-  if (claims.iss !== 'https://access.line.me') {
-    const err = new Error('ID Token iss 無效');
-    err.statusCode = 401;
-    throw err;
-  }
-
-  if (claims.exp * 1000 < Date.now()) {
-    const err = new Error('ID Token 已過期');
-    err.statusCode = 401;
-    throw err;
-  }
-
-  return {
-    sub: claims.sub,
-    name: claims.name || claims.displayName || null,
-    picture: claims.picture || null,
-  };
 }
 
 /**
@@ -340,8 +261,8 @@ async function loginExistingLineMember(lineProfile, deviceId = null) {
 }
 
 async function completeLineLoginWithCode(code, state, deviceId = null) {
-  const tokenData = await exchangeCodeForTokens(code);
-  const profile = await verifyLineIdToken(tokenData.id_token);
+  assertLineConfig();
+  const profile = await lineProfileFromCode(code, LINE_CALLBACK_URL);
   const bind = verifyLineBindState(state);
   if (bind) {
     return bindLineToMemberAndIssueJwt(profile, bind, deviceId);
@@ -367,12 +288,7 @@ router.get('/line/login-url', lineLoginUrlLimiter, (req, res) => {
     } else {
       state = issueLoginState();
     }
-    const loginUrl =
-      `${LINE_AUTH_URL}?response_type=code` +
-      `&client_id=${encodeURIComponent(LINE_CHANNEL_ID)}` +
-      `&redirect_uri=${encodeURIComponent(LINE_CALLBACK_URL)}` +
-      `&state=${encodeURIComponent(state)}` +
-      `&scope=${encodeURIComponent('profile openid')}`;
+    const loginUrl = buildLineAuthorizeUrl({ redirectUri: LINE_CALLBACK_URL, state });
 
     res.json({
       status: 'success',

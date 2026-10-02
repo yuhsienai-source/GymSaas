@@ -6,13 +6,19 @@ import bcrypt from 'bcrypt';
 import { verifyStaff, requireAdmin } from '../middleware/jwtAuth.js';
 import {
   STAFF_PERMISSIONS,
+  isAdminUser,
   validateStaffCreateInput,
 } from '../lib/staffAccess.js';
 import {
-  normalizeProductKind,
-  PRODUCT_KIND_SERVICE,
-  resolveSafetyStock,
-} from '../lib/productKind.js';
+  TRAINER_ROLES,
+  branchParentError,
+  isManagerTrainer,
+  normalizeBranchType,
+  normalizeTrainerLevel,
+  normalizeTrainerRole,
+  positionBranchError,
+  positionLabel,
+} from '../lib/orgStructure.js';
 import {
   normalizePlanMode,
   normalizeUsageType,
@@ -30,9 +36,24 @@ import {
   HQ_COMPENSATION_ACTIONS,
 } from '../lib/hqCompensation.js';
 import { normalizePhone } from '../lib/memberIdentify.js';
-import { normalizeBranchSellerUbn } from '../lib/invoiceAllowance.js';
+import { assertBranchEntityChangeAllowed } from '../lib/legalEntity.js';
 import { normalizeBranchCode, staffBranchLabel } from '../lib/branchLabel.js';
 import { normalizeDisplayName } from '../lib/displayName.js';
+import {
+  deleteStaffPhoto,
+  readStaffAvatar,
+  revokeStaffFace,
+  staffPhotoSelect,
+  uploadStaffPhoto,
+} from '../lib/staffPhoto.js';
+import { getRequestClientMeta } from '../lib/contractAudit.js';
+import { coachRequiresLaborAct, dbDateKey, normalizeEmploymentInput } from '../lib/laborLaw.js';
+import { employmentSelect, leaveBalancesFor } from '../lib/staffLeaveBalance.js';
+import {
+  getStaffBiometricsConsent,
+  getStaffBiometricsConsentTemplate,
+  signStaffBiometricsConsent,
+} from '../lib/staffConsent.js';
 import {
   mapPromotionContracts,
   syncPromotionContracts,
@@ -95,6 +116,55 @@ function parsePositiveInt(value, fieldName) {
   return n;
 }
 
+const branchOrgSelect = { id: true, name: true, code: true, type: true, parentId: true, isActive: true };
+
+function parseOptionalParentId(raw) {
+  if (raw === undefined) return undefined;
+  if (raw === null || raw === '') return null;
+  return parsePositiveInt(raw, 'parentId');
+}
+
+/** 分店類型 × 上層關係（僅一層；CLASS 必須隸屬 GYM） */
+async function assertBranchHierarchy(db, { id, type, parentId }) {
+  const [parent, childCount] = await Promise.all([
+    parentId ? db.branch.findUnique({ where: { id: parentId }, select: branchOrgSelect }) : null,
+    id ? db.branch.count({ where: { parentId: id } }) : 0,
+  ]);
+  if (parentId && !parent) httpError('找不到上層分店', 400);
+  const msg = branchParentError({ id, type, childCount }, parent);
+  if (msg) httpError(msg, 400);
+}
+
+/** 分店類型變更後，已綁定之在職員工職位仍須相容 */
+async function assertBranchStaffFit(db, branch) {
+  const staff = await db.staff.findMany({
+    where: { branchId: branch.id, isActive: true },
+    select: { name: true, role: true },
+  });
+  const misfits = staff.filter((s) => positionBranchError(s.role, branch));
+  if (misfits.length > 0) {
+    const names = misfits.map((s) => `${s.name}（${positionLabel(s.role)}）`).join('、');
+    httpError(`以下員工職位不符新分店類型，請先調整：${names}`, 409);
+  }
+}
+
+async function assertNoActiveChildren(db, branchId, action) {
+  const n = await db.branch.count({ where: { parentId: branchId, isActive: true } });
+  if (n > 0) httpError(`此分店仍有 ${n} 間啟用中的隸屬分店，請先停用或移出後再${action}`, 409);
+}
+
+/** 員工職位 × 分店類型（CLASS 不直接綁員工；ACADEMY 僅教練部） */
+async function assertStaffPlacement(db, { role, branchId }) {
+  if (!branchId) return;
+  const branch = await db.branch.findFirst({
+    where: { id: branchId, isActive: true },
+    select: branchOrgSelect,
+  });
+  if (!branch) httpError('分店不存在或已停用', 400);
+  const msg = positionBranchError(role, branch);
+  if (msg) httpError(msg, 400);
+}
+
 // ==========================================
 // 總覽：分店／場地／促銷／教練指派現況
 // GET /api/hq/overview
@@ -140,13 +210,24 @@ router.get('/overview', async (req, res) => {
   }
 });
 
+/** 分店綁定營業人（null＝解除）；須為啟用中營業人 */
+async function parseLegalEntityId(raw) {
+  if (raw === undefined) return undefined;
+  if (raw === null || raw === '') return null;
+  const id = parsePositiveInt(raw, 'legalEntityId');
+  const entity = await prisma.legalEntity.findUnique({ where: { id }, select: { isActive: true } });
+  if (!entity) httpError('營業人不存在', 404);
+  if (!entity.isActive) httpError('營業人已停用，無法綁定', 409);
+  return id;
+}
+
 // ==========================================
 // 1. 開立分店 (Branch)
 // POST /api/hq/branches
-// Body: { name, code, address?, invoiceSellerName?, invoiceSellerUbn? }
+// Body: { name, code, type?, parentId?, address?, legalEntityId? }
 // ==========================================
 router.post('/branches', async (req, res) => {
-  const { name, code, address, invoiceSellerName, invoiceSellerUbn } = req.body;
+  const { name, code, type, parentId, address, legalEntityId } = req.body;
 
   if (!name || typeof name !== 'string' || !name.trim()) {
     return res.status(400).json({ status: 'error', message: '請提供分店名稱' });
@@ -154,22 +235,21 @@ router.post('/branches', async (req, res) => {
 
   try {
     const branchCode = normalizeBranchCode(code);
-    let sellerUbn = undefined;
-    if (invoiceSellerUbn !== undefined) {
-      sellerUbn = normalizeBranchSellerUbn(invoiceSellerUbn);
-    }
+    const branchType = normalizeBranchType(type);
+    const branchParentId = parseOptionalParentId(parentId) ?? null;
+    await assertBranchHierarchy(prisma, { type: branchType, parentId: branchParentId });
+    const entityId = await parseLegalEntityId(legalEntityId);
     const branch = await prisma.branch.create({
       data: {
         name: name.trim(),
         code: branchCode,
+        type: branchType,
+        parentId: branchParentId,
         address: address?.trim() || null,
-        invoiceSellerName:
-          invoiceSellerName !== undefined
-            ? String(invoiceSellerName || '').trim() || null
-            : null,
-        ...(sellerUbn !== undefined ? { invoiceSellerUbn: sellerUbn } : {}),
+        legalEntityId: entityId ?? null,
         isActive: true,
       },
+      include: { legalEntity: { select: { id: true, code: true, name: true, ubn: true } } },
     });
 
     res.status(201).json({
@@ -199,7 +279,9 @@ router.get('/branches', async (req, res) => {
   try {
     const branches = await prisma.branch.findMany({
       include: {
-        _count: { select: { venues: true, promotions: true, trainers: true } },
+        parent: { select: { id: true, name: true, code: true, type: true } },
+        legalEntity: { select: { id: true, code: true, name: true, ubn: true, isActive: true } },
+        _count: { select: { venues: true, promotions: true, trainers: true, children: true } },
       },
       orderBy: { id: 'asc' },
     });
@@ -212,30 +294,53 @@ router.get('/branches', async (req, res) => {
 
 // PATCH /api/hq/branches/:id
 router.patch('/branches/:id', async (req, res) => {
-  const { name, code, address, isActive, invoiceSellerName, invoiceSellerUbn } = req.body || {};
+  const { name, code, type, parentId, address, isActive, legalEntityId } = req.body || {};
   const data = {};
-  if (name !== undefined) data.name = String(name).trim();
-  if (code !== undefined) data.code = normalizeBranchCode(code);
-  if (address !== undefined) data.address = address ? String(address).trim() : null;
-  if (invoiceSellerName !== undefined) {
-    data.invoiceSellerName = String(invoiceSellerName || '').trim() || null;
-  }
-  if (invoiceSellerUbn !== undefined) {
-    data.invoiceSellerUbn = normalizeBranchSellerUbn(invoiceSellerUbn);
-  }
-  if (isActive !== undefined) {
-    if (typeof isActive !== 'boolean') {
-      return res.status(400).json({ status: 'error', message: 'isActive 必須為 boolean' });
-    }
-    data.isActive = isActive;
-  }
-  if (Object.keys(data).length === 0) {
-    return res.status(400).json({ status: 'error', message: '沒有可更新的欄位' });
-  }
 
   try {
+    if (name !== undefined) data.name = String(name).trim();
+    if (code !== undefined) data.code = normalizeBranchCode(code);
+    if (type !== undefined) data.type = normalizeBranchType(type);
+    if (parentId !== undefined) data.parentId = parseOptionalParentId(parentId);
+    if (address !== undefined) data.address = address ? String(address).trim() : null;
+    if (legalEntityId !== undefined) data.legalEntityId = await parseLegalEntityId(legalEntityId);
+    if (isActive !== undefined) {
+      if (typeof isActive !== 'boolean') {
+        return res.status(400).json({ status: 'error', message: 'isActive 必須為 boolean' });
+      }
+      data.isActive = isActive;
+    }
+    if (Object.keys(data).length === 0) {
+      return res.status(400).json({ status: 'error', message: '沒有可更新的欄位' });
+    }
+
     const id = parsePositiveInt(req.params.id, 'id');
-    const branch = await prisma.branch.update({ where: { id }, data });
+    const branch = await prisma.$transaction(async (tx) => {
+      const current = await tx.branch.findUnique({ where: { id }, select: branchOrgSelect });
+      if (!current) httpError('找不到此分店', 404);
+      const next = {
+        ...current,
+        type: data.type ?? current.type,
+        parentId: data.parentId !== undefined ? data.parentId : current.parentId,
+      };
+      if (data.type !== undefined || data.parentId !== undefined) {
+        await assertBranchHierarchy(tx, next);
+      }
+      if (data.type !== undefined && data.type !== current.type) {
+        await assertBranchStaffFit(tx, next);
+      }
+      if (data.isActive === false && current.isActive) {
+        await assertNoActiveChildren(tx, id, '停用');
+      }
+      if (data.legalEntityId !== undefined) {
+        await assertBranchEntityChangeAllowed(id, data.legalEntityId, tx);
+      }
+      return tx.branch.update({
+        where: { id },
+        data,
+        include: { legalEntity: { select: { id: true, code: true, name: true, ubn: true } } },
+      });
+    });
     res.json({
       status: 'success',
       message: `分店 [${branch.name}]${branch.code ? `（${branch.code}）` : ''} 已更新`,
@@ -275,8 +380,9 @@ router.delete('/branches/:id', async (req, res) => {
             promotions: true,
             coursePlans: true,
             trainers: true,
-            products: true,
+            stocks: true,
             purchaseOrders: true,
+            orders: true,
             saleOrders: true,
             checkoutSessions: true,
             shiftHandovers: true,
@@ -293,6 +399,9 @@ router.delete('/branches/:id', async (req, res) => {
       return res.status(404).json({ status: 'error', message: '找不到此分店' });
     }
 
+    await assertNoActiveChildren(prisma, id, '刪除');
+    const childCount = await prisma.branch.count({ where: { parentId: id } });
+
     const c = branch._count;
     const [classCount, seriesCount] = await Promise.all([
       prisma.class.count({ where: { venue: { branchId: id } } }),
@@ -302,8 +411,9 @@ router.delete('/branches/:id', async (req, res) => {
       c.promotions +
       c.coursePlans +
       c.trainers +
-      c.products +
+      c.stocks +
       c.purchaseOrders +
+      c.orders +
       c.saleOrders +
       c.checkoutSessions +
       c.shiftHandovers +
@@ -312,6 +422,7 @@ router.delete('/branches/:id', async (req, res) => {
       c.ptContracts +
       c.memberBranches +
       c.gateDevices +
+      childCount +
       classCount +
       seriesCount;
 
@@ -986,6 +1097,8 @@ router.post('/course-plans', async (req, res) => {
     price,
     sessions,
     capacity,
+    dropInPrice,
+    minEnrollment,
     description,
     enableCardRecurring,
     recurringPeriods,
@@ -1041,6 +1154,8 @@ router.post('/course-plans', async (req, res) => {
         price,
         sessions,
         capacity,
+        dropInPrice,
+        minEnrollment,
         description,
         enableCardRecurring,
         recurringPeriods,
@@ -1076,6 +1191,8 @@ router.post('/course-plans', async (req, res) => {
             price: fields.price,
             sessions: fields.sessions,
             capacity: fields.capacity,
+            dropInPrice: fields.dropInPrice,
+            minEnrollment: fields.minEnrollment,
             description: fields.description,
             enableCardRecurring: fields.enableCardRecurring,
             recurringPeriods: fields.recurringPeriods,
@@ -1161,6 +1278,8 @@ router.patch('/course-plans/:id', async (req, res) => {
     price,
     sessions,
     capacity,
+    dropInPrice,
+    minEnrollment,
     description,
     enableCardRecurring,
     recurringPeriods,
@@ -1203,6 +1322,8 @@ router.patch('/course-plans/:id', async (req, res) => {
       price !== undefined ||
       sessions !== undefined ||
       capacity !== undefined ||
+      dropInPrice !== undefined ||
+      minEnrollment !== undefined ||
       description !== undefined ||
       enableCardRecurring !== undefined ||
       recurringPeriods !== undefined ||
@@ -1224,6 +1345,8 @@ router.patch('/course-plans/:id', async (req, res) => {
           price: price ?? current.price,
           sessions: sessions !== undefined ? sessions : current.sessions,
           capacity: capacity !== undefined ? capacity : current.capacity,
+          dropInPrice: dropInPrice !== undefined ? dropInPrice : current.dropInPrice,
+          minEnrollment: minEnrollment !== undefined ? minEnrollment : current.minEnrollment,
           description: description !== undefined ? description : current.description,
           enableCardRecurring:
             enableCardRecurring !== undefined
@@ -1270,6 +1393,8 @@ router.patch('/course-plans/:id', async (req, res) => {
       data.planType = fields.planType;
       data.price = fields.price;
       data.sessions = fields.sessions;
+      data.dropInPrice = fields.dropInPrice;
+      data.minEnrollment = fields.minEnrollment;
       data.capacity = fields.capacity;
       data.description = fields.description;
       data.enableCardRecurring = fields.enableCardRecurring;
@@ -1417,7 +1542,7 @@ router.get('/trainers', async (req, res) => {
 });
 
 router.post('/trainers', async (req, res) => {
-  const { name, phone, role, displayName } = req.body || {};
+  const { name, phone, role, displayName, level } = req.body || {};
   if (!name || !phone) {
     return res.status(400).json({ status: 'error', message: '請填寫教練姓名與電話' });
   }
@@ -1428,7 +1553,8 @@ router.post('/trainers', async (req, res) => {
         name: String(name).trim(),
         displayName: normalizeDisplayName(displayName),
         phone: String(phone).trim(),
-        role: role === 'MANAGER' ? 'MANAGER' : 'NORMAL',
+        role: normalizeTrainerRole(role),
+        level: normalizeTrainerLevel(level),
         isActive: true,
       },
     });
@@ -1447,12 +1573,13 @@ router.post('/trainers', async (req, res) => {
 });
 
 router.patch('/trainers/:id', async (req, res) => {
-  const { name, phone, role, isActive, staffId, displayName } = req.body || {};
+  const { name, phone, role, isActive, staffId, displayName, level } = req.body || {};
   const data = {};
   if (name !== undefined) data.name = String(name).trim();
   if (displayName !== undefined) data.displayName = normalizeDisplayName(displayName);
   if (phone !== undefined) data.phone = String(phone).trim();
-  if (role !== undefined) data.role = role === 'MANAGER' ? 'MANAGER' : 'NORMAL';
+  if (role !== undefined) data.role = normalizeTrainerRole(role);
+  if (level !== undefined) data.level = normalizeTrainerLevel(level);
   if (isActive !== undefined) {
     if (typeof isActive !== 'boolean') {
       return res.status(400).json({ status: 'error', message: 'isActive 必須為 boolean' });
@@ -1490,7 +1617,7 @@ router.patch('/trainers/:id', async (req, res) => {
         return res.status(400).json({ status: 'error', message: '找不到可綁定的員工帳號' });
       }
       const canTrainer =
-        staff.role === 'ADMIN' ||
+        isAdminUser(staff) ||
         (Array.isArray(staff.permissions) && staff.permissions.includes('trainer'));
       if (!canTrainer) {
         return res.status(400).json({
@@ -1555,7 +1682,7 @@ router.patch('/trainers/:id', async (req, res) => {
 // NORMAL → 須綁定「指定分店」（可多間）；MANAGER → 不限分店（branchIds 可空）
 // ==========================================
 router.post('/trainers/assign', async (req, res) => {
-  const { trainerId, role, branchIds } = req.body;
+  const { trainerId, role, branchIds, level } = req.body;
 
   if (!trainerId || !role || !Array.isArray(branchIds)) {
     return res.status(400).json({
@@ -1564,7 +1691,7 @@ router.post('/trainers/assign', async (req, res) => {
     });
   }
 
-  if (role !== 'NORMAL' && role !== 'MANAGER') {
+  if (!Object.hasOwn(TRAINER_ROLES, role)) {
     return res.status(400).json({
       status: 'error',
       message: 'role 只能是 NORMAL（一般教練）或 MANAGER（主管教練）',
@@ -1605,7 +1732,10 @@ router.post('/trainers/assign', async (req, res) => {
 
       await tx.trainer.update({
         where: { id: parsedTrainerId },
-        data: { role },
+        data: {
+          role,
+          ...(level ? { level: normalizeTrainerLevel(level) } : {}),
+        },
       });
 
       // 清空舊指派後重建（避免殘留幽靈權限）
@@ -1634,7 +1764,7 @@ router.post('/trainers/assign', async (req, res) => {
     });
 
     const scopeMsg =
-      role === 'MANAGER' && result.branches.length === 0
+      isManagerTrainer(result) && result.branches.length === 0
         ? '主管教練（不限分店）'
         : `並指派 ${result.branches.length} 間分店`;
 
@@ -1649,205 +1779,6 @@ router.post('/trainers/assign', async (req, res) => {
     }
     console.error(error);
     res.status(500).json({ status: 'error', message: '權限指派失敗' });
-  }
-});
-
-// ==========================================
-// 5. 商品（進銷存 SKU，與 Promotion 分離）
-// ==========================================
-
-// POST /api/hq/products  Body: { branchId, sku, name, price, cost?, productKind?, safetyStock? }
-router.post('/products', async (req, res) => {
-  const { branchId, sku, name, price, cost, stockQty, productKind, safetyStock } = req.body || {};
-
-  if (stockQty !== undefined) {
-    return res.status(400).json({
-      status: 'error',
-      message: '⛔ 禁止直接指定 stockQty，請走進貨 API',
-    });
-  }
-
-  if (!sku || !name || price === undefined || branchId === undefined) {
-    return res.status(400).json({
-      status: 'error',
-      message: '參數錯誤：必須提供 branchId、sku、name、price',
-    });
-  }
-
-  const parsedPrice = Number(price);
-  const parsedCost = cost === undefined || cost === null || cost === '' ? 0 : Number(cost);
-  if (!Number.isFinite(parsedPrice) || parsedPrice < 0) {
-    return res.status(400).json({ status: 'error', message: 'price 必須為非負數字' });
-  }
-  if (!Number.isFinite(parsedCost) || parsedCost < 0) {
-    return res.status(400).json({ status: 'error', message: 'cost 必須為非負數字' });
-  }
-
-  try {
-    const kind = normalizeProductKind(productKind);
-    const parsedSafety = resolveSafetyStock(safetyStock, kind);
-    const parsedBranchId = parsePositiveInt(branchId, 'branchId');
-    const branch = await prisma.branch.findUnique({ where: { id: parsedBranchId } });
-    if (!branch || !branch.isActive) {
-      return res.status(404).json({ status: 'error', message: '分店不存在或已停用' });
-    }
-
-    const product = await prisma.product.create({
-      data: {
-        branchId: parsedBranchId,
-        sku: String(sku).trim(),
-        name: String(name).trim(),
-        productKind: kind,
-        price: parsedPrice,
-        cost: parsedCost,
-        stockQty: 0,
-        safetyStock: parsedSafety,
-        isActive: true,
-      },
-      include: { branch: { select: { id: true, name: true, code: true } } },
-    });
-
-    const msg =
-      kind === PRODUCT_KIND_SERVICE
-        ? `服務類商品 [${product.name}] 已建立（不控管庫存）`
-        : `商品 [${product.name}] 已建立（庫存 0，請進貨）`;
-
-    res.status(201).json({
-      status: 'success',
-      message: msg,
-      data: product,
-    });
-  } catch (error) {
-    if (error.code === 'P2002') {
-      return res.status(400).json({ status: 'error', message: '此分店 SKU 已存在' });
-    }
-    if (error.statusCode) {
-      return res.status(error.statusCode).json({ status: 'error', message: error.message });
-    }
-    console.error(error);
-    res.status(500).json({ status: 'error', message: '建立商品失敗' });
-  }
-});
-
-// GET /api/hq/products?branchId=
-router.get('/products', async (req, res) => {
-  try {
-    const where = {};
-    if (req.query.branchId !== undefined) {
-      where.branchId = parsePositiveInt(req.query.branchId, 'branchId');
-    }
-    const products = await prisma.product.findMany({
-      where,
-      include: { branch: { select: { id: true, name: true, code: true } } },
-      orderBy: [{ branchId: 'asc' }, { id: 'asc' }],
-    });
-    res.json({ status: 'success', data: products });
-  } catch (error) {
-    if (error.statusCode) {
-      return res.status(error.statusCode).json({ status: 'error', message: error.message });
-    }
-    console.error(error);
-    res.status(500).json({ status: 'error', message: '讀取商品失敗' });
-  }
-});
-
-// PATCH /api/hq/products/:id — 禁改 stockQty
-router.patch('/products/:id', async (req, res) => {
-  const { name, price, cost, isActive, sku, stockQty, productKind, safetyStock, ...rest } =
-    req.body || {};
-
-  if (stockQty !== undefined) {
-    return res.status(400).json({
-      status: 'error',
-      message: '⛔ 禁止直接修改庫存，請走進貨／銷貨',
-    });
-  }
-  if (Object.keys(rest).length > 0) {
-    return res.status(400).json({
-      status: 'error',
-      message: `⛔ 非法參數：${Object.keys(rest).join(', ')}`,
-    });
-  }
-
-  try {
-    const id = parsePositiveInt(req.params.id, 'id');
-    const current = await prisma.product.findUnique({ where: { id } });
-    if (!current) {
-      return res.status(404).json({ status: 'error', message: '找不到此商品' });
-    }
-
-    const data = {};
-    if (name !== undefined) data.name = String(name).trim();
-    if (sku !== undefined) data.sku = String(sku).trim();
-    if (isActive !== undefined) {
-      if (typeof isActive !== 'boolean') {
-        return res.status(400).json({ status: 'error', message: 'isActive 必須為 boolean' });
-      }
-      data.isActive = isActive;
-    }
-    if (price !== undefined) {
-      const parsedPrice = Number(price);
-      if (!Number.isFinite(parsedPrice) || parsedPrice < 0) {
-        return res.status(400).json({ status: 'error', message: 'price 必須為非負數字' });
-      }
-      data.price = parsedPrice;
-    }
-    if (cost !== undefined) {
-      const parsedCost = Number(cost);
-      if (!Number.isFinite(parsedCost) || parsedCost < 0) {
-        return res.status(400).json({ status: 'error', message: 'cost 必須為非負數字' });
-      }
-      data.cost = parsedCost;
-    }
-
-    const nextKind =
-      productKind !== undefined
-        ? normalizeProductKind(productKind)
-        : normalizeProductKind(current.productKind);
-    if (productKind !== undefined) {
-      data.productKind = nextKind;
-    }
-
-    if (safetyStock !== undefined || productKind !== undefined) {
-      const safetyRaw =
-        safetyStock !== undefined ? safetyStock : current.safetyStock;
-      data.safetyStock = resolveSafetyStock(
-        nextKind === PRODUCT_KIND_SERVICE ? null : safetyRaw,
-        nextKind,
-      );
-    }
-
-    if (nextKind === PRODUCT_KIND_SERVICE) {
-      data.stockQty = 0;
-      data.safetyStock = null;
-    }
-
-    if (Object.keys(data).length === 0) {
-      return res.status(400).json({ status: 'error', message: '沒有可更新的欄位' });
-    }
-
-    const product = await prisma.product.update({
-      where: { id },
-      data,
-      include: { branch: { select: { id: true, name: true, code: true } } },
-    });
-    res.json({
-      status: 'success',
-      message: `商品 [${product.name}] 已更新`,
-      data: product,
-    });
-  } catch (error) {
-    if (error.code === 'P2002') {
-      return res.status(400).json({ status: 'error', message: '此分店 SKU 已存在' });
-    }
-    if (error.code === 'P2025') {
-      return res.status(404).json({ status: 'error', message: '找不到此商品' });
-    }
-    if (error.statusCode) {
-      return res.status(error.statusCode).json({ status: 'error', message: error.message });
-    }
-    console.error(error);
-    res.status(500).json({ status: 'error', message: '更新商品失敗' });
   }
 });
 
@@ -1867,8 +1798,14 @@ const staffSelect = {
   permissions: true,
   isActive: true,
   createdAt: true,
-  branch: { select: { id: true, name: true, code: true } },
+  ...staffPhotoSelect,
+  ...employmentSelect,
+  branch: { select: { id: true, name: true, code: true, type: true, parentId: true } },
 };
+
+function serializeStaff(row, balance) {
+  return { ...row, hireDate: dbDateKey(row.hireDate), leaveBalance: balance ?? null };
+}
 
 router.get('/staff', async (req, res) => {
   try {
@@ -1876,7 +1813,8 @@ router.get('/staff', async (req, res) => {
       select: staffSelect,
       orderBy: [{ isActive: 'desc' }, { id: 'asc' }],
     });
-    res.json({ status: 'success', data: staffList });
+    const balances = await leaveBalancesFor(staffList);
+    res.json({ status: 'success', data: staffList.map((s) => serializeStaff(s, balances.get(s.id))) });
   } catch (error) {
     console.error(error);
     res.status(500).json({ status: 'error', message: '讀取員工列表失敗' });
@@ -1891,8 +1829,10 @@ router.post('/staff', async (req, res) => {
   }
 
   const validated = validateStaffCreateInput({ role, branchId, permissions });
-  if (validated.errors.length > 0) {
-    return res.status(400).json({ status: 'error', message: validated.errors.join('；') });
+  const employment = normalizeEmploymentInput(req.body || {}, { requireHireDate: true, role: validated.role });
+  const errors = [...validated.errors, ...employment.errors];
+  if (errors.length > 0) {
+    return res.status(400).json({ status: 'error', message: errors.join('；') });
   }
 
   try {
@@ -1901,14 +1841,7 @@ router.post('/staff', async (req, res) => {
       return res.status(400).json({ status: 'error', message: '此帳號已被使用' });
     }
 
-    if (validated.branchId) {
-      const branch = await prisma.branch.findFirst({
-        where: { id: validated.branchId, isActive: true },
-      });
-      if (!branch) {
-        return res.status(400).json({ status: 'error', message: '分店不存在或已停用' });
-      }
-    }
+    await assertStaffPlacement(prisma, validated);
 
     const hashedPassword = await bcrypt.hash(password, 10);
     const created = await prisma.staff.create({
@@ -1921,6 +1854,7 @@ router.post('/staff', async (req, res) => {
         branchId: validated.branchId,
         permissions: validated.permissions,
         isActive: true,
+        ...employment.data,
       },
       select: staffSelect,
     });
@@ -1928,9 +1862,12 @@ router.post('/staff', async (req, res) => {
     res.status(201).json({
       status: 'success',
       message: `員工 [${created.name}] 已建立`,
-      data: created,
+      data: serializeStaff(created),
     });
   } catch (error) {
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({ status: 'error', message: error.message });
+    }
     console.error(error);
     res.status(500).json({ status: 'error', message: '建立員工失敗' });
   }
@@ -1952,6 +1889,19 @@ router.patch('/staff/:id', async (req, res) => {
     if (isActive !== undefined) data.isActive = Boolean(isActive);
     if (password) data.password = await bcrypt.hash(password, 10);
 
+    const body = req.body || {};
+    if (['employmentType', 'hireDate', 'weeklyHours', 'laborActApplies'].some((k) => body[k] !== undefined)) {
+      const current = await prisma.staff.findUnique({ where: { id: staffId }, select: { ...employmentSelect, role: true } });
+      if (!current) {
+        return res.status(404).json({ status: 'error', message: '找不到此員工' });
+      }
+      const employment = normalizeEmploymentInput(body, { current, role: role ?? current.role });
+      if (employment.errors.length > 0) {
+        return res.status(400).json({ status: 'error', message: employment.errors.join('；') });
+      }
+      Object.assign(data, employment.data);
+    }
+
     if (role !== undefined || branchId !== undefined || permissions !== undefined) {
       const current = await prisma.staff.findUnique({ where: { id: staffId } });
       if (!current) {
@@ -1968,22 +1918,16 @@ router.patch('/staff/:id', async (req, res) => {
         return res.status(400).json({ status: 'error', message: validated.errors.join('；') });
       }
 
+      await assertStaffPlacement(prisma, validated);
+
       data.role = validated.role;
       data.branchId = validated.branchId;
       data.permissions = validated.permissions;
+      if (coachRequiresLaborAct(validated.role)) data.laborActApplies = true;
     }
 
     if (Object.keys(data).length === 0) {
       return res.status(400).json({ status: 'error', message: '沒有可更新的欄位' });
-    }
-
-    if (data.branchId) {
-      const branch = await prisma.branch.findFirst({
-        where: { id: data.branchId, isActive: true },
-      });
-      if (!branch) {
-        return res.status(400).json({ status: 'error', message: '分店不存在或已停用' });
-      }
     }
 
     const updated = await prisma.staff.update({
@@ -1995,14 +1939,123 @@ router.patch('/staff/:id', async (req, res) => {
     res.json({
       status: 'success',
       message: `員工 [${updated.name}] 已更新`,
-      data: updated,
+      data: serializeStaff(updated),
     });
   } catch (error) {
     if (error.code === 'P2025') {
       return res.status(404).json({ status: 'error', message: '找不到此員工' });
     }
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({ status: 'error', message: error.message });
+    }
     console.error(error);
     res.status(500).json({ status: 'error', message: '更新員工失敗' });
+  }
+});
+
+// ==========================================
+// 員工照片（頭像＋人臉辨識）
+// GET    /api/hq/staff/:id/photo   → { dataUrl }（縮圖）
+// POST   /api/hq/staff/:id/photo   Body: { image, enrollFace }（enrollFace 須已簽有效同意書）
+// DELETE /api/hq/staff/:id/photo   刪照片＋人臉特徵（同意書保留）
+// DELETE /api/hq/staff/:id/face    撤回生物辨識同意（簽署標記撤回＋刪特徵，保留頭像）
+// GET    /api/hq/staff-consent/biometrics   員工生物辨識同意書條文
+// GET    /api/hq/staff/:id/face-consent     目前有效簽署（含簽名影像）
+// POST   /api/hq/staff/:id/face-consent     Body: { signatureData, bodyHash } 員工親簽
+// ==========================================
+function sendStaffPhotoError(res, error, fallback) {
+  if (error.statusCode) {
+    return res
+      .status(error.statusCode)
+      .json({ status: 'error', code: error.code || undefined, message: error.message });
+  }
+  console.error(error);
+  return res.status(500).json({ status: 'error', message: fallback });
+}
+
+router.get('/staff/:id/photo', async (req, res) => {
+  try {
+    const id = parsePositiveInt(req.params.id, 'id');
+    const avatar = await readStaffAvatar(id);
+    res.json({ status: 'success', data: avatar });
+  } catch (error) {
+    sendStaffPhotoError(res, error, '讀取員工照片失敗');
+  }
+});
+
+router.post('/staff/:id/photo', async (req, res) => {
+  const { image, enrollFace } = req.body || {};
+  try {
+    const id = parsePositiveInt(req.params.id, 'id');
+    const result = await uploadStaffPhoto({ staffId: id, image, enrollFace: enrollFace === true });
+    res.json({
+      status: 'success',
+      message:
+        result.warning ||
+        (result.faceEnrolledAt ? '員工照片已更新，人臉辨識已註冊' : '員工照片已更新（未啟用人臉辨識）'),
+      data: result,
+    });
+  } catch (error) {
+    sendStaffPhotoError(res, error, '上傳員工照片失敗');
+  }
+});
+
+router.delete('/staff/:id/photo', async (req, res) => {
+  try {
+    const id = parsePositiveInt(req.params.id, 'id');
+    const result = await deleteStaffPhoto(id);
+    res.json({ status: 'success', message: result.warning || '員工照片與人臉特徵已刪除', data: result });
+  } catch (error) {
+    sendStaffPhotoError(res, error, '刪除員工照片失敗');
+  }
+});
+
+router.delete('/staff/:id/face', async (req, res) => {
+  try {
+    const id = parsePositiveInt(req.params.id, 'id');
+    const result = await revokeStaffFace(id, req.user.id);
+    res.json({ status: 'success', message: result.warning || '已撤回生物辨識同意並刪除人臉特徵', data: result });
+  } catch (error) {
+    sendStaffPhotoError(res, error, '撤回人臉辨識失敗');
+  }
+});
+
+router.get('/staff-consent/biometrics', (_req, res) => {
+  res.json({ status: 'success', data: getStaffBiometricsConsentTemplate() });
+});
+
+router.get('/staff/:id/face-consent', async (req, res) => {
+  try {
+    const id = parsePositiveInt(req.params.id, 'id');
+    const consent = await getStaffBiometricsConsent(id, { withSignature: true });
+    let witnessName = null;
+    if (consent?.witnessStaffId) {
+      const witness = await prisma.staff.findUnique({
+        where: { id: consent.witnessStaffId },
+        select: { name: true },
+      });
+      witnessName = witness?.name ?? null;
+    }
+    res.json({ status: 'success', data: consent ? { ...consent, witnessName } : null });
+  } catch (error) {
+    sendStaffPhotoError(res, error, '讀取生物辨識同意書失敗');
+  }
+});
+
+router.post('/staff/:id/face-consent', async (req, res) => {
+  const { signatureData, bodyHash } = req.body || {};
+  try {
+    const id = parsePositiveInt(req.params.id, 'id');
+    const row = await signStaffBiometricsConsent({
+      staffId: id,
+      signatureData,
+      bodyHash,
+      actorStaffId: req.user.id,
+      clientMeta: getRequestClientMeta(req),
+    });
+    res.json({ status: 'success', message: '員工生物辨識同意書已簽署', data: row });
+  } catch (error) {
+    sendStaffPhotoError(res, error, '簽署生物辨識同意書失敗');
   }
 });
 

@@ -8,6 +8,7 @@ import {
   fulfillPromotionPurchase,
   isUnlimitedPromotion,
   parseTopupQtyFromItemDesc,
+  TOPUP_NO_WALLET_MESSAGE,
   resolvePromotionRecurringAmount,
   resolveRecurringPeriodDays,
 } from './promotion.js';
@@ -37,27 +38,31 @@ import {
 } from './cardSubscription.js';
 import { buildPtCheckoutLines, fulfillPtCheckoutLines } from './ptPurchase.js';
 import { resolveTopupOrderId, generateSubscriptionOrderId } from './orderIds.js';
-import { issueSplitCheckoutInvoices } from './checkoutInvoice.js';
+import { issueCheckoutInvoices, saveInvoiceRequest } from './einvoice.js';
+import { resolveBranchLegalEntity } from './legalEntity.js';
+import { lockOpenShiftForSale } from './shiftHandover.js';
+import { payWithCashWallet, restoreHeldCashWallet } from './walletMutation.js';
 import { resolveCourseRecurringSchedule } from './coursePlan.js';
 import {
-  splitInvoicesHaveFailure,
-  summarizeInvoiceFailures,
-} from './checkoutAbort.js';
+  quoteGroupItem,
+  createEnrollmentHold,
+  activateEnrollment,
+  activateEnrollmentsForCheckout,
+  releaseHoldsForCheckout,
+} from './groupClassService.js';
+import { normalizeEnrollKind } from './groupClassRules.js';
 
-async function failCheckoutIfInvoiceBroken({
-  checkoutId,
-  invoices,
-  linePayTransactionId = null,
-  linePayAmount = 0,
-}) {
-  // 已收款不因開票失敗沖回（防漏稅懸空改入 InvoiceIssueJob）
-  // linePay* 參數保留相容呼叫端，刻意不退款
-  void linePayTransactionId;
-  void linePayAmount;
-  if (!splitInvoicesHaveFailure(invoices)) {
+/** 已收款不因開票失敗沖回：失敗腿留 EInvoice FAILED 由佇列補開，回 PARTIAL_INVOICE */
+function failCheckoutIfInvoiceBroken({ checkoutId, invoices }) {
+  const list = Array.isArray(invoices) ? invoices : [];
+  if (!list.some((i) => i && i.ok === false)) {
     return null;
   }
-  const detail = summarizeInvoiceFailures(invoices);
+  const detail =
+    list
+      .filter((i) => i && i.ok === false)
+      .map((i) => i.message || i.lastError || `${i.leg || 'leg'} 開票失敗`)
+      .join('；') || '電子發票開立失敗';
   console.warn(
     `[PARTIAL_INVOICE] ${checkoutId} 部分開票失敗已入佇列（不沖回收款）: ${detail}`,
   );
@@ -92,7 +97,26 @@ export async function resolveCheckoutCart(body, req) {
     qty,
     courseItems,
     trainerId,
+    groupItems,
   } = body || {};
+
+  const groupDraft = [];
+  if (Array.isArray(groupItems)) {
+    for (const row of groupItems) {
+      const seriesId = parseInt(row?.seriesId, 10);
+      if (!Number.isInteger(seriesId) || seriesId <= 0) throw httpError('團課 seriesId 無效');
+      const kind = normalizeEnrollKind(row?.kind);
+      const classId = kind === 'DROP_IN' ? parseInt(row?.classId, 10) : null;
+      if (kind === 'DROP_IN' && (!Number.isInteger(classId) || classId <= 0)) {
+        throw httpError('團課單堂須指定 classId');
+      }
+      const dupKey = `${seriesId}:${kind}:${classId || ''}`;
+      if (groupDraft.some((g) => `${g.seriesId}:${g.kind}:${g.classId || ''}` === dupKey)) {
+        throw httpError('購物車內團課項目重複');
+      }
+      groupDraft.push({ seriesId, kind, classId });
+    }
+  }
 
   const productDraft = [];
   if (Array.isArray(items)) {
@@ -135,8 +159,8 @@ export async function resolveCheckoutCart(body, req) {
     throw httpError('promotionId 必須為整數');
   }
 
-  if (productDraft.length === 0 && !hasPromo && courseDraft.length === 0) {
-    throw httpError('購物車不可為空：請加入商品、購案或課程');
+  if (productDraft.length === 0 && !hasPromo && courseDraft.length === 0 && groupDraft.length === 0) {
+    throw httpError('購物車不可為空：請加入商品、購案、課程或團課');
   }
 
   let parsedBranchId = null;
@@ -179,17 +203,31 @@ export async function resolveCheckoutCart(body, req) {
     parsedMemberId = parseInt(memberId, 10);
     if (!Number.isInteger(parsedMemberId)) throw httpError('memberId 無效');
   }
-  if ((hasPromo || courseDraft.length > 0) && !parsedMemberId) {
-    throw httpError('購案／課程必須指定會員 memberId');
+  if ((hasPromo || courseDraft.length > 0 || groupDraft.length > 0) && !parsedMemberId) {
+    throw httpError('購案／課程／團課必須指定會員 memberId');
   }
 
   if (hasPromo && promotion.requiresMemberContract) {
     await assertMemberSignedPromotionContracts(parsedMemberId, promotion.id);
   }
 
+  if (groupDraft.length > 0) {
+    const series = await prisma.classSeries.findMany({
+      where: { id: { in: groupDraft.map((g) => g.seriesId) } },
+      select: { id: true, venue: { select: { branchId: true } } },
+    });
+    for (const g of groupDraft) {
+      const s = series.find((x) => x.id === g.seriesId);
+      if (!s) throw httpError('找不到團課期班', 404);
+      assertBranchAccess(req, s.venue.branchId);
+      if (!parsedBranchId) parsedBranchId = s.venue.branchId;
+    }
+  }
+
   return {
     productDraft,
     courseDraft,
+    groupDraft,
     promotion,
     promoQty,
     parsedBranchId,
@@ -252,13 +290,32 @@ export async function priceCheckoutCart(tx, cart) {
     trainer = built.trainer;
   }
 
-  const amount = posAmount + promoAmount + ptAmount;
-  const descParts = [posItemDesc, promoItemDesc, ptItemDesc].filter(Boolean);
+  let groupAmount = 0;
+  const groupLines = [];
+  for (const g of cart.groupDraft || []) {
+    const q = await quoteGroupItem(tx, g);
+    groupLines.push({
+      seriesId: g.seriesId,
+      kind: q.kind,
+      classId: q.cls?.id ?? null,
+      price: q.quote.price,
+      sessions: q.quote.sessions,
+      prorated: q.quote.prorated,
+      itemDesc: q.itemDesc,
+    });
+    groupAmount += q.quote.price;
+  }
+  const groupItemDesc = groupLines.map((l) => l.itemDesc.split(' | ').slice(0, 2).join(' ')).join('、');
+
+  const amount = posAmount + promoAmount + ptAmount + groupAmount;
+  const descParts = [posItemDesc, promoItemDesc, ptItemDesc, groupItemDesc].filter(Boolean);
   const itemDesc = descParts.join(' + ').slice(0, 200);
 
   return {
     amount,
     itemDesc,
+    groupAmount,
+    groupLines,
     posAmount,
     posLines,
     posItemDesc,
@@ -296,6 +353,17 @@ async function resolveRecurringCourseTarget(cart) {
 /**
  * 執行合併結帳
  */
+/** 臨櫃收款歸屬班次之分店：購物車已判定之分店 → 櫃檯選擇之分店 → 員工本店 */
+function resolveShiftBranchId(req, cart, rawBranchId) {
+  if (cart.parsedBranchId) return cart.parsedBranchId;
+  const bid = parseInt(rawBranchId, 10);
+  if (Number.isInteger(bid) && bid > 0) {
+    assertBranchAccess(req, bid);
+    return bid;
+  }
+  return req.user?.branchId ?? null;
+}
+
 export async function runOpsCheckout(req, body) {
   const {
     payments,
@@ -317,17 +385,19 @@ export async function runOpsCheckout(req, body) {
     qty: _q,
     courseItems: _c,
     trainerId: _t,
+    groupItems: _g,
     amount: illegalAmount,
     ...rest
   } = body || {};
 
   if (illegalAmount !== undefined || Object.keys(rest).length > 0) {
     throw httpError(
-      '⛔ 非法參數：結帳只允許 branchId、memberId、items、promotionId、qty、courseItems、trainerId、payments、payMethod、voucherCode、carrierNum、buyerUbn、loveCode、cardMode、cardInst、periodType、periodTimes、recurringAmount、linePayOneTimeKey；金額由後端查價',
+      '⛔ 非法參數：結帳只允許 branchId、memberId、items、promotionId、qty、courseItems、trainerId、groupItems、payments、payMethod、voucherCode、carrierNum、buyerUbn、loveCode、cardMode、cardInst、periodType、periodTimes、recurringAmount、linePayOneTimeKey；金額由後端查價',
     );
   }
 
   const cart = await resolveCheckoutCart(body, req);
+  const shiftBranchId = resolveShiftBranchId(req, cart, body?.branchId);
   const invoiceOpts = normalizeInvoiceOptions({ carrierNum, buyerUbn, loveCode });
   const staffId = req.user?.id || null;
 
@@ -363,6 +433,10 @@ export async function runOpsCheckout(req, body) {
       .includes('CARD');
   const wantsRecurring =
     String(cardMode || '').toUpperCase() === 'RECURRING' || needsCardHint;
+
+  if (wantsRecurring && cart.groupDraft.length > 0) {
+    throw httpError('團課報名不支援定期定額，請與定期定額項目分開結帳');
+  }
 
   if (wantsRecurring) {
     cardOpts = parseCardPayOptions(
@@ -448,6 +522,16 @@ export async function runOpsCheckout(req, body) {
   if (pay.walletAmount > 0 && !cart.parsedMemberId) {
     throw httpError('零錢包付款必須指定會員 memberId');
   }
+  if (pay.walletAmount > 0 && cart.groupDraft.length > 0) {
+    const err = httpError('團課報名不可使用錢包扣款，請改用現金／乙禾刷卡／LinePay，或與錢包付款項目分開結帳');
+    err.code = 'GROUP_NO_WALLET';
+    throw err;
+  }
+  if (pay.walletAmount > 0 && cart.promotion && !isUnlimitedPromotion(cart.promotion)) {
+    const err = httpError(TOPUP_NO_WALLET_MESSAGE);
+    err.code = 'TOPUP_NO_WALLET';
+    throw err;
+  }
 
   const status = pay.needsOnlinePay ? 'PENDING' : 'PAID';
   const checkoutId = generateCheckoutId();
@@ -455,6 +539,7 @@ export async function runOpsCheckout(req, body) {
   const isCourseRecurring = isRecurringCheckout && Boolean(courseSchedule);
 
   const created = await prisma.$transaction(async (tx) => {
+    await lockOpenShiftForSale(tx, shiftBranchId);
     let member = null;
     if (cart.parsedMemberId) {
       member = await tx.member.findUnique({ where: { id: cart.parsedMemberId } });
@@ -462,14 +547,14 @@ export async function runOpsCheckout(req, body) {
     }
 
     if (pay.walletAmount > 0) {
-      if (!member || member.cashWallet < pay.walletAmount) {
-        throw httpError(
-          `零錢包（本金）不足（餘額 $${member?.cashWallet ?? 0}，應付 $${pay.walletAmount}）；運動金不可折抵`,
-        );
-      }
-      await tx.member.update({
-        where: { id: member.id },
-        data: { cashWallet: { decrement: pay.walletAmount } },
+      if (!member) throw httpError('零錢包付款必須指定會員');
+      await payWithCashWallet(tx, {
+        memberId: member.id,
+        amount: pay.walletAmount,
+        refType: 'CHECKOUT',
+        refId: checkoutId,
+        staffId: staffId ?? null,
+        branchId: shiftBranchId,
       });
     }
 
@@ -495,9 +580,7 @@ export async function runOpsCheckout(req, body) {
           status,
           amount: pricedTx.posAmount,
           itemDesc: pricedTx.posItemDesc,
-          carrierNum: invoiceOpts.carrierNum,
-          buyerUbn: invoiceOpts.buyerUbn,
-          loveCode: invoiceOpts.loveCode,
+          legalEntityId: (await resolveBranchLegalEntity(cart.parsedBranchId, tx)).id,
           staffId,
           checkoutSessionId: checkoutId,
           items: {
@@ -507,6 +590,7 @@ export async function runOpsCheckout(req, body) {
               unitPrice: l.unitPrice,
               qty: l.qty,
               lineTotal: l.lineTotal,
+              taxType: l.taxType,
             })),
           },
         },
@@ -542,9 +626,7 @@ export async function runOpsCheckout(req, body) {
           periodTimes: isRecurringCheckout ? cardOpts.periodTimes : null,
           recurringAmount,
           recurringAmountFinal,
-          carrierNum: invoiceOpts.carrierNum,
-          buyerUbn: invoiceOpts.buyerUbn,
-          loveCode: invoiceOpts.loveCode,
+          branchId: cart.promotion.branchId || cart.parsedBranchId || null,
           status,
           checkoutSessionId: checkoutId,
         },
@@ -553,6 +635,9 @@ export async function runOpsCheckout(req, body) {
       if (!pay.needsOnlinePay) {
         await fulfillPromotionPurchase(tx, cart.parsedMemberId, cart.promotion, {
           qty: cart.promoQty,
+          orderId,
+          staffId,
+          branchId: shiftBranchId,
         });
       }
     } else if (isCourseRecurring) {
@@ -577,9 +662,7 @@ export async function runOpsCheckout(req, body) {
           periodTimes: courseSchedule.periodTimes,
           recurringAmount,
           recurringAmountFinal,
-          carrierNum: invoiceOpts.carrierNum,
-          buyerUbn: invoiceOpts.buyerUbn,
-          loveCode: invoiceOpts.loveCode,
+          branchId: recurringCourse.plan.branchId || cart.parsedBranchId || null,
           status,
           checkoutSessionId: checkoutId,
         },
@@ -603,10 +686,32 @@ export async function runOpsCheckout(req, body) {
       ptFulfilled = true;
     }
 
+    const groupEnrollmentIds = [];
+    for (const line of pricedTx.groupLines) {
+      const hold = await createEnrollmentHold(tx, {
+        memberId: cart.parsedMemberId,
+        seriesId: line.seriesId,
+        kind: line.kind,
+        classId: line.classId,
+        source: 'POS',
+        staffId,
+        checkoutSessionId: checkoutId,
+        payMethod: pay.payMethodLabel,
+        payBreakdown: pay.breakdown,
+        voucherCode: pay.voucherCode,
+        invoiceOpts,
+        expectedPrice: line.price,
+      });
+      if (!pay.needsOnlinePay) {
+        await activateEnrollment(tx, hold.enrollment);
+      }
+      groupEnrollmentIds.push(hold.enrollment.id);
+    }
+
     const session = await tx.checkoutSession.create({
       data: {
         id: checkoutId,
-        branchId: cart.parsedBranchId,
+        branchId: cart.parsedBranchId ?? shiftBranchId,
         memberId: cart.parsedMemberId,
         amount: isCourseRecurring ? chargeAmount : pricedTx.amount,
         itemDesc: pricedTx.itemDesc,
@@ -625,9 +730,6 @@ export async function runOpsCheckout(req, body) {
         recurringAmount,
         recurringAmountFinal,
         payuniPeriodHash: isRecurringCheckout ? payuniPeriodHash : null,
-        carrierNum: invoiceOpts.carrierNum,
-        buyerUbn: invoiceOpts.buyerUbn,
-        loveCode: invoiceOpts.loveCode,
         status,
         saleOrderId,
         orderId,
@@ -637,6 +739,12 @@ export async function runOpsCheckout(req, body) {
         staffId,
       },
     });
+    await saveInvoiceRequest(tx, {
+      refType: 'CHECKOUT',
+      refId: checkoutId,
+      buyerName: member?.name || null,
+      ...invoiceOpts,
+    });
 
     return {
       session,
@@ -644,6 +752,7 @@ export async function runOpsCheckout(req, body) {
       orderId,
       memberName: member?.name || null,
       priced: pricedTx,
+      groupEnrollmentIds,
     };
   });
 
@@ -669,6 +778,7 @@ export async function runOpsCheckout(req, body) {
         checkoutId: created.session.id,
         saleId: created.saleOrderId,
         orderId: created.orderId,
+        groupEnrollmentIds: created.groupEnrollmentIds,
         amount: created.session.amount,
         payMethod: pay.payMethodLabel,
         payBreakdown: pay.breakdown,
@@ -701,6 +811,7 @@ export async function runOpsCheckout(req, body) {
         checkoutId: created.session.id,
         saleId: created.saleOrderId,
         orderId: created.orderId,
+        groupEnrollmentIds: created.groupEnrollmentIds,
         amount: created.session.amount,
         yipayAmount: pay.yipayAmount,
         payMethod: pay.payMethodLabel,
@@ -748,10 +859,11 @@ export async function runOpsCheckout(req, body) {
       branchName,
     }).catch(async (err) => {
       await prisma.$transaction(async (tx) => {
-        await tx.checkoutSession.updateMany({
+        const claimed = await tx.checkoutSession.updateMany({
           where: { id: created.session.id, status: 'PENDING' },
           data: { status: 'CANCELLED' },
         });
+        if (!claimed.count) return;
         if (created.saleOrderId) {
           await tx.saleOrder.updateMany({
             where: { id: created.saleOrderId, status: 'PENDING' },
@@ -764,10 +876,15 @@ export async function runOpsCheckout(req, body) {
             data: { status: 'CANCELLED' },
           });
         }
+        await releaseHoldsForCheckout(tx, created.session.id, 'CANCELLED');
         if (pay.walletAmount > 0 && cart.parsedMemberId) {
-          await tx.member.update({
-            where: { id: cart.parsedMemberId },
-            data: { cashWallet: { increment: pay.walletAmount } },
+          await restoreHeldCashWallet(tx, {
+            memberId: cart.parsedMemberId,
+            refType: 'CHECKOUT',
+            refId: created.session.id,
+            staffId: staffId ?? null,
+            branchId: created.session.branchId ?? null,
+            reason: `合併結帳 LINE Pay 扣款失敗，退回零錢包 ${created.session.id}`,
           });
         }
       });
@@ -781,11 +898,9 @@ export async function runOpsCheckout(req, body) {
     );
 
     // fulfill 內開票失敗已入佇列；標 PARTIAL_INVOICE（不沖回／不退 LinePay）
-    const partial = await failCheckoutIfInvoiceBroken({
+    const partial = failCheckoutIfInvoiceBroken({
       checkoutId: created.session.id,
       invoices: fulfilled?.invoices || [],
-      linePayTransactionId: lp.transactionId,
-      linePayAmount: pay.linePayAmount,
     });
 
     return {
@@ -796,6 +911,7 @@ export async function runOpsCheckout(req, body) {
         checkoutId: created.session.id,
         saleId: created.saleOrderId,
         orderId: created.orderId,
+        groupEnrollmentIds: created.groupEnrollmentIds,
         amount: created.session.amount,
         payMethod: pay.payMethodLabel,
         payBreakdown: pay.breakdown,
@@ -813,37 +929,10 @@ export async function runOpsCheckout(req, body) {
     };
   }
 
-  let invoiceNumber = null;
-  let invoices = [];
-  let invoiceJobs = [];
-  let issuedMeta = null;
-  try {
-    const issued = await issueSplitCheckoutInvoices({
-      checkoutId: created.session.id,
-      buyerName: created.memberName || '臨櫃客戶',
-      carrierNum: invoiceOpts.carrierNum,
-      buyerUbn: invoiceOpts.buyerUbn,
-      loveCode: invoiceOpts.loveCode,
-    });
-    invoices = issued.invoices || [];
-    invoiceNumber = issued.invoiceNumber;
-    invoiceJobs = issued.invoiceJobs || [];
-    issuedMeta = issued;
-  } catch (invoiceErr) {
-    console.error(`❌ 合併結帳 ${created.session.id} 軟拆開票例外:`, invoiceErr.message);
-    invoices = [
-      {
-        leg: 'ALL',
-        id: created.session.id,
-        invoiceNumber: null,
-        amount: created.session.amount,
-        ok: false,
-        message: invoiceErr.message,
-      },
-    ];
-  }
+  const issuedMeta = await issueCheckoutInvoices(created.session.id);
+  const { invoices, invoiceNumber, invoiceJobs } = issuedMeta;
 
-  const partial = await failCheckoutIfInvoiceBroken({
+  const partial = failCheckoutIfInvoiceBroken({
     checkoutId: created.session.id,
     invoices,
   });
@@ -856,6 +945,7 @@ export async function runOpsCheckout(req, body) {
       checkoutId: created.session.id,
       saleId: created.saleOrderId,
       orderId: created.orderId,
+      groupEnrollmentIds: created.groupEnrollmentIds,
       amount: created.session.amount,
       payMethod: pay.payMethodLabel,
       payBreakdown: pay.breakdown,
@@ -961,7 +1051,7 @@ export async function fulfillCheckoutSession(checkoutId, merchantNo, cardMeta = 
       });
       return {
         session: refreshed || existing,
-        invoiceNumber: (refreshed || existing).invoiceNumber,
+        invoiceNumber: null,
         invoices: [],
       };
     }
@@ -1007,6 +1097,7 @@ export async function fulfillCheckoutSession(checkoutId, merchantNo, cardMeta = 
             await fulfillPromotionPurchase(tx, order.memberId, promotion, {
               qty,
               durationDaysOverride: durationDaysOverride ?? undefined,
+              orderId: order.id,
             });
           }
         } else if (isRecurring && order) {
@@ -1048,6 +1139,8 @@ export async function fulfillCheckoutSession(checkoutId, merchantNo, cardMeta = 
         });
       }
     }
+
+    await activateEnrollmentsForCheckout(tx, checkoutId, { merchantNo });
   });
 
   // 若交易外才解析到方案／課程（order 早已 PAID 的重入），再補一次
@@ -1073,56 +1166,10 @@ export async function fulfillCheckoutSession(checkoutId, merchantNo, cardMeta = 
     });
   }
 
-  let invoiceNumber = null;
-  let invoices = [];
-  let invoiceJobs = [];
-  let invoiceCode = null;
-  try {
-    const issued = await issueSplitCheckoutInvoices({
-      checkoutId: session.id,
-      buyerName: session.member?.name || '臨櫃客戶',
-      carrierNum: session.carrierNum || null,
-      buyerUbn: session.buyerUbn || null,
-      loveCode: session.loveCode || null,
-    });
-    invoices = issued.invoices || [];
-    invoiceNumber = issued.invoiceNumber;
-    invoiceJobs = issued.invoiceJobs || [];
-    invoiceCode = issued.code;
-    if (invoiceNumber) {
-      console.log(
-        `🧾 合併結帳 ${session.id} 軟拆開票 ${invoices.filter((i) => i.ok).length}/${invoices.length} 張`,
-      );
-    }
-  } catch (err) {
-    console.error(`❌ 合併結帳 ${session.id} 軟拆開票例外:`, err.message);
-    invoices = [
-      {
-        leg: 'ALL',
-        id: session.id,
-        invoiceNumber: null,
-        amount: session.amount,
-        ok: false,
-        message: err.message,
-      },
-    ];
-  }
-
-  const partial = await failCheckoutIfInvoiceBroken({
-    checkoutId: session.id,
-    invoices,
-    linePayTransactionId: (() => {
-      const merchant = String(session.merchantNo || '');
-      return merchant.startsWith('LP:') ? merchant.slice(3) : null;
-    })(),
-    linePayAmount: (() => {
-      const breakdown =
-        session.payBreakdown && typeof session.payBreakdown === 'object'
-          ? session.payBreakdown
-          : {};
-      return Number(breakdown.LINEPAY) || 0;
-    })(),
-  });
+  const issued = await issueCheckoutInvoices(session.id);
+  const { invoices, invoiceNumber, invoiceJobs } = issued;
+  const invoiceCode = issued.code;
+  const partial = failCheckoutIfInvoiceBroken({ checkoutId: session.id, invoices });
 
   if (isRecurring && paidOrderId && (promotionForSub || coursePlanForSub)) {
     try {

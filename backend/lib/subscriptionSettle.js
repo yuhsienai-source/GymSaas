@@ -16,6 +16,7 @@ import {
   syncCheckoutInvoiceAfterReverse,
   reevaluateCheckoutSessionStatus,
 } from './ezpayReverse.js';
+import { issuedInvoiceFor } from './einvoice.js';
 
 /**
  * 效期政策：
@@ -37,6 +38,13 @@ function roundMoney(n) {
   return Math.round((Number(n) || 0) * 100) / 100;
 }
 
+/** 訂單目前有效發票號（EInvoice ISSUED）；直接掛在 order 物件供退費流程使用 */
+async function withIssuedInvoice(order) {
+  if (!order) return order;
+  const inv = await issuedInvoiceFor(order.id);
+  return { ...order, invoiceNumber: inv?.invoiceNumber || null };
+}
+
 function httpError(message, statusCode = 400) {
   const err = new Error(message);
   err.statusCode = statusCode;
@@ -52,13 +60,13 @@ export async function findLatestPaidOrderForSubscription(sub) {
     orderBy: { periodIndex: 'desc' },
   });
   if (lastCharge?.orderId) {
-    const order = await prisma.order.findUnique({ where: { id: lastCharge.orderId } });
+    const order = await withIssuedInvoice(await prisma.order.findUnique({ where: { id: lastCharge.orderId } }));
     if (order?.status === 'PAID') {
       return { order, periodIndex: lastCharge.periodIndex, source: 'charge' };
     }
   }
   if (sub.originOrderId) {
-    const order = await prisma.order.findUnique({ where: { id: sub.originOrderId } });
+    const order = await withIssuedInvoice(await prisma.order.findUnique({ where: { id: sub.originOrderId } }));
     if (order?.status === 'PAID') {
       return { order, periodIndex: 1, source: 'origin' };
     }
@@ -176,12 +184,13 @@ export function computeUnusedAllowanceAmount(opts) {
  *   expirePolicy?: 'KEEP'|'CUT_UNUSED'|'CUT_NO_ALLOWANCE',
  *   doAllowance?: boolean,
  *   now?: Date,
+ *   staffId?: number|null,
  * }} opts
  * doAllowance 僅在 CUT_UNUSED 時有效（預設 true）
  */
 export async function settleCancelSubscription(
   subscriptionId,
-  { reason, expirePolicy = 'KEEP', doAllowance, now = new Date(), forceLocalOnly = false } = {},
+  { reason, expirePolicy = 'KEEP', doAllowance, now = new Date(), forceLocalOnly = false, staffId = null } = {},
 ) {
   const policy = String(expirePolicy || 'KEEP').toUpperCase();
   if (!EXPIRE_POLICIES.includes(policy)) {
@@ -216,6 +225,7 @@ export async function settleCancelSubscription(
         expirePolicy: policy,
         doAllowance,
         now,
+        staffId,
         // 避免再轉回本函式造成迴圈
         skipLinkedSubRedirect: true,
       });
@@ -288,7 +298,11 @@ export async function settleCancelSubscription(
         merchantOrderNo: ctx.merchantOrderNo,
       };
       try {
-        invoiceReverse = await executeInvoiceReverse(forceCtx, { reason: reason || '取消訂閱' });
+        invoiceReverse = await executeInvoiceReverse(forceCtx, {
+          reason: reason || '取消訂閱',
+          staffId,
+          allowance: { source: 'SUB_CANCEL', orderId: latest.order.id, memberId: sub.memberId },
+        });
       } catch (ezErr) {
         const err = new Error(
           ezErr.message || 'ezPay 折讓失敗，取消訂閱已中止（效期／訂閱未異動）',
@@ -383,7 +397,7 @@ export async function settleCancelSubscription(
  * 解析月卡訂單的方案天數（一次付清／現金無訂閱）
  * periodDays＝每期天數（15 日門檻用）；contractDays＝整約天數（存續比例分母）
  */
-async function resolveUnlimitedOrderPeriodDays(order) {
+export async function resolveUnlimitedOrderPeriodDays(order) {
   const promoMatch = String(order.itemDesc || '').match(/商品#(\d+)/);
   const promotionId = promoMatch ? parseInt(promoMatch[1], 10) : null;
   let promotion = null;
@@ -411,7 +425,7 @@ async function resolveUnlimitedOrderPeriodDays(order) {
  * 預覽：一次付清／現金月卡（無 CardSubscription）取消結算
  */
 export async function previewCancelUnlimitedOrder(orderId, { now = new Date() } = {}) {
-  const order = await prisma.order.findUnique({
+  const order = await withIssuedInvoice(await prisma.order.findUnique({
     where: { id: String(orderId || '').trim() },
     include: {
       member: {
@@ -425,7 +439,7 @@ export async function previewCancelUnlimitedOrder(orderId, { now = new Date() } 
         },
       },
     },
-  });
+  }));
   if (!order) throw httpError('找不到此訂單', 404);
   if (!isUnlimitedTopupOrder(order.itemDesc)) {
     throw httpError('此訂單不是訂閱制月卡購案');
@@ -490,17 +504,17 @@ export async function previewCancelUnlimitedOrder(orderId, { now = new Date() } 
  */
 export async function settleCancelUnlimitedOrder(
   orderId,
-  { reason, expirePolicy = 'KEEP', doAllowance, now = new Date(), skipLinkedSubRedirect = false } = {},
+  { reason, expirePolicy = 'KEEP', doAllowance, now = new Date(), skipLinkedSubRedirect = false, staffId = null } = {},
 ) {
   const policy = String(expirePolicy || 'KEEP').toUpperCase();
   if (!EXPIRE_POLICIES.includes(policy)) {
     throw httpError(`expirePolicy 無效，允許：${EXPIRE_POLICIES.join(' / ')}`);
   }
 
-  const order = await prisma.order.findUnique({
+  const order = await withIssuedInvoice(await prisma.order.findUnique({
     where: { id: String(orderId || '').trim() },
     include: { member: true },
-  });
+  }));
   if (!order) throw httpError('找不到此訂單', 404);
   if (!isUnlimitedTopupOrder(order.itemDesc)) {
     throw httpError('此訂單不是訂閱制月卡購案');
@@ -536,6 +550,7 @@ export async function settleCancelUnlimitedOrder(
         expirePolicy: policy,
         doAllowance,
         now,
+        staffId,
       });
     }
   }
@@ -586,6 +601,8 @@ export async function settleCancelUnlimitedOrder(
       try {
         invoiceReverse = await executeInvoiceReverse(forceCtx, {
           reason: reason || '取消月卡購案',
+          staffId,
+          allowance: { source: 'SUB_CANCEL', orderId: order.id, memberId: order.memberId },
         });
       } catch (ezErr) {
         const err = new Error(
@@ -611,7 +628,11 @@ export async function settleCancelUnlimitedOrder(
         if (!ctx.sharedInvoice && ctx.invoiceNumber) {
           invoiceReverse = await executeInvoiceReverse(
             { ...ctx, prefer: 'void', skip: false },
-            { reason: reason || '取消月卡購案沖回' },
+            {
+              reason: reason || '取消月卡購案沖回',
+              staffId,
+              allowance: { source: 'SUB_CANCEL', orderId: order.id, memberId: order.memberId },
+            },
           );
         }
       } catch (ezErr) {

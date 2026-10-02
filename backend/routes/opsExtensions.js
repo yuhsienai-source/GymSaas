@@ -15,7 +15,7 @@ import {
   reconcileYipayDay,
   markYipayCaptureOrphan,
 } from '../lib/yipayCapture.js';
-import { listInvoiceJobs, retryInvoiceJob } from '../lib/invoiceQueue.js';
+import { isCrossBranchUser, staffBranchIds } from '../lib/staffAccess.js';
 
 const router = express.Router();
 router.use(verifyStaff, requireDutyOrAbove);
@@ -238,43 +238,32 @@ router.post('/payment-blacklist/:memberId/clear', async (req, res) => {
 router.get('/invoices/search', async (req, res) => {
   try {
     const range = parseDateTimeRange(req.query);
-    const invoiceNumber = String(req.query.invoiceNumber || '').trim();
+    const invoiceNumber = String(req.query.invoiceNumber || '').trim().toUpperCase();
     const where = { invoiceNumber: { not: null } };
-    if (range) where.createdAt = range;
+    if (range) where.issuedAt = range;
     if (invoiceNumber) where.invoiceNumber = { contains: invoiceNumber };
-
-    const [orders, sales] = await Promise.all([
-      prisma.order.findMany({
-        where,
-        select: {
-          id: true,
-          memberId: true,
-          amount: true,
-          invoiceNumber: true,
-          status: true,
-          createdAt: true,
-        },
-        orderBy: { createdAt: 'desc' },
-        take: 200,
-      }),
-      prisma.saleOrder.findMany({
-        where,
-        select: {
-          id: true,
-          memberId: true,
-          amount: true,
-          invoiceNumber: true,
-          status: true,
-          createdAt: true,
-        },
-        orderBy: { createdAt: 'desc' },
-        take: 200,
-      }),
-    ]);
-    const items = [
-      ...orders.map((o) => ({ kind: 'ORDER', ...o })),
-      ...sales.map((s) => ({ kind: 'SALE', ...s })),
-    ].sort((a, b) => b.createdAt - a.createdAt);
+    if (!isCrossBranchUser(req.user)) {
+      where.OR = [{ branchId: { in: staffBranchIds(req.user) } }, { branchId: null }];
+    }
+    const rows = await prisma.eInvoice.findMany({
+      where,
+      include: { legalEntity: { select: { id: true, code: true, name: true, ubn: true } } },
+      orderBy: { issuedAt: 'desc' },
+      take: 200,
+    });
+    const items = rows.map((r) => ({
+      kind: r.refType === 'SALE' ? 'SALE' : r.refType === 'CHECKOUT' ? 'CHECKOUT' : 'ORDER',
+      id: r.refId,
+      einvoiceId: r.id,
+      memberId: r.memberId,
+      amount: r.totalAmount,
+      invoiceNumber: r.invoiceNumber,
+      category: r.category,
+      status: r.status,
+      allowanceTotal: r.allowanceTotal,
+      legalEntity: r.legalEntity,
+      createdAt: r.issuedAt || r.createdAt,
+    }));
     return res.json({ status: 'success', data: items });
   } catch (error) {
     if (error.statusCode) {
@@ -487,7 +476,7 @@ router.post('/yipay/captures', async (req, res) => {
     return res.json({ status: 'success', message: '已暫存乙禾端末成功紀錄', data: row });
   } catch (error) {
     if (error.statusCode) {
-      return res.status(error.statusCode).json({ status: 'error', message: error.message });
+      return res.status(error.statusCode).json({ status: 'error', code: error.code, message: error.message });
     }
     console.error(error);
     return res.status(500).json({ status: 'error', message: '暫存失敗' });
@@ -532,30 +521,6 @@ router.post('/yipay/captures/:id/orphan', async (req, res) => {
   } catch (error) {
     console.error(error);
     return res.status(500).json({ status: 'error', message: '標記失敗' });
-  }
-});
-
-// ——— ezPay 開票佇列 ———
-router.get('/invoice-jobs', async (req, res) => {
-  try {
-    const items = await listInvoiceJobs({ status: req.query.status, take: req.query.take });
-    return res.json({ status: 'success', data: { items } });
-  } catch (error) {
-    console.error(error);
-    return res.status(500).json({ status: 'error', message: '查詢開票任務失敗' });
-  }
-});
-
-router.post('/invoice-jobs/:id/retry', async (req, res) => {
-  try {
-    const job = await retryInvoiceJob(req.params.id);
-    return res.json({ status: 'success', message: '已重新排隊開票', data: job });
-  } catch (error) {
-    if (error.statusCode) {
-      return res.status(error.statusCode).json({ status: 'error', message: error.message });
-    }
-    console.error(error);
-    return res.status(500).json({ status: 'error', message: '重試失敗' });
   }
 });
 

@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import MemberLayout from '../../components/layout/MemberLayout';
+import MemberGroupClassPanel from '../../components/member/MemberGroupClassPanel';
 import {
   Alert,
   Badge,
@@ -56,6 +58,8 @@ function formatWhen(iso?: string) {
 export default function MemberBookingPage() {
   const { logout } = useMemberAuth();
   const { toast } = useToast();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const tab = searchParams.get('tab') === 'group' ? 'group' : 'pt';
   const [profile, setProfile] = useState<MemberProfile | null>(null);
   const [classes, setClasses] = useState<MemberBookableClass[]>([]);
   const [reservations, setReservations] = useState<MemberReservation[]>([]);
@@ -132,13 +136,38 @@ export default function MemberBookingPage() {
       onLogout={logout}
       activeTab="book"
     >
+      <div className="pay-method-grid" role="tablist" aria-label="課程類型">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === 'pt'}
+          className={`pay-method-chip${tab === 'pt' ? ' is-active' : ''}`}
+          onClick={() => setSearchParams({}, { replace: true })}
+        >
+          私教／諮詢
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === 'group'}
+          className={`pay-method-chip${tab === 'group' ? ' is-active' : ''}`}
+          onClick={() => setSearchParams({ tab: 'group' }, { replace: true })}
+        >
+          團課期班
+        </button>
+      </div>
+
+      {tab === 'group' ? (
+        <MemberGroupClassPanel key={reloadKey} />
+      ) : (
+      <>
       {!profile?.hasLineBound ? (
         <Alert tone="info">
           建議綁定 LINE 以便收到約課推播。您目前仍可在此頁預約課程。
         </Alert>
       ) : null}
 
-      <Card title="我的預約" subtitle="即將到來 · 可取消未開始的課程">
+      <Card title="我的預約" subtitle="即將到來 · 私教／諮詢可取消未開始的課程；團課請至「團課期班」請假">
         {loading ? (
           <Skeleton style={{ height: 80 }} />
         ) : reservations.length === 0 ? (
@@ -186,7 +215,7 @@ export default function MemberBookingPage() {
         )}
       </Card>
 
-      <Card title="可預約課程" subtitle="團課開放預約 · 私教／諮詢需為該教練合約學員">
+      <Card title="可預約課程" subtitle="私教／諮詢需為該教練合約學員">
         {loading ? (
           <Skeleton style={{ height: 120 }} />
         ) : classes.length === 0 ? (
@@ -240,6 +269,8 @@ export default function MemberBookingPage() {
           </ul>
         )}
       </Card>
+      </>
+      )}
     </MemberLayout>
   );
 }

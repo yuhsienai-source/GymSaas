@@ -1,6 +1,7 @@
 // routes/memberMarketing.js — 會員行銷自助（掛於 /api/member/marketing）
 import express from 'express';
 import prisma from '../lib/prisma.js';
+import { WALLET_MODE, WALLET_TX, mutateMemberWallet } from '../lib/walletMutation.js';
 
 const router = express.Router();
 
@@ -51,18 +52,33 @@ router.post('/gift-cards/redeem', async (req, res) => {
         throw err;
       }
 
-      const updated = await tx.giftCard.update({
-        where: { id: card.id },
+      const claimed = await tx.giftCard.updateMany({
+        where: { id: card.id, status: 'ACTIVE' },
         data: {
           status: 'REDEEMED',
           redeemerId: memberId,
           redeemedAt: new Date(),
         },
       });
+      if (!claimed.count) {
+        const err = new Error('兌換碼無效或已使用');
+        err.statusCode = 409;
+        throw err;
+      }
+      const updated = await tx.giftCard.findUnique({ where: { id: card.id } });
 
-      const member = await tx.member.update({
+      await mutateMemberWallet(tx, {
+        memberId,
+        txType: WALLET_TX.GIFT_CARD_REDEEM,
+        mode: WALLET_MODE.CREDIT_BUCKETS,
+        cashDelta: card.amount,
+        bonusDelta: 0,
+        reason: `禮物卡兌換 ${card.code.slice(0, 4)}****`,
+        refType: 'GIFT_CARD',
+        refId: card.id,
+      });
+      const member = await tx.member.findUnique({
         where: { id: memberId },
-        data: { cashWallet: { increment: card.amount } },
         select: { id: true, cashWallet: true, bonusWallet: true },
       });
 

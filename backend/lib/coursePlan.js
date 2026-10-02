@@ -108,6 +108,8 @@ export function resolveCoursePlanFields(body, { partial = false, current = null 
       price: 0,
       sessions,
       capacity: null,
+      dropInPrice: null,
+      minEnrollment: null,
       description:
         body.description !== undefined
           ? body.description == null || body.description === ''
@@ -319,12 +321,52 @@ export function resolveCoursePlanFields(body, { partial = false, current = null 
   }
   if (!giftLabel) giftQty = null;
 
+  let dropInPrice = current?.dropInPrice ?? null;
+  if (body.dropInPrice !== undefined) {
+    if (body.dropInPrice === null || body.dropInPrice === '' || Number(body.dropInPrice) === 0) {
+      dropInPrice = null;
+    } else {
+      const v = parseFloat(body.dropInPrice);
+      if (!Number.isFinite(v) || v < 0) {
+        const err = new Error('dropInPrice（單堂價）必須為正數或留空');
+        err.statusCode = 400;
+        throw err;
+      }
+      dropInPrice = v;
+    }
+  }
+  let minEnrollment = current?.minEnrollment ?? null;
+  if (body.minEnrollment !== undefined) {
+    if (body.minEnrollment === null || body.minEnrollment === '' || Number(body.minEnrollment) === 0) {
+      minEnrollment = null;
+    } else {
+      minEnrollment = parsePositiveInt(body.minEnrollment, 'minEnrollment');
+    }
+  }
+  if (planType === 'GROUP') {
+    if (enableCardRecurring) {
+      const err = new Error('團體課程（付費期班）不支援定期定額');
+      err.statusCode = 400;
+      throw err;
+    }
+    if (minEnrollment && capacity && minEnrollment > capacity) {
+      const err = new Error('最低開班人數不可大於人數上限');
+      err.statusCode = 400;
+      throw err;
+    }
+  } else {
+    dropInPrice = null;
+    minEnrollment = null;
+  }
+
   return {
     kind,
     planType,
     price: parsedPrice,
     sessions,
     capacity,
+    dropInPrice,
+    minEnrollment,
     description,
     enableCardRecurring,
     recurringPeriods,

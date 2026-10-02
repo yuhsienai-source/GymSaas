@@ -29,9 +29,25 @@ export default function OpsInvoiceFailBanner() {
   }, []);
 
   useEffect(() => {
-    void load();
-    const t = window.setInterval(() => void load(), 60_000);
-    return () => window.clearInterval(t);
+    let t: number | undefined;
+    const start = () => {
+      if (t !== undefined) return;
+      void load();
+      t = window.setInterval(() => void load(), 60_000);
+    };
+    const stop = () => {
+      if (t === undefined) return;
+      window.clearInterval(t);
+      t = undefined;
+    };
+    // 背景分頁不輪詢：否則 DB（Neon）永遠無法休眠
+    const onVisibility = () => (document.visibilityState === 'visible' ? start() : stop());
+    onVisibility();
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibility);
+      stop();
+    };
   }, [load]);
 
   async function retryOne(id: string) {
@@ -113,7 +129,7 @@ export default function OpsInvoiceFailBanner() {
             <thead>
               <tr>
                 <th>子單</th>
-                <th>腿</th>
+                <th>腿／營業人</th>
                 <th>金額</th>
                 <th>失敗原因</th>
                 <th>重試</th>
@@ -130,7 +146,12 @@ export default function OpsInvoiceFailBanner() {
                     ) : null}
                     <div className="text-sm text-muted">{job.itemDesc}</div>
                   </td>
-                  <td>{job.leg}</td>
+                  <td>
+                    {job.leg}
+                    {job.legalEntity ? (
+                      <div className="text-sm text-muted">{job.legalEntity.name}</div>
+                    ) : null}
+                  </td>
                   <td>{money(job.amount)}</td>
                   <td className="text-sm" style={{ maxWidth: 240 }}>
                     {job.lastError || '—'}

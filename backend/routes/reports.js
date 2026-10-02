@@ -2,10 +2,11 @@
 import express from 'express';
 import prisma from '../lib/prisma.js';
 import { verifyStaff, requireAdmin, requireDutyOrAbove, requireOpsOrDuty } from '../middleware/jwtAuth.js';
-import { branchListWhere, isAdminUser } from '../lib/staffAccess.js';
+import { branchListWhere, canAccessBranch, isCrossBranchUser } from '../lib/staffAccess.js';
 import { staffBranchLabel } from '../lib/branchLabel.js';
-import { formatCheckoutInvoiceDisplay } from '../lib/checkoutInvoice.js';
+import { attachInvoiceInfo, refIdsMatchingInvoiceQuery } from '../lib/einvoice.js';
 import { formatGateAccessNo, resolveGateLogId } from '../lib/gateAccessNo.js';
+import { buildSalesReconciliation } from '../lib/salesReconciliation.js';
 
 const router = express.Router();
 // 先驗員工 JWT；各路由再鎖 ops／DUTY／ADMIN
@@ -116,9 +117,21 @@ function txnStatusLabelWithInvoice(rawStatus, invoiceNumber) {
   return base;
 }
 
-function invoiceStatusMeta(rawStatus, invoiceNumber) {
+const EINVOICE_STATUS_LABEL = {
+  ISSUED: '已開立',
+  FAILED: '開立失敗（補開中）',
+  PENDING: '開立中',
+  VOIDED: '已作廢',
+  CANCELLED: '已取消',
+};
+
+/** einvoiceStatus＝EInvoice 彙總狀態（attachInvoiceInfo） */
+function invoiceStatusMeta(rawStatus, invoiceNumber, einvoiceStatus = null) {
   const s = String(rawStatus || '').toUpperCase();
   const inv = String(invoiceNumber || '').trim();
+  if (einvoiceStatus && EINVOICE_STATUS_LABEL[einvoiceStatus]) {
+    return { invoiceStatus: einvoiceStatus, invoiceStatusLabel: EINVOICE_STATUS_LABEL[einvoiceStatus] };
+  }
   if (inv) return { invoiceStatus: 'ISSUED', invoiceStatusLabel: '已開立' };
   if (s === 'PAID' || s === 'ACTIVE') {
     return { invoiceStatus: 'MISSING', invoiceStatusLabel: '未開票' };
@@ -439,13 +452,13 @@ router.get('/orders', requireOpsOrDuty, async (req, res) => {
         : statusRaw;
     const branchId = parseOptionalInt(req.query.branchId, 'branchId');
 
-    if (!isAdminUser(req.user) && branchId && req.user?.branchId && branchId !== req.user.branchId) {
+    if (branchId && !canAccessBranch(req.user, branchId)) {
       return res.status(403).json({ status: 'error', message: '⛔ 無權查詢其他分店交易' });
     }
 
-    const scopedBranchId = isAdminUser(req.user)
+    const scopedBranchId = isCrossBranchUser(req.user)
       ? branchId
-      : req.user?.branchId || -1;
+      : branchId || req.user?.branchId || -1;
 
     const dateWhere = createdAt ? { createdAt } : {};
     // 沖回後子單已 CANCELLED／REFUNDED 但 CHK 可能仍 PAID：先寬抓再依子單推導
@@ -454,7 +467,7 @@ router.get('/orders', requireOpsOrDuty, async (req, res) => {
       : {};
     const branchWhere = scopedBranchId ? { branchId: scopedBranchId } : {};
 
-    const [sessions, orphanOrders, orphanSales] = await Promise.all([
+    const [sessionsRaw, orphanOrdersRaw, orphanSalesRaw] = await Promise.all([
       prisma.checkoutSession.findMany({
         where: { ...dateWhere, ...statusWhere, ...branchWhere },
         include: {
@@ -463,14 +476,12 @@ router.get('/orders', requireOpsOrDuty, async (req, res) => {
         orderBy: { createdAt: 'desc' },
         take: 1000,
       }),
-      // Order 無 branchId：有分店篩選時略過無法歸戶的獨立訂單
-      scopedBranchId
-        ? Promise.resolve([])
-        : prisma.order.findMany({
+      prisma.order.findMany({
             where: {
               ...dateWhere,
               ...statusWhere,
               checkoutSessionId: null,
+              ...branchWhere,
             },
             include: {
               member: { select: { id: true, memberNo: true, name: true, phone: true } },
@@ -493,6 +504,11 @@ router.get('/orders', requireOpsOrDuty, async (req, res) => {
         orderBy: { createdAt: 'desc' },
         take: 1000,
       }),
+    ]);
+    const [sessions, orphanOrders, orphanSales] = await Promise.all([
+      attachInvoiceInfo(sessionsRaw, { bySession: true, sessionKey: null }),
+      attachInvoiceInfo(orphanOrdersRaw),
+      attachInvoiceInfo(orphanSalesRaw),
     ]);
 
     // 合併結帳：補商品明細
@@ -573,7 +589,7 @@ router.get('/orders', requireOpsOrDuty, async (req, res) => {
         ...(ptOrdersBySession.get(s.id) || []).map((o) => o.status),
       ];
       const effectiveStatus = deriveCheckoutTxnStatus(s.status, legStatuses);
-      const invoiceDisplay = formatCheckoutInvoiceDisplay(s.invoiceNumber);
+      const invoiceDisplay = s.invoiceNumber;
 
       return {
         orderId: s.id,
@@ -593,7 +609,7 @@ router.get('/orders', requireOpsOrDuty, async (req, res) => {
         status: effectiveStatus,
         txnStatus: txnStatusLabelWithInvoice(effectiveStatus, invoiceDisplay),
         invoiceNumber: invoiceDisplay,
-        ...invoiceStatusMeta(effectiveStatus, invoiceDisplay),
+        ...invoiceStatusMeta(effectiveStatus, invoiceDisplay, s.invoiceStatus),
         carrierNum: s.carrierNum,
         buyerUbn: s.buyerUbn,
         loveCode: s.loveCode,
@@ -658,7 +674,7 @@ router.get('/orders', requireOpsOrDuty, async (req, res) => {
         status: o.status,
         txnStatus: txnStatusLabelWithInvoice(o.status, o.invoiceNumber),
         invoiceNumber: o.invoiceNumber,
-        ...invoiceStatusMeta(o.status, o.invoiceNumber),
+        ...invoiceStatusMeta(o.status, o.invoiceNumber, o.invoiceStatus),
         carrierNum: o.carrierNum,
         buyerUbn: o.buyerUbn,
         loveCode: o.loveCode,
@@ -699,9 +715,9 @@ router.get('/orders', requireOpsOrDuty, async (req, res) => {
         periodTimes: s.periodTimes,
         recurringAmount: null,
         status: s.status,
-        txnStatus: txnStatusLabelWithInvoice(s.status, formatCheckoutInvoiceDisplay(s.invoiceNumber)),
-        invoiceNumber: formatCheckoutInvoiceDisplay(s.invoiceNumber),
-        ...invoiceStatusMeta(s.status, formatCheckoutInvoiceDisplay(s.invoiceNumber)),
+        txnStatus: txnStatusLabelWithInvoice(s.status, s.invoiceNumber),
+        invoiceNumber: s.invoiceNumber,
+        ...invoiceStatusMeta(s.status, s.invoiceNumber, s.invoiceStatus),
         carrierNum: s.carrierNum,
         buyerUbn: s.buyerUbn,
         loveCode: s.loveCode,
@@ -759,6 +775,7 @@ router.get('/topup', requireDutyOrAbove, async (req, res) => {
         ? null
         : statusRaw || 'PAID';
 
+    const invoiceRefIds = q ? await refIdsMatchingInvoiceQuery(q) : [];
     const where = {
       ...(createdAt ? { createdAt } : {}),
       ...(statusFilter ? { status: statusFilter } : {}),
@@ -771,8 +788,7 @@ router.get('/topup', requireDutyOrAbove, async (req, res) => {
                 OR: [
                   { id: { contains: q, mode: 'insensitive' } },
                   { itemDesc: { contains: q, mode: 'insensitive' } },
-                  { invoiceNumber: { contains: q, mode: 'insensitive' } },
-                  { carrierNum: { contains: q, mode: 'insensitive' } },
+                  ...(invoiceRefIds.length ? [{ id: { in: invoiceRefIds } }] : []),
                   { member: { name: { contains: q, mode: 'insensitive' } } },
                   { member: { phone: { contains: q } } },
                   { member: { memberNo: { contains: q, mode: 'insensitive' } } },
@@ -783,14 +799,16 @@ router.get('/topup', requireDutyOrAbove, async (req, res) => {
         : {}),
     };
 
-    const rows = await prisma.order.findMany({
-      where,
-      include: {
-        member: { select: { id: true, memberNo: true, name: true, phone: true } },
-      },
-      orderBy: { createdAt: 'desc' },
-      take: 1000,
-    });
+    const rows = await attachInvoiceInfo(
+      await prisma.order.findMany({
+        where,
+        include: {
+          member: { select: { id: true, memberNo: true, name: true, phone: true } },
+        },
+        orderBy: { createdAt: 'desc' },
+        take: 1000,
+      }),
+    );
 
     const orderIds = rows.map((o) => o.id);
     const subs = orderIds.length
@@ -835,7 +853,7 @@ router.get('/topup', requireDutyOrAbove, async (req, res) => {
         subscriptionStatus: subStatus,
         recurringStopped,
         invoiceNumber: o.invoiceNumber,
-        ...invoiceStatusMeta(o.status, o.invoiceNumber),
+        ...invoiceStatusMeta(o.status, o.invoiceNumber, o.invoiceStatus),
         carrierNum: o.carrierNum,
         buyerUbn: o.buyerUbn,
         loveCode: o.loveCode,
@@ -951,14 +969,15 @@ router.get('/sales', requireDutyOrAbove, async (req, res) => {
         ? null
         : statusRaw;
 
-    if (!isAdminUser(req.user) && branchId && req.user?.branchId && branchId !== req.user.branchId) {
+    if (branchId && !canAccessBranch(req.user, branchId)) {
       return res.status(403).json({ status: 'error', message: '⛔ 無權查詢其他分店銷售' });
     }
 
-    const scopedBranchId = isAdminUser(req.user)
+    const scopedBranchId = isCrossBranchUser(req.user)
       ? branchId
-      : req.user?.branchId || -1;
+      : branchId || req.user?.branchId || -1;
 
+    const invoiceRefIds = q ? await refIdsMatchingInvoiceQuery(q) : [];
     const where = {
       status: statusFilter
         ? statusFilter
@@ -970,8 +989,9 @@ router.get('/sales', requireDutyOrAbove, async (req, res) => {
             OR: [
               { id: { contains: q, mode: 'insensitive' } },
               { itemDesc: { contains: q, mode: 'insensitive' } },
-              { invoiceNumber: { contains: q, mode: 'insensitive' } },
-              { carrierNum: { contains: q, mode: 'insensitive' } },
+              ...(invoiceRefIds.length
+                ? [{ id: { in: invoiceRefIds } }, { checkoutSessionId: { in: invoiceRefIds } }]
+                : []),
               { voucherCode: { contains: q, mode: 'insensitive' } },
               { member: { name: { contains: q, mode: 'insensitive' } } },
               { member: { phone: { contains: q } } },
@@ -982,24 +1002,28 @@ router.get('/sales', requireDutyOrAbove, async (req, res) => {
         : {}),
     };
 
-    const rows = await prisma.saleOrder.findMany({
-      where,
-      include: {
-        branch: { select: { id: true, name: true, code: true } },
-        member: { select: { id: true, memberNo: true, name: true, phone: true } },
-        items: {
-          select: {
-            productId: true,
-            name: true,
-            unitPrice: true,
-            qty: true,
-            lineTotal: true,
+    const rows = await attachInvoiceInfo(
+      await prisma.saleOrder.findMany({
+        where,
+        include: {
+          branch: { select: { id: true, name: true, code: true } },
+          legalEntity: { select: { id: true, code: true, name: true, ubn: true } },
+          member: { select: { id: true, memberNo: true, name: true, phone: true } },
+          items: {
+            select: {
+              productId: true,
+              name: true,
+              unitPrice: true,
+              qty: true,
+              lineTotal: true,
+              taxType: true,
+            },
           },
         },
-      },
-      orderBy: { createdAt: 'desc' },
-      take: 1000,
-    });
+        orderBy: { createdAt: 'desc' },
+        take: 1000,
+      }),
+    );
 
     const data = rows.map((s) => ({
       saleId: s.id,
@@ -1015,7 +1039,9 @@ router.get('/sales', requireDutyOrAbove, async (req, res) => {
       voucherCode: s.voucherCode,
       status: s.status,
       txnStatus: txnStatusLabel(s.status),
+      legalEntity: s.legalEntity,
       invoiceNumber: s.invoiceNumber,
+      ...invoiceStatusMeta(s.status, s.invoiceNumber, s.invoiceStatus),
       carrierNum: s.carrierNum,
       buyerUbn: s.buyerUbn,
       loveCode: s.loveCode,
@@ -1043,6 +1069,29 @@ router.get('/sales', requireDutyOrAbove, async (req, res) => {
     }
     console.error(error);
     res.status(500).json({ status: 'error', message: '讀取商品銷售報表失敗' });
+  }
+});
+
+// GET /api/hq/reports/sales-reconciliation?from=YYYY-MM-DD&to=YYYY-MM-DD&branchId=&includeCancelled=0|1
+// 門市銷貨對帳（會計師沖帳用）：明細未稅／稅額依發票分攤；Excel／CSV 由前端依 columns 組檔
+router.get('/sales-reconciliation', requireAdmin, async (req, res) => {
+  try {
+    if (!req.query.from || !req.query.to) {
+      return res.status(400).json({ status: 'error', code: 'DATE_REQUIRED', message: '請指定日期區間（from、to）' });
+    }
+    const data = await buildSalesReconciliation({
+      from: String(req.query.from),
+      to: String(req.query.to),
+      branchId: parseOptionalInt(req.query.branchId, 'branchId'),
+      includeCancelled: req.query.includeCancelled !== '0',
+    });
+    res.json({ status: 'success', message: 'OK', data });
+  } catch (error) {
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({ status: 'error', code: error.code, message: error.message });
+    }
+    console.error(error);
+    res.status(500).json({ status: 'error', message: '讀取銷貨對帳報表失敗' });
   }
 });
 
@@ -1113,9 +1162,7 @@ function explodePtCheckoutLines(session, { trainerName = null, branchName = null
       payBreakdown: session.payBreakdown,
       status: matchedOrder?.status || session.status,
       txnStatus: txnStatusLabel(matchedOrder?.status || session.status),
-      invoiceNumber:
-        matchedOrder?.invoiceNumber ||
-        formatCheckoutInvoiceDisplay(session.invoiceNumber),
+      invoiceNumber: matchedOrder?.invoiceNumber || session.invoiceNumber || null,
       carrierNum: session.carrierNum,
       buyerUbn: session.buyerUbn,
       loveCode: session.loveCode,
@@ -1148,7 +1195,7 @@ function rowFromOrphanPtOrder(order) {
     checkoutId: null,
     orderId: order.id,
     createdAt: order.createdAt,
-    branchId: null,
+    branchId: order.branchId ?? null,
     branchName: null,
     ...memberPick(order.member),
     trainerId: null,
@@ -1214,13 +1261,13 @@ router.get('/course-purchases', requireDutyOrAbove, async (req, res) => {
         ? null
         : statusRaw;
 
-    if (!isAdminUser(req.user) && branchId && req.user?.branchId && branchId !== req.user.branchId) {
+    if (branchId && !canAccessBranch(req.user, branchId)) {
       return res.status(403).json({ status: 'error', message: '⛔ 無權查詢其他分店課程購買' });
     }
 
-    const scopedBranchId = isAdminUser(req.user)
+    const scopedBranchId = isCrossBranchUser(req.user)
       ? branchId
-      : req.user?.branchId || -1;
+      : branchId || req.user?.branchId || -1;
 
     const dateWhere = createdAt ? { createdAt } : {};
     // 列狀態以私教 Order 為準；CHK 可能仍 PAID／僅 CANCELLED，故寬抓後再過濾
@@ -1237,7 +1284,7 @@ router.get('/course-purchases', requireDutyOrAbove, async (req, res) => {
       ? { status: statusFilter }
       : { status: { in: ['PAID', 'CANCELLED', 'REFUNDED'] } };
 
-    const [sessions, orphanOrders] = await Promise.all([
+    const [sessionsRaw, orphanOrdersRaw] = await Promise.all([
       prisma.checkoutSession.findMany({
         where: {
           ...dateWhere,
@@ -1252,8 +1299,8 @@ router.get('/course-purchases', requireDutyOrAbove, async (req, res) => {
         orderBy: { createdAt: 'desc' },
         take: 1000,
       }),
-      // 獨立私教 Order 無分店欄：有分店／教練篩選時略過
-      scopedBranchId || trainerId
+      // 獨立私教 Order 無教練欄：有教練篩選時略過
+      trainerId
         ? Promise.resolve([])
         : prisma.order.findMany({
             where: {
@@ -1261,6 +1308,7 @@ router.get('/course-purchases', requireDutyOrAbove, async (req, res) => {
               ...orphanStatusWhere,
               checkoutSessionId: null,
               itemDesc: { contains: '私教' },
+              ...branchWhere,
             },
             include: {
               member: { select: { id: true, memberNo: true, name: true, phone: true } },
@@ -1268,6 +1316,10 @@ router.get('/course-purchases', requireDutyOrAbove, async (req, res) => {
             orderBy: { createdAt: 'desc' },
             take: 500,
           }),
+    ]);
+    const [sessions, orphanOrders] = await Promise.all([
+      attachInvoiceInfo(sessionsRaw, { bySession: true, sessionKey: null }),
+      attachInvoiceInfo(orphanOrdersRaw),
     ]);
 
     const trainerIds = [
@@ -1284,7 +1336,7 @@ router.get('/course-purchases', requireDutyOrAbove, async (req, res) => {
 
     const sessionIds = sessions.map((s) => s.id);
     const ptOrders = sessionIds.length
-      ? await prisma.order.findMany({
+      ? await attachInvoiceInfo(await prisma.order.findMany({
           where: {
             checkoutSessionId: { in: sessionIds },
             itemDesc: { contains: '私教' },
@@ -1295,11 +1347,10 @@ router.get('/course-purchases', requireDutyOrAbove, async (req, res) => {
             amount: true,
             itemDesc: true,
             status: true,
-            invoiceNumber: true,
             createdAt: true,
           },
           orderBy: { createdAt: 'asc' },
-        })
+        }))
       : [];
     const ptOrdersBySession = new Map();
     for (const o of ptOrders) {
@@ -2078,15 +2129,9 @@ router.get('/group-class-crm', requireOpsOrDuty, async (req, res) => {
             id: true,
             status: true,
             memberId: true,
+            makeupCreditId: true,
             classLeave: { select: { id: true, status: true, withinPolicy: true } },
             attendance: { select: { id: true, checkedInAt: true } },
-          },
-        },
-        makeupSlots: {
-          select: {
-            id: true,
-            capacity: true,
-            _count: { select: { registrations: true } },
           },
         },
       },
@@ -2095,14 +2140,10 @@ router.get('/group-class-crm', requireOpsOrDuty, async (req, res) => {
     });
 
     const rows = classes.map((c) => {
-      const booked = c.reservations.filter((r) =>
-        ['PENDING', 'CONFIRMED', 'ATTENDED', 'NO_SHOW'].includes(String(r.status || '').toUpperCase()) ||
-        r.status,
-      );
       const reserved = c.reservations.length;
       const attended = c.reservations.filter((r) => r.attendance).length;
       const left = c.reservations.filter((r) => r.classLeave).length;
-      const makeupReg = c.makeupSlots.reduce((s, m) => s + (m._count?.registrations || 0), 0);
+      const makeupReg = c.reservations.filter((r) => r.makeupCreditId && r.status !== 'CANCELLED').length;
       const attendanceRate = reserved > 0 ? Math.round((attended / reserved) * 1000) / 10 : 0;
       const leaveRate = reserved > 0 ? Math.round((left / reserved) * 1000) / 10 : 0;
       return {

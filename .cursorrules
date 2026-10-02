@@ -20,6 +20,7 @@
 ```bash
 npm run dev:api   # backend → :8000
 npm run dev:web   # frontend → Vite（proxy /api、/ws → 後端）
+cd backend && npm test   # node:test；只連本機 <db>_test（自動重建），禁止連開發庫／Neon
 ```
 
 機密只在 `backend/.env`。`FRONTEND_URL` 與 `API_PUBLIC_URL`／`BASE_URL` **必須不同網域／埠**。根目錄禁止復活 `app.js`、`routes/`、`public/*.html`、`prisma/`。
@@ -43,13 +44,29 @@ npm run dev:web   # frontend → Vite（proxy /api、/ws → 後端）
    * 儲值、購課、POS 購物**嚴禁自填金額與堂數**，一律由後端查驗 `promotionId`、`coursePlanId`、`productId`。
 
 4. **Token 分倉管理**：
-   * 會員 JWT（內嵌 `deviceId`、`dav`）與員工 JWT（內嵌 `staffId`、`role`、`branchId`）密鑰與 Storage Key 物理分離，嚴禁混用或越權呼叫。
+ * 會員 JWT（內嵌 `deviceId`、`dav`）與員工 JWT（內嵌 `staffId`、`role`、`branchId`）密鑰與 Storage Key 物理分離，嚴禁混用或越權呼叫。
+ * 員工職位：`STAFF`（場務）／`TRAINER`（教練）< `DUTY` < `STORE_MANAGER`（相容 `MANAGER`）< `FM`／`GM` < `ADMIN`。`GM`／`FM` 可跨店但**不得**進 `/api/hq` 總部主控台（仍限 `ADMIN`）；`DUTY+` 判斷一律走 `roleRank`，禁止字串硬比對。
+ * 組織架構（分店類型、隸屬 `parentId`、部門 場務／教練、職位、教練等級 `GOLD`／`SILVER`）唯一定義於 `backend/lib/orgStructure.js`，前端 `frontend/src/lib/orgStructure.ts` 為鏡像；職位須符合分店類型由後端強制，前端僅做提示。
+ * 分店類型：`GYM` 健身房（店長＋場務／教練）；`CLASS` 教室**必須隸屬一間 GYM**，由上層店長督導、上層員工支援，**禁止**直接綁員工；`ACADEMY` 學院由 FM 督導、僅教練部。非跨店員工可操作之分店＝本店＋啟用中隸屬分店（登入時寫入員工 JWT `branchIds`；階層變更須重新登入生效）。
+ * 勞動條件（工作型態 正職／兼職／實習、到職日、年資、特休、國休）計算唯一定義於 `backend/lib/laborLaw.js`（勞基法 §37／§38、部分工時按週工時比例）；前端 `frontend/src/lib/laborLaw.ts` 僅顯示用，**禁止**前端自算額度或自填已用天數。特休／國休扣抵必須經後端額度檢查。
+ * **場務排班（四週變形工時，勞基法 §30-1）**：規則與自動排班唯一定義於 `backend/lib/shiftRoster.js`（服務層 `rosterService.js`）。每店以固定起算日切 28 日週期；早班／晚班場務人力**各至少 2 人**（`MIN_SHIFT_HEADCOUNT`，後端強制）。編制＝場務（STAFF／DUTY）＋**實習教練**（TRAINER＋INTERN）；**轉正教練不列編制**，改走「週班表」（見下）。必須檢查：日正常工時 ≤10h、四週 ≤160h、每 14 日 ≥2 例假、四週休息 ≥8 日、輪班間隔 ≥11h（§34，晚班接次日早班違規）、人力缺額；**有 ERROR 禁止發布**，已發布須撤回（附原因）才可改。前端只顯示後端檢查結果，禁止自算合規。排班管理 API `/api/staff/roster` 限 **`STORE_MANAGER` 以上**（`roleRank` 判斷）；非跨店職位僅能操作 JWT `branchIds` 內分店（依排班期反查分店後檢查），`DUTY` 以下禁止。**排假申請**：編制員工經 `PUT /api/staff/hr/off-requests` 為本期／下一期指定希望休假日（上限＝28 − 約定班數，正職 8 日；身分取自 JWT，禁止代他人遞交），店長於排班面板收件；自動排班必須避開申請日並優先標為例假／休息日，僅人力不足時才排入並列 WARNING；**每期開始前 14 日截止**（`OFF_REQUEST_DEADLINE_DAYS`，含當日，發布後亦截止）。**班表確認**：發布後員工須於 **72 小時（3 日）內**經 `POST /api/staff/hr/roster-ack` 確認或提出異議（異議必附說明）；回覆綁發布版本，撤回重發須重新確認；**逾期未回覆自動視為同意**（後端排程補寫 `CONFIRMED`＋`autoConfirmed=true`，不得覆寫已回覆者）；自動同意後員工仍可提出異議（標記逾期），由店長撤回調整。**總部班表總覽**（`/api/hq/hr/schedules`，ADMIN）僅唯讀彙整；四週排班之班次**禁止**經此修改或刪除（409 `ROSTER_MANAGED`），總部臨時指派**禁止**用於場務／實習教練（409 `USE_ROSTER`）、轉正教練（409 `USE_COACH_PLAN`）、店長／GM／FM（409 `USE_WEEK_PLAN`）與 ADMIN（409 `SCHEDULE_EXEMPT`），現已無適用對象（前端不提供新增，既有臨時班次僅可改／刪）。
+ * **教練僱傭關係（勞基法／勞動部從屬性認定）**：教練一律為受僱員工（`laborActApplies` 強制 true，實習教練亦同），**禁止**承攬式「僅付上課鐘點」或以業績抵底薪。
+   * **週班表（轉正教練＋店長／GM／FM）**：規則唯一定義於 `backend/lib/coachSchedule.js`（對象 `weekPlanRoleOf`：非實習 TRAINER＝`COACH`、STORE_MANAGER／GM／FM＝`MANAGER`；服務層 `coachScheduleService.js`）。本人經 `/api/staff/hr/week-plans`（舊別名 `coach-plans`）按週（週一起）提報出勤時段＋指定 1 例假＋1 休息日 → 送審 → 審核者於 `/api/staff/week-plans` 核准／退回（附原因）／撤回核准（附原因）。**審核鏈（後端 `canReviewWeekPlan` 強制）**：教練 → **FM** 或督導該分店之**店長**（JWT `branchIds`，ADMIN 可代審）；店長／GM／FM → **僅 ADMIN**；**GM 無審核權**、不得審本人（403 `WEEK_PLAN_REVIEW_FORBIDDEN`）。**ADMIN 免排班**。出勤分店：教練＝本店＋授課分店、店長＝本店＋啟用中隸屬分店、GM／FM＝任一啟用分店或不指定（總部）。**僅核准班表生效**（值勤判定、考勤、薪資、教練可預約時段）；核准／撤回須即時清值勤快取。必須檢查：日正常工時 ≤8h、週 ≤40h（§30）、連續 4h 須休 30 分（§35，間隔 <30 分視為連續、自動扣除）、每 7 日 1 例假＋1 休息日且最多連續 6 日（§36）、工作日間隔 ≥11h（§34）、不得與已核准請假或已排課程衝突；**有 ERROR 禁止送審與核准**，不得審核本人班表，送審中／已核准不可自改。
+   * **可預約時段＝已核准出勤 − 已核准請假 − 不開放預約時段**：所有開課／約課／改期（私教、團課、諮詢）一律經 `assertTrainerBookable`，未綁在職員工 409 `COACH_NOT_EMPLOYED`、班表外 409 `OUTSIDE_WORK_SCHEDULE`、請假中 409 `COACH_ON_LEAVE`。`TrainerTimeOff` 僅為工時內「不開放預約」（行政／備課／外出公務），**禁止**用於休假（休假走請假或週班表例假／休息日，400 `USE_LEAVE`）。
+   * **底薪與業績獎金**：底薪只在薪資設定（正職須月薪制且 ≥ 基本工資、兼職時薪 ≥ 基本時薪，400 `COACH_BASE_PAY`），**不因業績扣減**；業績獎金唯一定義於 `backend/lib/coachPerformance.js`（私教執行堂數 × 合約單堂價 × 階梯比例、授課獎金、團課人頭獎金），規則經 `PUT /api/hq/coach/commission-rules` 維護，**禁止**含底薪（400 `BASE_SALARY_IN_PAYROLL`）、扣除費率或鐘點制（400 `NON_EMPLOYMENT_TERMS`）。獎金由薪資批次自動計入工資（`PERF_*` 明細），計入加班費基數；投保薪資低於（底薪＋津貼＋獎金）須警示。
+ * **員工通知與 LINE 推播**：排班發布／撤回／異議／確認提醒／逾期自動同意、排假遞交／截止、請假申請／審核／假期衝突，一律由後端事件寫入 `StaffNotification`（站內通知匣）後推播；員工本人於「我的出勤」以 LINE Login 自願綁定（`/api/staff/notifications`），LINE **僅作推播收件，禁止用於員工登入**；推播文案**禁止**含請假事由等敏感資料；通知失敗不得影響主流程。
+ * **工資核算匯出**：`GET /api/hq/hr/payroll-export`（ADMIN）由後端彙整月度考勤標記／總數與假別時數（不計薪資金額、每次留 `PayrollExportLog`）；CSV 由前端依後端 `columns`／`rows` 組檔（BOM、防公式注入），**禁止**前端自算考勤或工時。
+ * **薪資系統**（`/api/hq/payroll`，ADMIN）：金額計算唯一定義於 `backend/lib/payrollRules.js`（服務層 `payrollService.js`，考勤事實與工資匯出共用 `collectPayrollFacts`），**禁止**前端計算或回填任何金額。每月一批、僅有薪資設定者出單；月薪制請假依假別給付比例扣薪、遲到早退／曠職按時薪比例扣（**禁止罰款**）；加班（延後下班、休息日、國定假日、例假）由系統列建議，**必須經總部逐筆核定才計入**（核定 ≤ 建議），倍率依 §24／§39／§40；勞健保／勞退依投保薪資與可調費率計算、所得稅以手動項輸入；加班費時薪基數＝（月薪＋固定津貼＋業績獎金）÷240（時薪制＝時薪＋其他經常性給與÷正常工時）；教練業績獎金由後端依生效規則自動帶入（底薪以薪資設定為準，禁止重複）。結算必須：月份已結束、加班全數核定、無未打下班卡／上班中、有出勤員工皆已設定薪資（409 `PAYROLL_UNREVIEWED`／`PAYROLL_ATTENDANCE_REVIEW`／`PAYROLL_BLOCKED`）；結算後唯讀，撤銷須附原因並留紀錄。員工僅能經 `/api/staff/hr/payslips` 查看**本人已結算**薪資單；結算／撤銷通知**禁止**含金額。
+ * **班表值勤判定（登入即辨識）**：規則唯一定義於 `backend/lib/attendanceService.js`（`resolveDutyStatus`）。除 `ADMIN` 外**所有員工（含店長／FM／GM）**皆須有已生效班表才算值勤；值勤＝已打上班卡（未逾時），或現在落在已生效出勤班次之**值勤窗（班次開始前 30 分 ～ 班次結束，`DUTY_EARLY_MINUTES`）**且無核准請假、班次分店在 JWT 可操作範圍內。店長／GM／FM 之班表來源為本人提報、ADMIN 核准之週班表。員工登入（`POST /api/admin/login`）回傳 `duty`；非值勤仍可登入，但業務 API 一律由全域海關 `middleware/staffDutyGate.js` 擋下 **403 `OFF_DUTY`**（白名單僅 `/api/admin/login`、`/api/admin/me`、`/api/staff/hr`、`/api/staff/notifications` 與非員工路由），**禁止**僅靠前端隱藏選單。前端只顯示後端 `duty`（`GET /api/staff/hr/duty-status`），禁止自算值勤。
+ * **考勤／請假**：規則唯一定義於後端 `attendanceService.js`／`staffLeaveService.js`。打卡身分取自員工 JWT，交易內鎖員工列防雙開卡；**自助上班打卡（非 ADMIN）必須落在值勤窗**，打卡綁定該班次（`StaffAttendance.scheduleId`）與班次分店，班外 409 `NOT_ON_DUTY`、請假中 409 `ON_LEAVE`、班次分店不在權限 409 `BRANCH_NOT_SCHEDULED`，班外出勤一律由總部補登（可綁班次）；下班打卡不受值勤窗限制（延後下班照實記錄，加班另經核定）。遲到／早退／曠職由後端比對**已生效班表**（不含草稿）計算（已綁班次者直接歸屬，同班次多段僅首段判遲到、末段判早退），前端禁止自算。總部補登／更正、拒絕／撤銷請假**必填原因並留經辦人**，禁止刪除打卡紀錄；請假狀態機 待審 → 核准／拒絕、已核准 → 撤銷（額度回補），重疊請假拒絕。員工自助打卡與請假在「我的出勤」（所有員工），不在 HQ。
 
 5. **強制回流路由**：
    * `/auth/callback`：LINE OAuth 2.0 / 臨時 Auth Code 回流（URL 嚴禁帶明文 JWT）。
    * `/pay/return`：PayUNi / 線上金流完成後之瀏覽器回流頁面。
 
 6. **瀏覽器回流 ≠ 託管 UI**：後端僅允許對 `FRONTEND_URL` 做 OAuth／金流 `302`；業務結果一律 JSON。
+
+7. **交易內禁止外部 I/O 與第二連線**：`prisma.$transaction` 持有列鎖期間，**嚴禁**等待任何外部網路 I/O（ezPay、LINE Pay、PayUNi、乙禾、Face8、R2/S3、LINE 推播），亦**嚴禁**呼叫使用根 `prisma` 的 helper（佔第二條連線，Neon 連線池小易枯竭／自鎖）；helper 需在交易內使用時必須接受 `db`／`tx` 參數並由呼叫端傳入。外部呼叫一律「交易提交後」執行（Saga／`afterCommit` 佇列），失敗以狀態欄＋重試補償，**禁止**回滾已提交之收款或扣帳。
 
 ---
 
@@ -83,6 +100,7 @@ npm run dev:web   # frontend → Vite（proxy /api、/ws → 後端）
 2. **Face8 (GOAT API) 特徵比對**：
    * 嚴格檢查 `member.allowBiometrics`；未簽署同意書者嚴禁調用人臉特徵比對 API。
    * 採用 `multipart/form-data` 與原生 Blob 傳輸影像，表單參數攜帶對應之 `access_token` 與 `env_token`。
+ * **員工人臉**：須由員工本人親簽**電子**生物辨識同意書（`StaffConsentSignature`，綁條文 SHA-256 版本；條文升版須重簽，嚴禁以勾選代替簽名）才可註冊，且必須使用獨立群組 `PAPAGO_STAFF_GROUP_ID`（externalId `STAFF-{id}`），**嚴禁**混入會員群組；撤回同意或刪照片必須同步刪除 Face8 特徵。員工照片與證件同走私有儲存，嚴禁公開 URL。
 
 3. **閘機配對持久化**：
    * 閘機依「裝置代碼 (`deviceCode`) ＋ 密鑰 (`deviceKey`)」綁定門市，持久化於 `localStorage`（`gymsaas_gate_pair`），連線暫時中斷不清除配對。
@@ -98,7 +116,9 @@ npm run dev:web   # frontend → Vite（proxy /api、/ws → 後端）
 5. **出場結算、尾隨異常攔截與雙錢包扣款（跨夜灰姑娘條款）**：
    * **尾隨／無進場快照出場攔截**：出場刷卡時若查無該會員狀態為 `ACTIVE` 的 `CheckInLog`（尾隨進場或重複刷出），**閘機嚴禁開門並拋出 409 `NO_ACTIVE_CHECKIN`**，同時透過 WebSocket (`/ws/gate-alert`) 即時推播櫃檯螢幕標記「異常滯留」，強制現場工作人員介入查驗。
    * **雙錢包出場結算**：出場計算（1.3 元/分）**100% 依據 `CheckInLog.billingMode` 快照**，禁止依賴會員當前方案。交易內先 `FOR UPDATE` 鎖 `Member` 與 ACTIVE `CheckInLog`。
-   * **扣款順序**：一律優先扣除 `bonusWallet`（運動金／SC），不足部分才自 `cashWallet`（現金）扣抵；必須用 SQL 條件式遞減（`WHERE balance >= deduct`），禁止 Node 算好餘額後覆寫；DB `CHECK (cashWallet/bonusWallet >= 0)`。若總額不足：在場紀錄仍結算、回傳 `gateOpen=false`／`feeDetails.shortfall`，閘機不開門。
+   * **扣款順序**：一律優先扣除 `bonusWallet`（運動金／SC），不足部分才自 `cashWallet`（現金）扣抵（`mutateMemberWallet` `WATERFALL_DEDUCT`，僅限門禁出場）；DB `CHECK (cashWallet/bonusWallet >= 0)`。實扣拆分寫入 `CheckInLog.deductedBonus`／`deductedCash`。
+   * **餘額不足（`cashWallet + bonusWallet < 出場費`）**：**禁止部分扣款**；不扣任何款項、在場紀錄維持 ACTIVE（不寫 `checkOutAt`），差額寫 `CheckInLog.shortfallAmt`，回 `gateOpen=false`／`settled=false`／`feeDetails.shortfall`，經 `/ws/gate-alert` 推播 `EXIT_SHORTFALL`；會員補儲值後再刷出時依當下時長一次全額扣款、寫流水並歸零 `shortfallAmt`。
+   * **進出場紀錄取消退費**：依 `CheckInLog.deductedBonus`／`deductedCash`（其次該筆 `GATE_CHECKOUT` 流水）原路分別退回運動金／本金，**禁止**把運動金退成本金；兩者皆無之舊紀錄才全額退本金。
 
 6. **警示帳號（`isAlert`）處置**：
    * 警示帳號門禁動態 QR 強制失效；解除警示僅限總部 `DUTY+` 經由合規補償 API 填寫必填 `reason`，一般櫃檯無權解鎖。
@@ -109,14 +129,25 @@ npm run dev:web   # frontend → Vite（proxy /api、/ws → 後端）
 
 1. **多軌混合支付標準**：
    * **線上儲值／購案**：直串 LINE Pay V3（Request 產生 `paymentUrl`，回呼 Confirm 驗證請款後入帳雙錢包）。
-   * **現場實體刷卡**：採用 **YiPay（乙禾／凱基銀行固定式 EDC）**。API `payMethod`／`payments` 使用 **`YIPAY`**（勿與線上 PayUNi `CARD` 混淆）。端末交易成功後取得 `authCode`、`cardLast4`、`rrn`，先寫 **`YipayTerminalCapture` 暫存**（`POST /ops/yipay/captures`），再由前端呼叫 `opsConfirmYipay` 完成認列；日結對帳 `GET /ops/yipay/reconcile`。
+   * **現場實體刷卡**：採用 **YiPay（乙禾／凱基銀行固定式 EDC）**。API `payMethod`／`payments` 使用 **`YIPAY`**（勿與線上 PayUNi `CARD` 混淆）。端末交易成功後取得 `authCode`、`cardLast4`、`rrn`，先寫 **`YipayTerminalCapture` 暫存**（`POST /ops/yipay/captures`），再由前端呼叫 `opsConfirmYipay` 完成認列；日結對帳 `GET /ops/yipay/reconcile`。同一 RRN 收款暫存與退刷各僅能認列一次（DB partial unique，衝突 409 `YIPAY_RRN_DUPLICATE`）。
    * **臨櫃 LinePay**：掃碼槍讀取會員手機付款條碼，傳送 `linePayOneTimeKey` 直打後端請款，不轉跳外部網址。
    * **定期定額月卡**：臨櫃以乙禾刷首期確認，隨即建立 PayUNi 定期定額（臨櫃 $1 授權驗證後取消不請款），次期起由排程自動扣繳（`PeriodAmt` 原價）。
+   * **雙錢包原子異動與流水鐵律（Zero Orphan Balance Mutation）**：全系統任何 `Member.cashWallet`／`Member.bonusWallet` 增減（儲值入帳、零錢包付款／回補、閘機出場扣款、退費扣回／退回、中止回補、團課退費、總部補償、禮物卡兌換）**一律**經 `backend/lib/walletMutation.js` 之 `mutateMemberWallet(tx, …)`。**禁止在 walletMutation.js 以外的任何檔案直接對 Member.cashWallet 或 Member.bonusWallet 進行寫入操作**（含 `prisma.member.update`、`increment`／`decrement`、raw SQL；僅 `prisma/seed.js` 示範資料例外）。模式僅四種：`WATERFALL_DEDUCT`（限門禁出場，先運動金後本金）、`CASH_ONLY_DEDUCT`（POS／合併結帳／購案零錢包付款，**禁止**動用運動金）、`EXACT_BUCKETS_DEDUCT`（儲值取消／退費回收／中止沖回，兩錢包各自定額，任一不足 409 `WALLET_INSUFFICIENT_FOR_VOID`）、`CREDIT_BUCKETS`（入帳，`cashDelta`／`bonusDelta` ≥ 0）。Helper 必須在 `prisma.$transaction` 內：`SELECT … FOR UPDATE` 鎖會員列 → 條件式 `UPDATE … WHERE ROUND(錢包,2) >= 扣額 RETURNING`（金額 JS 與 SQL 皆 `ROUND(…,2)`，禁止 Node 覆寫餘額）→ 同交易寫 `WalletLedger`（`reasonCode`＝異動類別、兩錢包 Before／Delta／After、`reason`、`staffId`、`branchId`、`refType`／`refId`），DB `CHECK` 保證 Before＋Delta＝After（容差 < 0.005）且 After ≥ 0；`WalletLedger` append-only。`npm run wallet:audit` 驗每位會員流水連續（前筆 After＝後筆 Before）且末筆 After＝目前餘額，部署後與定期必跑。
+   * **計時儲值禁止零錢包付款**：計時儲值方案（非 `UNLIMITED`）入帳本金＋贈送運動金，以零錢包支付等於循環套取運動金；臨櫃儲值與合併結帳含計時儲值時帶 `WALLET_CASH` 一律 400 `TOPUP_NO_WALLET`（後端強制，前端同步擋）。
+   * **待付款失敗退回**：LINE Pay 扣款失敗與待付款作廢一律經 `restoreHeldCashWallet`（`POS_PENDING_ABORT_RESTORE`），金額＝同單 `WALLET_PAY` 流水扣除已退回之淨額（冪等，重複呼叫不重退）；僅條件式搶占 `PENDING → CANCELLED` 成功者可退回。PayUNi 失敗 Notify 不作廢（顧客可重試付款）、乙禾無失敗回呼，放棄之單一律走待付款作廢。
+   * **待付款作廢**：乙禾／PayUNi 未完成付款之臨櫃單（`CHK…`／`SAL…`／儲值單）由 `DUTY+` 經 `POST /api/ops/pending-payments/:id/cancel { reason, checked }` 作廢（必勾「已確認端末／金流未扣款」409 `PAYMENT_CHECK_REQUIRED`；端末已有刷卡暫存 409 `YIPAY_CAPTURED`；合併結帳子單須以 CHK 作廢 409 `USE_CHECKOUT_CANCEL`；團課 GRP 由排程釋出 409 `USE_GROUP_HOLD`），預扣零錢包依流水淨額回補、未開立發票改 `CANCELLED`、釋放團課保留並寫 `TransactionAuditLog`。
 
-2. **ezPay 自動分腿發票（Soft-Split）**：
-   * POS 合併結帳交易，後端必須依科目自動拆分子單（零售商品 `SAL...`、會籍購案 `TYK...`／訂閱 `CRS...`、私教合約），分別向 ezPay 開立獨立電子發票。
-   * **非同步補開（防漏稅）**：任一腿 `issueInvoice` 失敗時寫入 `InvoiceIssueJob`（`refId`＋`leg`，`status=FAILED`），**禁止因開票失敗沖回已收款**（現金／乙禾／LinePay／PayUNi）；API 回 **`PARTIAL_INVOICE`**。佇列自動重試；後台 `GET/POST /ops/invoice-jobs…/retry` 可手動補開。
-   * 部分退費折讓：**嚴禁直接作廢整筆合併發票**。必須針對特定子單據開立 ezPay 折讓單，嚴格維持發票對帳完整性。
+2. **多營業人（獨立統編）**：每個營業人 `LegalEntity`＝一個統編＝一個 ezPay 商店；分店必綁一個營業人（`Branch.legalEntityId`）。**發票由提供服務／出貨之分店營業人開立**（`Order.branchId`／`SaleOrder.branchId` 決定），採購、驗收、應付、付款亦依營業人分帳。ezPay HashKey／HashIV **只放後端 env**（`EZPAY_{代碼}_HASH_KEY`／`_HASH_IV`，可選 `_MERCHANT_ID`／`_INVOICE_URL`），**嚴禁**寫入 DB 或出現在 API 回應（HQ 只看「是否齊備＋缺漏變數名」）。已開過發票之營業人禁改代碼／統編（409 `LEGAL_ENTITY_LOCKED`）；分店有庫存時禁改營業人（409 `BRANCH_HAS_STOCK`）。
+
+3. **ezPay 自動分腿發票（Soft-Split）**：
+ * 唯一出口 `backend/lib/einvoice.js`（`EInvoice`／`EInvoiceItem`／`InvoiceRequest`，已取代 `InvoiceIssueJob` 與訂單上舊發票欄位）；**禁止**任何路由直接呼叫 ezPay 開票。
+ * 支援 B2C（手機條碼／自然人憑證／ezPay 載具、捐贈碼、紙本）與 B2B（統編三聯式，未稅＋稅額拆列）；應稅／零稅率／免稅分張開立。買受人資料只存 `InvoiceRequest`（合併結帳子單沿用 CHK 之請求）。
+ * POS 合併結帳交易，後端必須依科目自動拆分子單（零售商品 `SAL...`、會籍購案 `TYK...`／訂閱 `CRS...`、私教合約、團課報名 `GRP...`），分別向 ezPay 開立獨立電子發票。
+ * **ezPay 協定**：每次呼叫依營業人帶 MerchantID＋金鑰（AES-256-CBC、32-byte PKCS7）；開立回應**必須**驗 `CheckCode`；重試前**必須**先 `invoice_search` 查自訂編號防重複開票；每次呼叫寫 `EInvoiceLog`（**禁止**含金鑰／PostData），總部 `GET /hq/einvoice-logs` 查閱。
+ * **非同步補開（防漏稅）**：一律於收款交易 commit 後才開票；任一腿失敗標記 `EInvoice.status=FAILED`，**禁止因開票失敗沖回已收款**（現金／乙禾／LinePay／PayUNi）；API 回 **`PARTIAL_INVOICE`**。佇列自動重試；櫃檯 `GET/POST /ops/invoice-jobs…/retry`（限可操作分店）、總部 `GET /hq/einvoices`＋`POST /hq/einvoices/:id/retry` 可手動補開。訂單取消時未開立之發票改 `CANCELLED`，不得再補開。
+ * 部分退費折讓：**嚴禁直接作廢整筆合併發票**。必須針對特定子單據開立 ezPay 折讓單，嚴格維持發票對帳完整性；同單據全額作廢時其分張（如免稅品）一併作廢。
+ * **作廢 vs 折讓判定**唯一經 `einvoiceRules.decideInvoiceActions`：全額退＋發票皆當期（同一雙月期）＋未曾折讓＋非舊制合併發票 → 作廢；否則逐張折讓（未稅＝`round(含稅/1.05)`、逐品項分攤，折讓用盡時取發票剩餘未稅／稅額精算；`allowanceTotal` 條件式預扣防超折）。開立中 409 `INVOICE_ISSUING`；未開立僅全額退可取消（`CANCELLED`），部分退 409 `INVOICE_NOT_ISSUED`。每張折讓寫 `InvoiceAllowance`＋`InvoiceAllowanceItem` 品項快照。
+ * **折讓單資料**：後端**只回 JSON**（`GET /api/ops/allowances` 列表＋`columns`／`rows` 供前端匯出；`GET /api/ops/allowances/:id/print-payload` 回賣方／買方／原發票字軌日期／品項／稅額／簽名；僅 `?purpose=print` 遞增 `InvoiceAllowance.printCount`，第 2 次起印「補印」，客顯推送用 `purpose=display` 不計次；會計匯出 `POST /api/ops/allowances/export`〔必帶起訖日；`exportState=ALL|UNEXPORTED|EXPORTED`；`markExported: true` 才對首次匯出者寫 `exportedToAcctAt`〔不覆寫〕，省略或 false 只回檔可重複下載〕＋`ALLOWANCE_EXPORT` 稽核），**禁止**後端產 HTML／PDF 折讓單；A4 四聯／80mm 熱感由前端 `AllowancePrintView`（`@media print`＋`window.print()`）排版列印。**B2B 折讓須買受人簽名後退費單才結案**（主螢幕先取後端 `POST /api/ops/refunds/:id/signature-preview`〔金額／稅額由後端組、`previewToken` 10 分鐘綁退費單＋`requestId`＋內容摘要〕，經 `pos_display_bus` 之 `ALLOWANCE_SIGN_*` 事件推至客顯，顧客確認後 `SignaturePad` 親簽並於記憶體壓浮水印，以 `Blob` 傳回主機，再 `multipart/form-data` 上傳 `POST …/signature`〔`previewToken`＋`requestId`，摘要不符 409 `PREVIEW_STALE`，後端驗墨跡防空白〕；PNG 私有儲存＋SHA-256，列印時僅回短效 data URL），B2C 選簽。
 
 ---
 
@@ -128,8 +159,11 @@ npm run dev:web   # frontend → Vite（proxy /api、/ws → 後端）
    * 清除須申請、櫃檯核准；保存會籍結束後法定年限。
 
 2. **延伸客顯觸控螢幕架構**：
-   * POS 系統採用瀏覽器原生 **`BroadcastChannel('pos_display_bus')`** 進行主機與客顯視窗通訊；封裝層須以 **`localStorage` + `storage` 事件**為備援心跳（跨 Profile／全螢幕 Context 隔離時 BC 可能靜默斷線）。實作見 `frontend/src/lib/posDisplayBus.ts`。
-   * 顧客於副螢幕完整閱讀定型化契約與個資告知書，使用 `SignaturePad` 完成數位親簽，簽章傳回主機後自動歸檔，確保消保法合規證據力。
+   * POS 系統採用瀏覽器原生 **`BroadcastChannel('pos_display_bus')`** 進行主機與客顯視窗通訊；封裝層須以 **`localStorage` + `storage` 事件**為備援（跨 Profile／全螢幕 Context 隔離時 BC 可能靜默斷線）。實作見 `frontend/src/lib/posDisplayBus.ts`。
+   * **連線心跳**：Host 定期 `PING`、客顯回 `PONG`；逾約 12 秒無對端訊號須降為「未連線」，禁止長期假陽性。
+   * **簽名回執**：客顯送出 `SIGNATURE_COMPLETED` 後須等 Host `SIGNATURE_ACK` 才回待機；逾時須可重送／重簽。
+   * **折讓簽名例外**：`ALLOWANCE_SIGN_*` 事件**只走 BroadcastChannel**（`signatureBlob` 為 Blob，無法亦不得經 Storage），**禁止** localStorage 備援；簽名**禁止** Base64 或寫入任何 Storage。
+  * 顧客於副螢幕完整閱讀定型化契約與個資告知書，使用 `SignaturePad` 完成數位親簽，簽章傳回主機後自動歸檔，確保消保法合規證據力。
 
 3. **臨櫃代辦證件上傳標準操作流程（On-Site Assisted SOP）**：
 
@@ -165,17 +199,26 @@ npm run dev:web   # frontend → Vite（proxy /api、/ws → 後端）
 
 ---
 
-## 🏋️ 私教排課、教練拆帳與營運報表
+## 🏋️ 私教排課、教練業績與營運報表
 
 1. **私教預約雙重防衝堂**：
-   * 排課端點強制執行「教練排班衝堂」與「場地空間（`VenueStation`）衝堂」雙重交易鎖定。
+   * 排課端點強制執行「教練排班衝堂」與「場地空間（`VenueStation`）衝堂」雙重交易鎖定，並須落在教練可預約時段內（`assertTrainerBookable`）。
    * 支援線上請假規範（未依規定提前請假執行扣課）、釋出名額與候補補課機制。
 
-2. **教練業績抽成引擎**：
-   * 私教與團課分開拆帳：支援「底薪 ＋ 階段執行堂數抽成」、「固定鐘點制」與「人頭分潤抽成」。
-   * 考核係數連動：支援將考核成績折算權重自動納入薪資報表結算。
+2. **教練業績獎金（工資之一部）**：
+   * 底薪（薪資設定）＋私教業績階梯抽成＋授課獎金＋團課人頭獎金，併入月薪資批次；**已廢除**「固定鐘點制」與規則內底薪／扣除費率（舊 `CoachCommissionLedger` 僅留歷史，不再產生）。
+   * 私教以合約單堂價計業績：扣堂之私教課必須寫入 `Class.ptContractId`。
 
-3. **行銷喚醒與數據看板**：
+3. **團課＝付費期班（`GroupEnrollment`）**：規則唯一定義於 `backend/lib/groupClassRules.js`（純函式）、服務層 `groupClassService.js`；前端僅顯示後端報價／名額／退費試算。
+   * **開班**：`POST /api/pt/schedule-group-class` 必綁上架中 GROUP 課程方案（400 `COURSE_PLAN_REQUIRED`／`COURSE_PLAN_INVALID`），展開堂數須等於方案每期堂數（400 `SESSION_COUNT_MISMATCH`）；整期價、單堂價、堂數、最低開班人數、報名截止（預設開課前 2 日）**快照**於 `ClassSeries`，開班後不隨方案變動；方案須屬場地分店或其上層 GYM。GROUP 方案**禁止**定期定額。**禁止**單獨建立 GROUP 課（`/api/trainer/schedule-class` 400 `USE_GROUP_SERIES`）、**禁止**免費約團課（`/api/member/book-class` 409 `GROUP_ENROLL_REQUIRED`）與團課扣點；舊 `MakeupSlot` 免費補課已停用（410 `USE_GROUP_MAKEUP`）。
+   * **報名**：整期報名保留全部剩餘堂次；開課後插班金額＝整期價 × 剩餘堂數 ÷ 總堂數（後端計價）；單堂僅用整期報名剩餘空位。一報名＝一張 `GRP…` 訂單＝一張發票。管道：會員線上 `POST /api/member/group/enroll`（LINE Pay／PayUNi 刷卡，僅收 `seriesId`／`kind`／`classId`／`payMethod`／發票欄位）、臨櫃 POS 合併結帳 `groupItems`（獨立 `GROUP` 發票腿）；**禁止**錢包扣款（400 `GROUP_NO_WALLET`）、禁止自帶金額或堂數。待付款保留名額 30 分鐘，逾時由排程釋出；已付款但保留已逾時仍須入帳並補建預約（不得吞款）。
+   * **額滿候補**：交易內 `FOR UPDATE` 鎖期班列；額滿 409 `SERIES_FULL` 可登記候補。有名額時依登記順序遞補、通知並限時 24 小時（不晚於下一堂開課）付款，逾時換下一位；遞補名額保留給被遞補者，後位與單堂不得插隊。
+   * **請假補課**：整期學員開課前 ≥24 小時請假（`POST /api/member/group/reservations/:id/leave`，逾時 409 `LEAVE_TOO_LATE`）取得 1 次補課權，限同課程方案**其他**期班有空位之堂次，期班結束後 30 日失效；取消補課預約退回補課權。單堂不適用請假（409 `USE_DROP_IN_CANCEL`）；一般取消預約 API 擋團課（409 `USE_GROUP_LEAVE`）。
+   * **退費**（櫃檯 `DUTY+`，`POST /api/ops/group/enrollments/:id/refund` 只收 `reason`）：7 日內且未使用全額退；否則 實付 − 已使用堂數 × 單堂價 − `Math.min(未履約 × 20%, 5000)`；已使用＝已開課未取消之本報名＋已上補課＋過期補課權；單堂開課前 24 小時全額退、之後不退。退款依原付款比例拆分：零錢包退回、LINE Pay 線上退、其餘臨櫃人工退；發票作廢或折讓（**禁止**作廢合併發票），發票未開立不得部分退費（`INVOICE_NOT_ISSUED`）。
+   * **最低開班**：報名截止仍未達最低人數，總部列表標記「待決定」；**取消期班限 ADMIN**（`POST /api/pt/group-series/:id/cancel`，必填原因）：刪除未上課堂次、取消候補、撤銷補課權，已報名者未履約部分全額退費（無手續費）。
+   * 報名／遞補／取消通知經 LINE 推播，**禁止**含金額。
+
+4. **行銷喚醒與數據看板**：
    * 沉睡客戶標記：高餘額久未進場、合約即將到期、體驗完未購課名單自動篩選與 LINE 推播。
    * 容留看板：透過 WebSocket `/ws/occupancy` 推播，嚴格遵循 `Branch.showOccupancy` 與 `GET /api/board/occupancy-settings`；關閉時前端隱藏，不硬顯示 0 人。
 
@@ -184,13 +227,19 @@ npm run dev:web   # frontend → Vite（proxy /api、/ws → 後端）
 ## 📦 POS 庫存管理與交班防弊 (Inventory & Shift Handover)
 
 1. **交班盲盤機制 (Blind Shift Handover)**：
-   * 櫃檯開班前強制輸入「起始備用金 (Cash Float)」；未確認前鎖定 POS 結帳。
+   * 班別兩班制：**早班 07:00–15:30**、**晚班 15:30–00:00**（`MORNING`／`EVENING`；舊 `MIDDAY` 僅歷史顯示）。
+   * 櫃檯開班前強制輸入「起始備用金 (Cash Float)」；未確認前鎖定 POS 結帳。**後端強制**：`/ops/checkout`、`/ops/pos/checkout`、`/ops/topup` 建單交易內必須先 `lockOpenShiftForSale`（`FOR SHARE` 鎖分店進行中班次），無進行中班次 409 `SHIFT_NOT_OPEN`、無法判定分店 409 `SHIFT_BRANCH_REQUIRED`；交班以 `FOR UPDATE` 互斥，等待進行中收款提交後才結算，**禁止**僅靠前端鎖鈕。已在端末／LINE Pay 完成扣款之確認步驟（`confirm-yipay`、LinePay Confirm）不擋，避免吞款；交班後才完成者併入下一班彙整。
    * 交班時系統嚴禁預顯帳面應有現金，員工必須輸入實際清點各面額數量 (`cashDenominations`)。
    * 系統自動比對並產出「溢短差日誌 (Discrepancy Log)」。差額超過門檻強制輸入備註，並鎖定由接班人員覆核。
+   * 應有現金＝起始備用金＋班內現金收款 − **班內現金退款**（`RefundPayment` CASH 綁本班 `shiftHandoverId`）；現金退款須有進行中班次（409 `SHIFT_NOT_OPEN`）。
 
 2. **進銷存原子化連動 (Inventory Atomicity)**：
-   * POS 商品銷售 (`SAL...`) 必須與庫存扣減 (`inventory.decrement`) 處於同一 Prisma Transaction，嚴禁負庫存交易。
-   * 商品報損、過期與盤點調整，一般櫃檯僅具備查驗權限，異動必須由主管 (`DUTY+`) 簽核並記錄 `InventoryLog`。
+ * 商品主檔 `Product` 全公司共用 SKU（含課稅別），**不含**庫存與成本；庫存、分店售價、安全庫存、移動平均成本在 `BranchStock`（分店×商品）。`onHand` **只能**經 `lib/inventory.js` `applyStockDelta`（SQL 條件式增減＋寫 `StockMovement`）異動，**禁止**任何 API 直接指定庫存或成本（400）。
+ * POS 商品銷售 (`SAL...`) 必須與庫存扣減處於同一 Prisma Transaction，嚴禁負庫存交易（DB `CHECK onHand >= 0`）；銷貨取消回補庫存。
+ * 商品報損、盤盈、盤點調整與調撥，一般櫃檯僅具備查驗權限，異動必須由主管 (`DUTY+`) 執行並留 `StockMovement`（`/api/ops/inventory`，限可操作分店）。
+ * **採購／應付**（`/api/hq`，ADMIN）：採購單 草稿 → 送出 → 部分到貨／到齊（或短交結案、取消須附原因）；未稅小計＋應稅 5% 進項稅額＝總額，由後端計算。**門市驗收只能依採購單、只送數量**（進價以採購單為準，帶 `unitCost` 400）；無單進貨與實際進價調整僅總部。每張驗收單自動立一筆 `SupplierPayable`（到期日依供應商付款條件），付款沖銷合計須等於付款金額、不得超付（409）、同營業人＋供應商才可沖銷；有付款之應付不可作廢。
+ * **調撥僅限同一營業人分店**（跨統編 409 `CROSS_ENTITY_TRANSFER`，須走進銷貨開票）。
+ * **門市發票對帳（會計師沖帳／申報）**：`GET /api/hq/reports/sales-reconciliation?from=&to=&branchId=`（ADMIN，台灣日、最長 366 日）唯一由 `backend/lib/salesReconciliation.js` 計算。**發票清冊必須涵蓋門市（`EInvoice.branchId`＝提供服務分店）所有來源**（商品、會籍／儲值、月卡／定期定額、私教、團課、舊制合併），依開立日期，含本期作廢（含前期開立）、開立失敗／待開立與本期折讓單；有效發票＝本期開立且 `ISSUED`，淨額＝有效 − 已開立折讓。品項／商品明細之未稅／稅額必須依整張發票稅額分攤（加總＝發票）；商品銷貨明細依銷貨日期，已取消單只列示不計入合計。後端只回 JSON（`columns`／`rows`／`invoices`／`summary`），Excel（exceljs，動態載入）／CSV 由前端排版下載，**禁止**前端重算金額或稅額。
 
 ---
 
@@ -206,6 +255,17 @@ npm run dev:web   # frontend → Vite（proxy /api、/ws → 後端）
    * 購案附贈之運動金於退費時全數註銷。
    * 若贈送之運動金已被消耗，系統必須自「應退現金」中等額扣除其已消耗金額；若扣除後小於 0 則應退款為 0，絕對不倒貼。
 
+4. **交易取消／退費引擎（唯一出口 `backend/lib/refundService.js`，金額規則 `refundRules.js`）**：
+   * 端點（`/api/ops`，員工 JWT＋**`DUTY+`**＋可操作分店，**必填 `reason`**）：
+     * `POST /topups/:id/cancel`（計時儲值**原單取消**）：須 PAID 未退；會員有**計時進場未出場結算**（ACTIVE 且非月費通行之 `CheckInLog`）時禁止回收儲值（含子單 `UNUSED` 退費），409 `MEMBER_CHECKED_IN`（試算與交易內鎖會員後皆檢查）；錢包須仍完整留存入帳快照之本金＋贈送運動金，否則 409 `WALLET_INSUFFICIENT_FOR_VOID`；兩錢包一次扣回（`mutateMemberWallet` `EXACT_BUCKETS_DEDUCT`＋`WalletLedger`）→ 原路退款 → 發票作廢／折讓。缺入帳快照 409 `TOPUP_GRANT_UNKNOWN`。
+     * `POST /sub-orders/:subOrderId/refund`（`scope`＝`FULL`／`UNUSED`／`ITEMS`）：**軟拆隔離只動該子單**（SAL 銷貨退回並回補庫存、TYK／儲值依消保公式、私教依堂數）；前端只送 `quoteToken`、`scope`、`items[{orderItemId, qty}]`、`reason`，**禁止**帶金額、`payMethod` 或退款管道（400 `ILLEGAL_FIELDS`；管道一律由後端依原付款比例拆分）。團課走 `/ops/group`、月卡走訂閱取消。
+     * **報價鎖**：試算回傳 `quoteToken`（後端 HMAC、10 分鐘，綁子單＋作法＋經辦＋計畫摘要〔品項、應退／手續費／實退、錢包回收、退款管道、發票作法〕），建單**必須**帶回；後端於交易前與交易內**重算**並比對摘要，不符 409 `QUOTE_STALE`、逾時 409 `QUOTE_EXPIRED`、缺少／偽造 400 `QUOTE_TOKEN_REQUIRED`／`QUOTE_TOKEN_INVALID`。**禁止**以試算快照直接執行扣帳（狀態可能已變），一律以重算結果為準。
+     * 試算 `GET …/cancel-preview`、`GET …/refund-preview`；後續 `GET /refunds(/:id)`、`POST /refunds/:id/retry`、`…/payments/:paymentId/yipay-confirm`、`…/cash-fallback`、`POST /refunds/:id/invoice-resolve`、`POST /refunds/:id/abort`、`POST /refunds/:id/signature-preview`、`POST /refunds/:id/signature`（multipart）。
+     * 舊端點 `POST /ops/refund`、`/ops/cancel-sale`、`/ops/cancel-pt-purchase`、`GET /ops/allowances/:allowanceNo` 回 **410**（`USE_TOPUP_CANCEL`／`USE_SUB_ORDER_REFUND`／`USE_PRINT_PAYLOAD`）。
+   * **Saga（禁止在 DB 交易內打外部 API）**：交易一（`FOR UPDATE` 鎖目標＋會員、權益沖回、建 `RefundRequest`＋各 `RefundPayment`）→ 線上退款（LINE Pay／PayUNi）→ 乙禾端末退刷確認（`AWAITING_TERMINAL`，須 `rrn`＋`authCode`＋`cardLast4`）→ 發票作廢／折讓 → B2B 待簽名（`SIGNATURE_PENDING`）→ `COMPLETED`。同子單同時僅一張未結案退費單（DB partial unique）。建單端點（儲值取消、子單退費）**必須**帶 Header `Idempotency-Key`（前端每個子單選擇產生一鍵，逾時重按沿用；存 `RefundRequest.idempotencyKey` unique），同鍵重送回傳原退費單（`replayed`），鍵用於其他單據／經辦 409 `IDEMPOTENCY_KEY_REUSED`；缺鍵 400。結果不明且無 `providerRef` 之線上退款，重試與改現金必須帶 `confirmGatewayNotRefunded: true`（只在畫面上勾選無效；缺旗標 409 `RETRY_NEEDS_CHECK`，通過時寫 `REFUND_GATEWAY_CONFIRM`，含 `confirmedByStaffId` 與確認時間）。**ezPay 折讓結果不明**（逾時或 SUCCESS 但無法解析／缺折讓號）必須**保留折讓預占**，禁止直接重開；由 `DUTY+` 核對藍新後台後經 `invoice-resolve` 擇一：已開立 → `ezPayAllowanceNo` 非空才補登折讓號結案（不再呼叫 ezPay）、未開立 → 必須 `confirmEzPayNotIssued: true` 並寫稽核後才釋放預占並重開；作廢結果不明時重試前先查詢 ezPay（有 4 碼隨機碼走 `invoice_search` SearchType 0，否則 SearchType 1），遠端已作廢即只同步本地。重試（`POST /refunds/:id/retry` 與 `POST /refunds/:id/retry-gateway`）先在短交易內 `SELECT … FOR UPDATE NOWAIT` 將退費單改為 `GATEWAY_RETRYING` 再提交，外部 API 不得持鎖；第二個請求 409 `REFUND_RETRY_IN_PROGRESS`。已 `REFUNDED` 或已有 `providerRef` 之線上退款腿禁止再打金流。折讓結果不明仍禁止依 `invoice_search` 餘額自癒結案（該查詢不回折讓號）。中止（`ABORTED`，必填原因）僅限：無已完成之線上／乙禾退款、發票尚未作廢／折讓且無結果不明之 ezPay 呼叫（409 `INVOICE_RESULT_UNKNOWN`）、現金退款班次未交班、退回零錢包金額未被動用；中止時沖回退款腿並回補權益。月卡退費之 PayUNi 續期**必須先終止再建單**（失敗即中止、不動帳）；終止後建單失敗須寫稽核 `REFUND_SUBSCRIPTION_ORPHANED` 並回 409 `SUBSCRIPTION_CANCELLED_REFUND_INCOMPLETE` 要求重新試算。折讓簽名影像已上傳但未歸檔即失敗者，必須刪除該檔（不留無 DB 指向之個資）。
+   * **退款管道**依原付款比例拆分：現金（綁班次）、零錢包（入帳＋流水）、LINE Pay／PayUNi 線上退、乙禾端末退刷兩段式；**折價券（VOUCHER）份額一律 `FORFEITED`，禁止折現**。開票失敗**不得**回滾已退款，退費單停 `INVOICE_FAILED`、API 回 `PARTIAL_INVOICE`，可重試。
+   * 每步寫 append-only `TransactionAuditLog`（`staffId`、`branchId`、before／after 快照；DB trigger 禁改刪）；`WalletLedger` 同為 append-only。
+
 ---
 
 ## 💻 前端 UI / UX 規範 (React 19)
@@ -214,4 +274,4 @@ npm run dev:web   # frontend → Vite（proxy /api、/ws → 後端）
 * **並發鎖定**：金流送出、購案、儲值按鈕必須配置 React `ref` 同步鎖（如 `checkoutInFlightRef`），杜絕連點造成的雙重請款。
 * **Mobile-First 標準**：會員端底部導覽列恆定顯示；所有觸控標的 ≥44px；表單 Input 字級 ≥16px（防止 iOS 自動縮放）；螢幕寬度 <768px 時彈窗自動切換為底部抽屜。
 * **極速後台**：員工端側邊欄支援 Hover 展開；配置 **Ctrl/⌘K** 全域會員快速搜尋（呼叫 `GET /api/ops/members?lite=1&q=`，禁止預載全表資料）。
-* **錯誤中斷**：`AUTH_EXPIRED`／`AUTH_REQUIRED`／`DEVICE_MISMATCH`（或 401）清 JWT 並硬導登入（會員 `/`、員工 `/staff/login`）；模組 403 不得當登出。`CONTRACT_REQUIRED`／`NO_ACTIVE_CHECKIN`／`CONSENT_REQUIRED` 須明示，不得吞錯。
+* **錯誤中斷**：`AUTH_EXPIRED`／`AUTH_REQUIRED`／`DEVICE_MISMATCH`（或 401）清 JWT 並硬導登入（會員 `/`、員工 `/staff/login`）；模組 403 不得當登出；員工 403 `OFF_DUTY` 不得登出，須切「非值勤模式」（僅我的出勤／我的排班）並導回 `/staff/my-attendance`。`CONTRACT_REQUIRED`／`NO_ACTIVE_CHECKIN`／`CONSENT_REQUIRED`／`WALLET_INSUFFICIENT_FOR_VOID` 須以警示框明示（含處置建議），不得吞錯或僅以 toast 帶過。

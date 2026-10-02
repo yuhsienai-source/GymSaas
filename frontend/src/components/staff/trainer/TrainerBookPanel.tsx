@@ -121,8 +121,8 @@ export default function TrainerBookPanel({
   );
   const [studentQuery, setStudentQuery] = useState('');
   const [selectedMemberId, setSelectedMemberId] = useState<number | ''>('');
-  const [contractId, setContractId] = useState<number | ''>('');
-  const [venueId, setVenueId] = useState<number | ''>('');
+  const [contractPick, setContractPick] = useState<{ memberId: number; id: number } | null>(null);
+  const [pickedVenueId, setVenueId] = useState<number | ''>('');
   const [stationId, setStationId] = useState<number | ''>('');
   const [bookDate, setBookDate] = useState(todayYmd);
   const [bookTime, setBookTime] = useState('');
@@ -156,22 +156,26 @@ export default function TrainerBookPanel({
   }
 
   // 課表點選私教／諮詢 → 帶入場地與時段
-  useEffect(() => {
-    if (!selectedClass) return;
-    if (selectedClass.type === 'CONSULT') setMode('consult');
-    if (selectedClass.type === 'PRIVATE') setMode('student');
-    if (selectedClass.venueId) setVenueId(selectedClass.venueId);
-    if (selectedClass.stationId) setStationId(selectedClass.stationId);
-    const parts = partsFromIso(selectedClass.startAt);
-    if (parts.date) setBookDate(parts.date);
-    if (parts.time) setBookTime(parts.time);
-    const start = new Date(selectedClass.startAt).getTime();
-    const end = new Date(selectedClass.endAt).getTime();
-    if (Number.isFinite(start) && Number.isFinite(end) && end > start) {
-      const mins = Math.round((end - start) / 60_000);
-      if (DURATION_OPTIONS.includes(mins)) setDurationMin(mins);
+  const selectedClassId = selectedClass?.id ?? null;
+  const [seenClassId, setSeenClassId] = useState<number | null>(selectedClassId);
+  if (selectedClassId !== seenClassId) {
+    setSeenClassId(selectedClassId);
+    if (selectedClass) {
+      if (selectedClass.type === 'CONSULT') setMode('consult');
+      if (selectedClass.type === 'PRIVATE') setMode('student');
+      if (selectedClass.venueId) setVenueId(selectedClass.venueId);
+      if (selectedClass.stationId) setStationId(selectedClass.stationId);
+      const parts = partsFromIso(selectedClass.startAt);
+      if (parts.date) setBookDate(parts.date);
+      if (parts.time) setBookTime(parts.time);
+      const start = new Date(selectedClass.startAt).getTime();
+      const end = new Date(selectedClass.endAt).getTime();
+      if (Number.isFinite(start) && Number.isFinite(end) && end > start) {
+        const mins = Math.round((end - start) / 60_000);
+        if (DURATION_OPTIONS.includes(mins)) setDurationMin(mins);
+      }
     }
-  }, [selectedClass?.id]);
+  }
 
   useEffect(() => {
     if (mode !== 'consult') return;
@@ -219,6 +223,20 @@ export default function TrainerBookPanel({
       .sort((a, b) => b.remainingSessions - a.remainingSessions);
   }, [ptContracts, selectedMemberId]);
 
+  // 選學員後自動帶入購買合約（剩堂最多），手動改選僅對同一學員有效
+  const preferredContractId =
+    (memberContracts.find((c) => c.remainingSessions > 0) || memberContracts[0])?.id ?? '';
+  const contractId: number | '' =
+    selectedMemberId === ''
+      ? ''
+      : contractPick &&
+          contractPick.memberId === selectedMemberId &&
+          memberContracts.some((c) => c.id === contractPick.id)
+        ? contractPick.id
+        : preferredContractId;
+  const setContractId = (id: number | '') =>
+    setContractPick(id === '' || selectedMemberId === '' ? null : { memberId: selectedMemberId, id });
+
   const selectedPt =
     contractId === ''
       ? null
@@ -226,28 +244,22 @@ export default function TrainerBookPanel({
         ptContracts.find((c) => c.id === contractId) ||
         null;
 
-  // 選學員後自動帶入購買合約（剩堂最多）
-  useEffect(() => {
-    if (mode !== 'student') return;
-    if (selectedMemberId === '') {
-      setContractId('');
-      return;
-    }
-    const list = ptContracts
-      .filter((c) => c.memberId === selectedMemberId)
-      .sort((a, b) => b.remainingSessions - a.remainingSessions);
-    const preferred =
-      list.find((c) => c.remainingSessions > 0) || list[0] || null;
-    setContractId(preferred?.id ?? '');
-  }, [mode, selectedMemberId, ptContracts]);
-
-  const venue =
-    venueId === '' ? null : venues.find((v) => v.id === venueId) || null;
-
   const venuesForStudent = useMemo(() => {
     if (mode !== 'student' || !selectedPt) return venues;
     return venues.filter((v) => privateVenueAllowed(selectedPt, v));
   }, [mode, selectedPt, venues]);
+
+  // 預設場地（私教依購案分店＋HP/HR 共享過濾）
+  const venueChoices = mode === 'student' ? venuesForStudent : venues;
+  const venueId: number | '' =
+    pickedVenueId !== '' && venueChoices.some((v) => v.id === pickedVenueId)
+      ? pickedVenueId
+      : venueChoices.length
+        ? venueChoices[0].id
+        : '';
+
+  const venue =
+    venueId === '' ? null : venues.find((v) => v.id === venueId) || null;
 
   const venueForForm =
     mode === 'student'
@@ -263,14 +275,6 @@ export default function TrainerBookPanel({
       : stationId !== '' && stations.some((s) => s.id === stationId)
         ? stationId
         : stations[0]?.id ?? '';
-
-  // 預設場地（私教依購案分店＋HP/HR 共享過濾）
-  useEffect(() => {
-    const list = mode === 'student' ? venuesForStudent : venues;
-    if (list.length === 0) return;
-    if (venueId !== '' && list.some((v) => v.id === venueId)) return;
-    setVenueId(list[0].id);
-  }, [mode, venues, venuesForStudent, venueId]);
 
   const noSessions = Boolean(selectedPt && selectedPt.remainingSessions <= 0);
   const startIso = bookDate && bookTime ? toTaipeiIso(bookDate, bookTime) : null;

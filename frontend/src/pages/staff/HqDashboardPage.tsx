@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
   fetchBranches,
+  fetchHqBranchStocks,
   fetchHqCoursePlans,
-  fetchHqProducts,
   fetchHqPromotions,
   fetchHqStaff,
   fetchHqTrainers,
@@ -12,8 +12,8 @@ import {
 import { useToast } from '../../contexts/ToastContext';
 import type {
   Branch,
+  BranchStockRow,
   CoursePlan,
-  Product,
   Promotion,
   StaffAccount,
   Trainer,
@@ -28,6 +28,7 @@ import HqCoursePlansTab from './hq/HqCoursePlansTab';
 import HqCrmTab from './hq/HqCrmTab';
 import HqGateDevicesTab from './hq/HqGateDevicesTab';
 import HqHrTab from './hq/HqHrTab';
+import HqPayrollTab from './hq/HqPayrollTab';
 import HqInventoryTab from './hq/HqInventoryTab';
 import HqMarketingTab from './hq/HqMarketingTab';
 import HqPeopleTab from './hq/HqPeopleTab';
@@ -47,10 +48,9 @@ export default function HqDashboardPage() {
   const [venues, setVenues] = useState<Venue[]>([]);
   const [promotions, setPromotions] = useState<Promotion[]>([]);
   const [coursePlans, setCoursePlans] = useState<CoursePlan[]>([]);
-  const [products, setProducts] = useState<Product[]>([]);
+  const [branchStocks, setBranchStocks] = useState<BranchStockRow[]>([]);
   const [staffList, setStaffList] = useState<StaffAccount[]>([]);
   const [trainers, setTrainers] = useState<Trainer[]>([]);
-  const [inventoryBranchId, setInventoryBranchId] = useState<number | ''>('');
 
   const loadCore = useCallback(async () => {
     try {
@@ -62,10 +62,7 @@ export default function HqDashboardPage() {
         fetchHqStaff(),
         fetchHqTrainers(),
       ]);
-      if (branchRes.status === 'success' && branchRes.data) {
-        setBranches(branchRes.data);
-        setInventoryBranchId((prev) => prev || branchRes.data?.[0]?.id || '');
-      }
+      if (branchRes.status === 'success' && branchRes.data) setBranches(branchRes.data);
       if (venueRes.status === 'success' && venueRes.data) setVenues(venueRes.data);
       if (promoRes.status === 'success' && promoRes.data) setPromotions(promoRes.data);
       if (courseRes.status === 'success' && courseRes.data) setCoursePlans(courseRes.data);
@@ -77,14 +74,13 @@ export default function HqDashboardPage() {
   }, [toast]);
 
   const loadInventory = useCallback(async () => {
-    if (!inventoryBranchId) return;
     try {
-      const prodRes = await fetchHqProducts(Number(inventoryBranchId));
-      if (prodRes.status === 'success' && prodRes.data) setProducts(prodRes.data);
+      const res = await fetchHqBranchStocks();
+      if (res.status === 'success' && res.data) setBranchStocks(res.data);
     } catch (err) {
-      toast(getErrorMessage(err, '載入商品主檔失敗'), 'error');
+      toast(getErrorMessage(err, '載入分店庫存失敗'), 'error');
     }
-  }, [inventoryBranchId, toast]);
+  }, [toast]);
 
   useEffect(() => {
     let cancelled = false;
@@ -99,10 +95,7 @@ export default function HqDashboardPage() {
           fetchHqTrainers(),
         ]);
         if (cancelled) return;
-        if (branchRes.status === 'success' && branchRes.data) {
-          setBranches(branchRes.data);
-          setInventoryBranchId((prev) => prev || branchRes.data?.[0]?.id || '');
-        }
+        if (branchRes.status === 'success' && branchRes.data) setBranches(branchRes.data);
         if (venueRes.status === 'success' && venueRes.data) setVenues(venueRes.data);
         if (promoRes.status === 'success' && promoRes.data) setPromotions(promoRes.data);
         if (courseRes.status === 'success' && courseRes.data) setCoursePlans(courseRes.data);
@@ -119,33 +112,29 @@ export default function HqDashboardPage() {
   }, [toast]);
 
   useEffect(() => {
-    if (!inventoryBranchId) return;
     let cancelled = false;
     async function run() {
       try {
-        const prodRes = await fetchHqProducts(Number(inventoryBranchId));
-        if (cancelled) return;
-        if (prodRes.status === 'success' && prodRes.data) setProducts(prodRes.data);
+        const res = await fetchHqBranchStocks();
+        if (!cancelled && res.status === 'success' && res.data) setBranchStocks(res.data);
       } catch (err) {
-        if (!cancelled) toast(getErrorMessage(err, '載入商品主檔失敗'), 'error');
+        if (!cancelled) toast(getErrorMessage(err, '載入分店庫存失敗'), 'error');
       }
     }
     void run();
     return () => {
       cancelled = true;
     };
-  }, [inventoryBranchId, toast]);
+  }, [toast]);
 
   const sharedProps = {
     branches,
     venues,
     promotions,
     coursePlans,
-    products,
+    branchStocks,
     staffList,
     trainers,
-    inventoryBranchId,
-    setInventoryBranchId,
     onReload: loadCore,
     onReloadInventory: loadInventory,
   };
@@ -181,6 +170,7 @@ export default function HqDashboardPage() {
         {tab === 'marketing' && <HqMarketingTab />}
         {tab === 'crm' && <HqCrmTab branches={branches} />}
         {tab === 'hr' && <HqHrTab {...sharedProps} />}
+        {tab === 'payroll' && <HqPayrollTab />}
         {tab === 'coach' && <HqCoachTab trainers={trainers} />}
         {tab === 'people' && <HqPeopleTab {...sharedProps} />}
         {tab === 'gateDevices' && <HqGateDevicesTab branches={branches} />}

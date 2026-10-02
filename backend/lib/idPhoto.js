@@ -167,9 +167,9 @@ export async function normalizeIdPhotoBuffer(dataUrlOrBase64, opts = {}) {
   };
 }
 
-function assertImageMagicBytes(buf) {
+export function assertImageMagicBytes(buf, label = '證件影像') {
   if (!buf || buf.length < 12) {
-    const err = new Error('證件影像格式無效（檔頭過短）');
+    const err = new Error(`${label}格式無效（檔頭過短）`);
     err.statusCode = 400;
     err.code = 'INVALID_IMAGE_MAGIC';
     throw err;
@@ -190,7 +190,7 @@ function assertImageMagicBytes(buf) {
     buf[10] === 0x42 &&
     buf[11] === 0x50;
   if (!isJpeg && !isPng && !isWebp) {
-    const err = new Error('證件影像須為 JPG／PNG／WebP（拒絕可執行檔偽裝）');
+    const err = new Error(`${label}須為 JPG／PNG／WebP（拒絕可執行檔偽裝）`);
     err.statusCode = 400;
     err.code = 'INVALID_IMAGE_MAGIC';
     throw err;

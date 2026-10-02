@@ -1,10 +1,13 @@
 import { useEffect, useState } from 'react';
 import { Link, Outlet, useLocation } from 'react-router-dom';
 import BrandMark from '../BrandMark';
-import { Button } from '../ui';
+import { Badge, Button } from '../ui';
 import { useStaffAuth } from '../../contexts/StaffAuthContext';
 import type { StaffPermission } from '../../lib/storage';
+import { DUTY_STATE_META } from '../../lib/hrFormat';
 import StaffCommandPalette from '../staff/StaffCommandPalette';
+import StaffAvatar from '../staff/StaffAvatar';
+import StaffDutyBanner from '../staff/StaffDutyBanner';
 
 const SIDEBAR_COLLAPSE_KEY = 'gymsaas.staff.sidebarCollapsed';
 
@@ -14,17 +17,26 @@ const navItems: {
   icon: string;
   adminOnly?: boolean;
   dutyOrAbove?: boolean;
+  managerOrAbove?: boolean;
+  offRequest?: boolean;
   permission?: StaffPermission;
+  /** 非值勤仍可用（員工自助） */
+  selfService?: boolean;
 }[] = [
   { to: '/staff/ops', label: '櫃檯維運', icon: '🏪', permission: 'ops' },
+  { to: '/staff/pt', label: '團課服務台', icon: '🗓️', permission: 'pt' },
   { to: '/staff/inventory', label: '進銷存', icon: '📦', dutyOrAbove: true },
+  { to: '/staff/roster', label: '場務排班', icon: '📅', managerOrAbove: true },
+  { to: '/staff/my-roster', label: '我的排班', icon: '🗓', offRequest: true, selfService: true },
+  { to: '/staff/my-attendance', label: '我的出勤', icon: '🕘', selfService: true },
   { to: '/staff/hq', label: '總部 HQ', icon: '🏢', adminOnly: true },
   { to: '/staff/trainer', label: '教練服務台', icon: '🏋️', permission: 'trainer' },
   { to: '/staff/tx', label: '交易異動', icon: '🔁', dutyOrAbove: true },
 ];
 
 export default function StaffShell() {
-  const { staff, isAdmin, canAccessTx, hasPermission, logout } = useStaffAuth();
+  const { staff, isAdmin, canAccessTx, canManageRoster, canRequestOff, hasPermission, isOffDuty, duty, logout } =
+    useStaffAuth();
   const location = useLocation();
   const [collapsed, setCollapsed] = useState(() => {
     try {
@@ -33,7 +45,10 @@ export default function StaffShell() {
       return false;
     }
   });
-  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  /** 記錄開啟選單時的路徑；換頁後自動視為關閉 */
+  const [mobileMenuPath, setMobileMenuPath] = useState<string | null>(null);
+  const mobileMenuOpen = mobileMenuPath === location.pathname;
+  const setMobileMenuOpen = (open: boolean) => setMobileMenuPath(open ? location.pathname : null);
   const [cmdOpen, setCmdOpen] = useState(false);
 
   useEffect(() => {
@@ -45,13 +60,9 @@ export default function StaffShell() {
   }, [collapsed]);
 
   useEffect(() => {
-    setMobileMenuOpen(false);
-  }, [location.pathname]);
-
-  useEffect(() => {
     if (!mobileMenuOpen) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setMobileMenuOpen(false);
+      if (e.key === 'Escape') setMobileMenuPath(null);
     };
     window.addEventListener('keydown', onKey);
     const prev = document.body.style.overflow;
@@ -63,6 +74,7 @@ export default function StaffShell() {
   }, [mobileMenuOpen]);
 
   useEffect(() => {
+    if (isOffDuty) return;
     const onKey = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
         e.preventDefault();
@@ -71,11 +83,14 @@ export default function StaffShell() {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, []);
+  }, [isOffDuty]);
 
   const visibleNav = navItems.filter((item) => {
+    if (isOffDuty && !item.selfService) return false;
     if (item.adminOnly) return isAdmin;
     if (item.dutyOrAbove) return canAccessTx;
+    if (item.managerOrAbove) return canManageRoster;
+    if (item.offRequest) return canRequestOff;
     if (item.permission) return hasPermission(item.permission);
     return true;
   });
@@ -149,13 +164,22 @@ export default function StaffShell() {
 
         <div className="staff-sidebar__footer">
           <div className="staff-user">
-            <div className="avatar avatar--sm">{staff?.name?.charAt(0) || '?'}</div>
+            {staff ? (
+              <StaffAvatar staffId={staff.id} name={staff.name} version={staff.photoUpdatedAt} source="self" />
+            ) : (
+              <div className="avatar avatar--sm">?</div>
+            )}
             <div className="staff-user__meta">
               <strong>{staff?.name}</strong>
               <span>
                 {staff?.role}
                 {staff?.branchName ? ` · ${staff.branchName}` : ''}
               </span>
+              {duty && !duty.exempt && (
+                <Badge tone={DUTY_STATE_META[duty.state].tone} dot>
+                  {DUTY_STATE_META[duty.state].label}
+                </Badge>
+              )}
             </div>
           </div>
           <Button
@@ -196,15 +220,17 @@ export default function StaffShell() {
             <h1>{activeLabel}</h1>
           </div>
           <div className="staff-topbar__right">
-            <Button
-              variant="secondary"
-              size="sm"
-              onClick={() => setCmdOpen(true)}
-              title="全域搜尋 (Ctrl/⌘ K)"
-            >
-              搜尋
-              <kbd className="staff-topbar__kbd">⌘K</kbd>
-            </Button>
+            {!isOffDuty && (
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => setCmdOpen(true)}
+                title="全域搜尋 (Ctrl/⌘ K)"
+              >
+                搜尋
+                <kbd className="staff-topbar__kbd">⌘K</kbd>
+              </Button>
+            )}
             <Button
               variant="ghost"
               size="sm"
@@ -220,6 +246,7 @@ export default function StaffShell() {
           </div>
         </header>
         <main className="staff-main">
+          <StaffDutyBanner />
           <Outlet />
         </main>
       </div>
@@ -247,7 +274,7 @@ export default function StaffShell() {
         </button>
       </nav>
 
-      <StaffCommandPalette open={cmdOpen} onClose={() => setCmdOpen(false)} />
+      <StaffCommandPalette open={cmdOpen && !isOffDuty} onClose={() => setCmdOpen(false)} />
     </div>
   );
 }

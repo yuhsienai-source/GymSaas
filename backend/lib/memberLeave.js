@@ -432,8 +432,12 @@ export async function listMemberLeaves({ memberId, status, take = 50 } = {}) {
   });
 }
 
-/** 閘機／進場前：請假中擋月費；期滿自動清 leaveUntil 並恢復 PAUSED 訂閱 */
-export async function assertMemberNotOnLeave(member, { now = new Date(), tx } = {}) {
+/**
+ * 閘機／進場前：請假中擋月費；期滿自動清 leaveUntil 並恢復 PAUSED 訂閱
+ * @param {{ now?: Date, tx?: object, afterCommit?: Array<() => Promise<unknown>> }} [opts]
+ *   tx 內呼叫時必須傳 afterCommit：恢復訂閱會打 PayUNi，禁止在持有列鎖的交易內等待外部 I/O
+ */
+export async function assertMemberNotOnLeave(member, { now = new Date(), tx, afterCommit } = {}) {
   if (!member?.leaveUntil) return member;
   if (new Date(member.leaveUntil) > now) {
     throw httpError(
@@ -457,8 +461,13 @@ export async function assertMemberNotOnLeave(member, { now = new Date(), tx } = 
 
   const subId = active?.subscriptionId;
   if (subId) {
-    // 用 root client 恢復訂閱，避免卡在進場長交易裡；PayUNi 失敗不擋入場
-    await resumeSubscriptionAfterLeave(subId, { now, forceLocalOnly: true });
+    const resume = () => resumeSubscriptionAfterLeave(subId, { now, forceLocalOnly: true });
+    if (tx) {
+      if (!Array.isArray(afterCommit)) throw new Error('assertMemberNotOnLeave 於交易內呼叫必須提供 afterCommit');
+      afterCommit.push(resume);
+    } else {
+      await resume();
+    }
   }
   return updated;
 }

@@ -11,9 +11,17 @@
     "db:generate": "npm run db:generate --prefix backend",
     "db:studio": "npm run db:studio --prefix backend",
     "db:seed": "npm run db:seed --prefix backend",
+    "db:constraints": "npm run db:constraints --prefix backend",
+    "db:migrate-refunds": "npm run db:migrate-refunds --prefix backend --",
     "lint": "npm run lint:web && npm run lint:api",
     "lint:web": "npm run lint --prefix frontend",
     "lint:api": "npm run check:lint --prefix backend",
     "doctor:api": "npm run doctor --prefix backend"
+  },
+  "dependencies": {
+    "pg": "^8.23.0"
+  },
+  "devDependencies": {
+    "prisma": "^7.9.0"
   }
 }

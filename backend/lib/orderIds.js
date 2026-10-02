@@ -12,6 +12,11 @@ export function generateTopupOrderId() {
   return buildTradeNo('TYK');
 }
 
+/** 團課期班／單堂報名：GRP…（一筆報名一張訂單、一張發票） */
+export function generateGroupOrderId() {
+  return buildTradeNo('GRP');
+}
+
 /** 訂閱制月卡／定期定額：CRS… */
 export function generateSubscriptionOrderId() {
   return buildTradeNo('CRS');

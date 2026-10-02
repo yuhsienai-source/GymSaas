@@ -52,29 +52,43 @@ export async function stageYipayCapture({
   const amt = Number(amount);
   if (!(amt > 0)) throw httpError('amount 必須 > 0');
 
-  if (rrn) {
+  const findSameRrn = async () => {
+    if (!rrn) return null;
     const dup = await prisma.yipayTerminalCapture.findFirst({
       where: { rrn: String(rrn), status: { in: ['PENDING_CONFIRM', 'CONFIRMED'] } },
     });
-    if (dup) return dup;
-  }
+    if (!dup) return null;
+    if (dup.targetType !== type || dup.targetId !== id || roundMoney(dup.amount) !== roundMoney(amt)) {
+      throw httpError(`RRN ${rrn} 已認列於其他單據，請核對端末簽單`, 409, 'YIPAY_RRN_DUPLICATE');
+    }
+    return dup;
+  };
+  const existing = await findSameRrn();
+  if (existing) return existing;
 
-  return prisma.yipayTerminalCapture.create({
-    data: {
-      id: newId(),
-      targetType: type,
-      targetId: id,
-      amount: amt,
-      rrn: rrn ? String(rrn) : null,
-      authCode: authCode ? String(authCode) : null,
-      cardLast4: cardLast4 ? String(cardLast4).slice(-4) : null,
-      branchId: branchId != null ? Number(branchId) : null,
-      staffId: staffId != null ? Number(staffId) : null,
-      terminalRef: terminalRef ? String(terminalRef).slice(0, 120) : null,
-      status: 'PENDING_CONFIRM',
-      raw: raw && typeof raw === 'object' ? raw : undefined,
-    },
-  });
+  try {
+    return await prisma.yipayTerminalCapture.create({
+      data: {
+        id: newId(),
+        targetType: type,
+        targetId: id,
+        amount: amt,
+        rrn: rrn ? String(rrn) : null,
+        authCode: authCode ? String(authCode) : null,
+        cardLast4: cardLast4 ? String(cardLast4).slice(-4) : null,
+        branchId: branchId != null ? Number(branchId) : null,
+        staffId: staffId != null ? Number(staffId) : null,
+        terminalRef: terminalRef ? String(terminalRef).slice(0, 120) : null,
+        status: 'PENDING_CONFIRM',
+        raw: raw && typeof raw === 'object' ? raw : undefined,
+      },
+    });
+  } catch (e) {
+    if (e?.code !== 'P2002') throw e;
+    const raced = await findSameRrn();
+    if (raced) return raced;
+    throw e;
+  }
 }
 
 /** confirm 成功後標記對應暫存為 CONFIRMED */
@@ -239,17 +253,13 @@ export async function reconcileYipayDay(
     ...(branchId != null ? { branchId: Number(branchId) } : {}),
   };
 
-  const [pending, confirmedRows, orphans, system] = await Promise.all([
+  const [pending, confirmedRows, system] = await Promise.all([
     prisma.yipayTerminalCapture.findMany({
       where: { ...whereBase, status: 'PENDING_CONFIRM' },
       orderBy: { createdAt: 'asc' },
     }),
     prisma.yipayTerminalCapture.findMany({
       where: { ...whereBase, status: 'CONFIRMED' },
-      orderBy: { createdAt: 'asc' },
-    }),
-    prisma.yipayTerminalCapture.findMany({
-      where: { ...whereBase, status: 'ORPHAN' },
       orderBy: { createdAt: 'asc' },
     }),
     loadSystemYipayPaid(start, end, branchId),

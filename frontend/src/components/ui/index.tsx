@@ -1,4 +1,13 @@
-import { useState, type CSSProperties, type ReactNode, type ButtonHTMLAttributes, type InputHTMLAttributes, type SelectHTMLAttributes } from 'react';
+import {
+  useEffect,
+  useId,
+  useState,
+  type CSSProperties,
+  type ReactNode,
+  type ButtonHTMLAttributes,
+  type InputHTMLAttributes,
+  type SelectHTMLAttributes,
+} from 'react';
 
 interface CardProps {
   title?: string;
@@ -66,8 +75,8 @@ export function Button({
     <button
       type={type}
       className={`btn btn--${variant} btn--${size}${loading ? ' is-loading' : ''}${className ? ` ${className}` : ''}`}
-      disabled={loading || props.disabled}
       {...props}
+      disabled={loading || props.disabled}
     >
       {loading && <span className="btn__spinner" />}
       {children}
@@ -220,25 +229,48 @@ export function Modal({
   children,
   onClose,
   footer,
+  closeOnBackdrop = true,
+  wide = false,
 }: {
   open: boolean;
   title: string;
   children: ReactNode;
   onClose: () => void;
   footer?: ReactNode;
+  /** 金流確認等流程可設 false，避免誤點背景關閉 */
+  closeOnBackdrop?: boolean;
+  /** 含表格之明細視窗 */
+  wide?: boolean;
 }) {
+  const titleId = useId();
+
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [open, onClose]);
+
   if (!open) return null;
   return (
-    <div className="modal-backdrop" onClick={onClose} role="presentation">
+    <div
+      className="modal-backdrop"
+      onClick={() => {
+        if (closeOnBackdrop) onClose();
+      }}
+      role="presentation"
+    >
       <div
-        className="modal"
+        className={wide ? 'modal modal--wide' : 'modal'}
         onClick={(e) => e.stopPropagation()}
         role="dialog"
         aria-modal="true"
-        aria-labelledby="modal-title"
+        aria-labelledby={titleId}
       >
         <header className="modal__header">
-          <h3 id="modal-title">{title}</h3>
+          <h3 id={titleId}>{title}</h3>
           <button type="button" className="modal__close" onClick={onClose} aria-label="關閉">
             ×
           </button>

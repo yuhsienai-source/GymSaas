@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useState } from 'react';
 import { QRCodeSVG } from 'qrcode.react';
 import { Alert, Button, Card, EmptyState } from '../../ui';
 import { useToast } from '../../../contexts/ToastContext';
@@ -14,8 +14,14 @@ type Props = {
 
 export default function TrainerCheckInPanel({ classItem, viewAsTrainerId }: Props) {
   const { toast } = useToast();
-  const [token, setToken] = useState('');
-  const [expiresAt, setExpiresAt] = useState<string | null>(null);
+  const [issued, setIssued] = useState<{
+    classId: number;
+    token: string;
+    expiresAt: string | null;
+  } | null>(null);
+  const current = issued && issued.classId === classItem?.id ? issued : null;
+  const token = current?.token ?? '';
+  const expiresAt = current?.expiresAt ?? null;
   const [loading, setLoading] = useState(false);
 
   const generate = useCallback(async () => {
@@ -28,8 +34,11 @@ export default function TrainerCheckInPanel({ classItem, viewAsTrainerId }: Prop
         viewAsTrainerId,
       });
       if (res.status === 'success' && res.data?.token) {
-        setToken(res.data.token);
-        setExpiresAt(res.data.expiresAt);
+        setIssued({
+          classId: classItem.id,
+          token: res.data.token,
+          expiresAt: res.data.expiresAt ?? null,
+        });
         toast('QR 簽到碼已產生', 'success');
       } else {
         toast(res.message || '產生失敗', 'error');
@@ -40,11 +49,6 @@ export default function TrainerCheckInPanel({ classItem, viewAsTrainerId }: Prop
       setLoading(false);
     }
   }, [classItem, viewAsTrainerId, toast]);
-
-  useEffect(() => {
-    setToken('');
-    setExpiresAt(null);
-  }, [classItem?.id]);
 
   if (!classItem) {
     return (

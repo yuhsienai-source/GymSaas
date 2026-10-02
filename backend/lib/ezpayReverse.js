@@ -1,10 +1,25 @@
 // lib/ezpayReverse.js
-// 交易異動：取消銷貨／退費折讓時，解析發票上下文並呼叫 ezPay 作廢或折讓
-// 軟拆後：各子單（SAL／TYK／CRS／私教）各自開票，異動只動自己那張
-// 舊版合併單一發票：有存活兄弟單時禁止作廢整張，僅准折讓
+// 交易異動：取消銷貨／退費折讓時，解析發票上下文並經 einvoice 閘道作廢或折讓（依發票營業人憑證）
+// 軟拆後：各子單（SAL／TYK／CRS／私教／團課）各自開票，異動只動自己那張
+// 舊版合併單一發票（EInvoice refType=CHECKOUT）：有存活兄弟單時禁止作廢整張，僅准折讓
 import prisma from './prisma.js';
-import { reverseIssuedInvoice, sanitizeMerchantOrderNo } from './ezpay.js';
-import { isLegacySharedCheckoutInvoice } from './checkoutInvoice.js';
+import { sanitizeMerchantOrderNo } from './ezpay.js';
+import { reverseEInvoice } from './einvoice.js';
+
+/** 單據目前已開立之發票（第一張為主；其餘如免稅分張另列） */
+async function issuedInvoicesOf(refId, db) {
+  return db.eInvoice.findMany({
+    where: { refId: String(refId), status: 'ISSUED' },
+    orderBy: { createdAt: 'asc' },
+  });
+}
+
+async function legacySharedInvoiceOf(checkoutSessionId, db) {
+  if (!checkoutSessionId) return null;
+  return db.eInvoice.findFirst({
+    where: { refType: 'CHECKOUT', refId: String(checkoutSessionId), status: 'ISSUED' },
+  });
+}
 
 function roundMoney(n) {
   return Math.round((Number(n) || 0) * 100) / 100;
@@ -98,257 +113,134 @@ export async function listAliveCheckoutSiblings(
 
 /**
  * 取消商品銷售：決定如何反向發票
+ * 軟拆／獨立子單發票只動 SAL 自己；舊版合併發票有存活兄弟單時僅准折讓
  */
 export async function resolveSaleInvoiceReverse(sale, { tx } = {}) {
   const db = tx || prisma;
   const saleAmount = roundMoney(sale.amount);
-  const childInv = sale.invoiceNumber || null;
+  const childRows = await issuedInvoicesOf(sale.id, db);
+  const childInv = childRows[0]?.invoiceNumber || null;
+  const session = sale.checkoutSessionId
+    ? await db.checkoutSession.findUnique({ where: { id: sale.checkoutSessionId } })
+    : null;
+  const legacyRow = !childInv && session ? await legacySharedInvoiceOf(session.id, db) : null;
 
-  if (!sale.checkoutSessionId) {
-    if (!childInv) {
-      return {
-        invoiceNumber: null,
-        merchantOrderNo: sanitizeMerchantOrderNo(sale.id),
-        amount: saleAmount,
-        itemDesc: sale.itemDesc || '商品銷售',
-        prefer: 'void',
-        checkoutSessionId: null,
-        sharedInvoice: false,
-        skip: true,
-      };
-    }
+  if (!legacyRow) {
     return {
       invoiceNumber: childInv,
       merchantOrderNo: sanitizeMerchantOrderNo(sale.id),
       amount: saleAmount,
       itemDesc: sale.itemDesc || '商品銷售',
       prefer: 'void',
-      checkoutSessionId: null,
-      sharedInvoice: false,
-      skip: false,
-    };
-  }
-
-  const session = await db.checkoutSession.findUnique({
-    where: { id: sale.checkoutSessionId },
-  });
-  if (!session) {
-    return {
-      invoiceNumber: childInv,
-      merchantOrderNo: sanitizeMerchantOrderNo(sale.id),
-      amount: saleAmount,
-      itemDesc: sale.itemDesc || '商品銷售',
-      prefer: childInv ? 'void' : 'void',
-      checkoutSessionId: sale.checkoutSessionId,
+      checkoutSessionId: session?.id || sale.checkoutSessionId || null,
       sharedInvoice: false,
       skip: !childInv,
+      extraInvoiceNumbers: childRows.slice(1).map((r) => r.invoiceNumber),
     };
   }
 
-  const legacyShared = isLegacySharedCheckoutInvoice(session.invoiceNumber, childInv);
-
-  // 軟拆／獨立子單發票：只動 SAL 自己
-  if (!legacyShared) {
-    if (!childInv) {
-      return {
-        invoiceNumber: null,
-        merchantOrderNo: sanitizeMerchantOrderNo(sale.id),
-        amount: saleAmount,
-        itemDesc: sale.itemDesc || '商品銷售',
-        prefer: 'void',
-        checkoutSessionId: session.id,
-        sharedInvoice: false,
-        skip: true,
-      };
-    }
+  const siblings = await listAliveCheckoutSiblings(session, { excludeSaleId: sale.id, tx: db });
+  const legacy = {
+    invoiceNumber: legacyRow.invoiceNumber,
+    merchantOrderNo: sanitizeMerchantOrderNo(session.id),
+    checkoutSessionId: session.id,
+  };
+  if (siblings.length > 0 && legacy.invoiceNumber) {
     return {
-      invoiceNumber: childInv,
-      merchantOrderNo: sanitizeMerchantOrderNo(sale.id),
-      amount: saleAmount,
-      itemDesc: sale.itemDesc || '商品銷售',
-      prefer: 'void',
-      checkoutSessionId: session.id,
-      sharedInvoice: false,
-      skip: false,
-    };
-  }
-
-  // 舊版合併單一發票
-  const siblings = await listAliveCheckoutSiblings(session, {
-    excludeSaleId: sale.id,
-    tx: db,
-  });
-  const invoiceNumber = session.invoiceNumber || childInv;
-  const merchantOrderNo = sanitizeMerchantOrderNo(session.id);
-
-  if (siblings.length > 0 && invoiceNumber) {
-    return {
-      invoiceNumber,
-      merchantOrderNo,
+      ...legacy,
       amount: saleAmount,
       itemDesc: sale.itemDesc || '商品銷售折讓',
       prefer: 'allowance',
-      checkoutSessionId: session.id,
       sharedInvoice: true,
       skip: false,
     };
   }
-
   return {
-    invoiceNumber,
-    merchantOrderNo,
+    ...legacy,
     amount: roundMoney(session.amount || saleAmount),
     itemDesc: session.itemDesc || sale.itemDesc || '合併結帳',
     prefer: 'void',
-    checkoutSessionId: session.id,
     sharedInvoice: false,
-    skip: !invoiceNumber,
+    skip: !legacy.invoiceNumber,
   };
 }
 
 /**
  * 儲值／購案／私教 Order 退費或取消：決定如何反向發票
+ * 應退 ≥ 單據金額 → 作廢（連同分張）；部分 → 折讓；舊版合併發票有存活兄弟單時僅准折讓
  */
 export async function resolveOrderInvoiceReverse(order, { refundCash, tx } = {}) {
   const db = tx || prisma;
   const orderAmount = roundMoney(order.amount);
   const cash = roundMoney(refundCash);
-  const childInv = order.invoiceNumber || null;
+  const partial = Math.min(cash, orderAmount);
+  const childRows = await issuedInvoicesOf(order.id, db);
+  const childInv = childRows[0]?.invoiceNumber || null;
+  const session = order.checkoutSessionId
+    ? await db.checkoutSession.findUnique({ where: { id: order.checkoutSessionId } })
+    : null;
+  const legacyRow = !childInv && session ? await legacySharedInvoiceOf(session.id, db) : null;
 
-  let session = null;
-  if (order.checkoutSessionId) {
-    session = await db.checkoutSession.findUnique({
-      where: { id: order.checkoutSessionId },
-    });
+  const base = {
+    merchantOrderNo: sanitizeMerchantOrderNo(order.id),
+    itemDesc: order.itemDesc || '訂單',
+    checkoutSessionId: session?.id || null,
+    sharedInvoice: false,
+    skip: false,
+  };
+
+  if (!childInv && !legacyRow) {
+    return { ...base, invoiceNumber: null, amount: 0, prefer: 'allowance', skip: true, skipReason: '無發票' };
   }
-
-  if (!childInv && !session?.invoiceNumber) {
-    return {
-      invoiceNumber: null,
-      merchantOrderNo: sanitizeMerchantOrderNo(order.id),
-      amount: 0,
-      itemDesc: order.itemDesc || '訂單',
-      prefer: 'allowance',
-      checkoutSessionId: session?.id || null,
-      sharedInvoice: false,
-      skip: true,
-      skipReason: '無發票',
-    };
-  }
-
   if (cash <= 0) {
-    // 勿回傳 SPLIT:／逗號複合標記，以免上游誤當真實發票號強制折讓
-    const safeInv =
-      childInv && !String(childInv).startsWith('SPLIT:') && !String(childInv).includes(',')
-        ? childInv
-        : null;
     return {
-      invoiceNumber: safeInv,
-      merchantOrderNo: sanitizeMerchantOrderNo(order.id),
+      ...base,
+      invoiceNumber: childInv,
       amount: 0,
-      itemDesc: order.itemDesc || '訂單',
       prefer: 'allowance',
-      checkoutSessionId: session?.id || null,
-      sharedInvoice: false,
       skip: true,
       skipReason: '應退現金為 0，無需折讓／作廢',
     };
   }
 
-  const legacyShared = session
-    ? isLegacySharedCheckoutInvoice(session.invoiceNumber, childInv)
-    : false;
-
-  // 軟拆／獨立：MerchantOrderNo = 訂單號
-  if (!legacyShared) {
-    const invoiceNumber = childInv;
-    if (!invoiceNumber) {
-      return {
-        invoiceNumber: null,
-        merchantOrderNo: sanitizeMerchantOrderNo(order.id),
-        amount: Math.min(cash, orderAmount),
-        itemDesc: order.itemDesc || '訂單',
-        prefer: 'allowance',
-        checkoutSessionId: session?.id || null,
-        sharedInvoice: false,
-        skip: true,
-        skipReason: '無子單發票',
-      };
-    }
+  if (!legacyRow) {
     if (cash >= orderAmount) {
       return {
-        invoiceNumber,
-        merchantOrderNo: sanitizeMerchantOrderNo(order.id),
+        ...base,
+        invoiceNumber: childInv,
         amount: orderAmount,
-        itemDesc: order.itemDesc || '訂單',
         prefer: 'void',
-        checkoutSessionId: session?.id || null,
-        sharedInvoice: false,
-        skip: false,
+        extraInvoiceNumbers: childRows.slice(1).map((r) => r.invoiceNumber),
       };
     }
-    return {
-      invoiceNumber,
-      merchantOrderNo: sanitizeMerchantOrderNo(order.id),
-      amount: Math.min(cash, orderAmount),
-      itemDesc: order.itemDesc || '退費折讓',
-      prefer: 'allowance',
-      checkoutSessionId: session?.id || null,
-      sharedInvoice: false,
-      skip: false,
-    };
+    return { ...base, invoiceNumber: childInv, amount: partial, itemDesc: order.itemDesc || '退費折讓', prefer: 'allowance' };
   }
 
-  // 舊版合併單一發票
-  const siblings = await listAliveCheckoutSiblings(session, {
-    excludeOrderId: order.id,
-    tx: db,
-  });
-  const invoiceNumber = session.invoiceNumber || childInv;
-  const merchantOrderNo = sanitizeMerchantOrderNo(session.id);
-
-  if (siblings.length > 0) {
-    return {
-      invoiceNumber,
-      merchantOrderNo,
-      amount: Math.min(cash, orderAmount),
-      itemDesc: order.itemDesc || '退費折讓',
-      prefer: 'allowance',
-      checkoutSessionId: session.id,
-      sharedInvoice: true,
-      skip: false,
-    };
-  }
-
-  if (cash >= orderAmount && cash >= roundMoney(session.amount || orderAmount)) {
-    return {
-      invoiceNumber,
-      merchantOrderNo,
-      amount: roundMoney(session.amount || orderAmount),
-      itemDesc: session.itemDesc || order.itemDesc || '合併結帳',
-      prefer: 'void',
-      checkoutSessionId: session.id,
-      sharedInvoice: false,
-      skip: false,
-    };
-  }
-
-  return {
-    invoiceNumber,
-    merchantOrderNo,
-    amount: Math.min(cash, orderAmount),
-    itemDesc: order.itemDesc || '退費折讓',
-    prefer: 'allowance',
-    checkoutSessionId: session.id,
-    sharedInvoice: false,
-    skip: false,
+  const legacy = {
+    ...base,
+    invoiceNumber: legacyRow.invoiceNumber,
+    merchantOrderNo: sanitizeMerchantOrderNo(session.id),
   };
+  const siblings = await listAliveCheckoutSiblings(session, { excludeOrderId: order.id, tx: db });
+  if (siblings.length > 0) {
+    return { ...legacy, amount: partial, itemDesc: order.itemDesc || '退費折讓', prefer: 'allowance', sharedInvoice: true };
+  }
+  const sessionAmount = roundMoney(session.amount || orderAmount);
+  if (cash >= orderAmount && cash >= sessionAmount) {
+    return { ...legacy, amount: sessionAmount, itemDesc: session.itemDesc || order.itemDesc || '合併結帳', prefer: 'void' };
+  }
+  return { ...legacy, amount: partial, itemDesc: order.itemDesc || '退費折讓', prefer: 'allowance' };
 }
 
 /**
- * 執行 ezPay 反向；成功時可選擇回寫 CheckoutSession／關聯單據註記
+ * 執行 ezPay 反向；折讓成功時由 einvoice 寫入 InvoiceAllowance 並回傳 result.slip
+ * @param {{ reason?, buyerEmail?, prefer?, staffId?,
+ *   allowance?: { source: string, orderId?: string|null, saleOrderId?: string|null, memberId?: number|null } }} opts
  */
-export async function executeInvoiceReverse(ctx, { reason, buyerEmail, prefer } = {}) {
+export async function executeInvoiceReverse(
+  ctx,
+  { reason, buyerEmail, prefer, staffId = null, allowance: allowanceContext = {} } = {},
+) {
   const mode = prefer || ctx?.prefer || 'void';
   const amt = roundMoney(ctx?.amount);
   if (!ctx?.invoiceNumber || ctx.skip) {
@@ -364,15 +256,38 @@ export async function executeInvoiceReverse(ctx, { reason, buyerEmail, prefer } 
   if (mode === 'allowance') {
     assertRealInvoiceForAllowance(ctx.invoiceNumber, '退費折讓');
   }
-  return reverseIssuedInvoice({
+  const result = await reverseEInvoice({
     invoiceNumber: ctx.invoiceNumber,
-    merchantOrderNo: ctx.merchantOrderNo,
     itemDesc: ctx.itemDesc,
     amount: ctx.amount,
     reason,
     prefer: mode,
     buyerEmail,
+    staffId,
+    allowanceContext,
   });
+  // 全額作廢時，同單據其他分張（如免稅品）一併作廢
+  if (result.action === 'void' && Array.isArray(ctx.extraInvoiceNumbers)) {
+    result.extraVoided = [];
+    for (const inv of ctx.extraInvoiceNumbers) {
+      try {
+        const r = await reverseEInvoice({ invoiceNumber: inv, prefer: 'void', reason, staffId, itemDesc: ctx.itemDesc });
+        result.extraVoided.push({ invoiceNumber: inv, action: r.action });
+      } catch (err) {
+        console.error(`作廢分張發票 ${inv} 失敗:`, err.message);
+        result.extraVoided.push({ invoiceNumber: inv, error: err.message });
+      }
+    }
+  }
+  return result;
+}
+
+/** 作廢結果之發票號清單（含同單據分張；分張失敗者標註） */
+export function voidedInvoiceLabel(reverseResult) {
+  const extra = (reverseResult?.extraVoided || []).map((x) =>
+    x.error ? `${x.invoiceNumber}（作廢失敗，請人工處理）` : x.invoiceNumber,
+  );
+  return [reverseResult?.invoiceNumber, ...extra].filter(Boolean).join('、');
 }
 
 /**
@@ -384,7 +299,7 @@ export function appendInvoiceReverseNote(itemDesc, reverseResult) {
     return base;
   }
   if (reverseResult.action === 'void') {
-    return `${base}｜發票已作廢 ${reverseResult.invoiceNumber}`.trim();
+    return `${base}｜發票已作廢 ${voidedInvoiceLabel(reverseResult)}`.trim();
   }
   if (reverseResult.action === 'allowance') {
     return `${base}｜發票折讓 ${reverseResult.invoiceNumber} 折讓號 ${reverseResult.allowanceNo} $${reverseResult.allowanceAmt}`.trim();
@@ -446,7 +361,7 @@ export async function reevaluateCheckoutSessionStatus(tx, checkoutSessionId) {
   const ptOrders = await db.order.findMany({
     where: {
       checkoutSessionId: session.id,
-      itemDesc: { contains: '私教' },
+      OR: [{ itemDesc: { contains: '私教' } }, { id: { startsWith: 'GRP' } }],
       ...(session.orderId ? { id: { not: session.orderId } } : {}),
     },
     select: { status: true },

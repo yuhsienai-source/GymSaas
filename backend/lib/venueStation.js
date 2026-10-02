@@ -84,7 +84,7 @@ export function serializeVenueStation(row) {
 }
 
 export const venueWithStationsInclude = {
-  branch: { select: { id: true, name: true, code: true } },
+  branch: { select: { id: true, name: true, code: true, parentId: true } },
   stations: { orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }] },
 };
 

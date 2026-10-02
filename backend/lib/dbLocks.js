@@ -1,4 +1,4 @@
-// lib/dbLocks.js — PostgreSQL 悲觀鎖（進出場並發）＋條件式雙錢包扣款
+// lib/dbLocks.js — PostgreSQL 悲觀鎖（進出場並發）；錢包增減一律經 lib/walletMutation.js
 
 /**
  * 鎖定會員列（SELECT … FOR UPDATE），序列化同會員進出場／扣款。
@@ -8,6 +8,22 @@
 export async function lockMemberRow(tx, memberId) {
   const rows = await tx.$queryRaw`
     SELECT id FROM "Member" WHERE id = ${memberId} FOR UPDATE
+  `;
+  return rows[0] ?? null;
+}
+
+/** 鎖定員工列，序列化同員工上下班打卡（防連點雙開卡） */
+export async function lockStaffRow(tx, staffId) {
+  const rows = await tx.$queryRaw`
+    SELECT id FROM "Staff" WHERE id = ${staffId} FOR UPDATE
+  `;
+  return rows[0] ?? null;
+}
+
+/** 鎖定薪資批次列，序列化同批次之重算／核定／結算 */
+export async function lockPayrollRun(tx, runId) {
+  const rows = await tx.$queryRaw`
+    SELECT id, status FROM "PayrollRun" WHERE id = ${runId} FOR UPDATE
   `;
   return rows[0] ?? null;
 }
@@ -40,45 +56,6 @@ export async function lockActiveCheckInLog(tx, { memberId, logId = null }) {
           FOR UPDATE
         `;
   return rows[0] ?? null;
-}
-
-/**
- * 雙錢包原子遞減（條件式 UPDATE，拒絕寫成負數）。
- * 呼叫前必須已對 Member 列 FOR UPDATE。
- * @returns {Promise<{ cashWallet: number, bonusWallet: number } | null>}
- */
-export async function decrementWalletsAtomic(tx, memberId, deductBonus, deductCash) {
-  const bonus = Number(deductBonus) || 0;
-  const cash = Number(deductCash) || 0;
-  if (bonus < 0 || cash < 0) {
-    throw new Error('wallet decrement must be non-negative');
-  }
-  if (bonus === 0 && cash === 0) {
-    const m = await tx.member.findUnique({
-      where: { id: memberId },
-      select: { cashWallet: true, bonusWallet: true },
-    });
-    return m
-      ? { cashWallet: Number(m.cashWallet), bonusWallet: Number(m.bonusWallet) }
-      : null;
-  }
-
-  const rows = await tx.$queryRaw`
-    UPDATE "Member"
-    SET
-      "bonusWallet" = "bonusWallet" - ${bonus},
-      "cashWallet" = "cashWallet" - ${cash}
-    WHERE id = ${memberId}
-      AND "bonusWallet" >= ${bonus}
-      AND "cashWallet" >= ${cash}
-    RETURNING "cashWallet", "bonusWallet"
-  `;
-  const row = rows[0];
-  if (!row) return null;
-  return {
-    cashWallet: Number(row.cashWallet),
-    bonusWallet: Number(row.bonusWallet),
-  };
 }
 
 export function isUniqueViolation(err) {

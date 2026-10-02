@@ -198,7 +198,7 @@ export default function HqSalesAnalyticsTab({ branches, trainers }: Props) {
   }
 
   const summary = payload?.summary;
-  const rows = payload?.rows ?? [];
+  const rows = useMemo(() => payload?.rows ?? [], [payload]);
 
   const chartPoints = useMemo(() => {
     if (kind === 'daily') {

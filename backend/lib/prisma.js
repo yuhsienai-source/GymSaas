@@ -15,3 +15,9 @@ const prisma = new PrismaClient({ adapter, log: ['info', 'warn', 'error'] });
 
 // 將設定好的 prisma 實體匯出，供其他檔案共用
 export default prisma;
+
+/** 外部建立之連線池不隨 prisma.$disconnect() 關閉；需完整結束行程（腳本／測試）時另行 end() */
+export async function closePrisma() {
+  await prisma.$disconnect();
+  await pool.end();
+}

@@ -82,7 +82,12 @@ export default function OpsIdPhotoAssistPanel({
 }: Props) {
   const { toast } = useToast();
   const [assistConsentId, setAssistConsentId] = useState<string | null>(null);
-  const [consentOk, setConsentOk] = useState(false);
+  const lastSig = posDisplay.lastSignature;
+  const consentOk = Boolean(
+    assistConsentId &&
+      lastSig?.purpose === 'ID_PHOTO_ASSIST' &&
+      lastSig.consentSignatureId === assistConsentId,
+  );
   const [cameraSide, setCameraSide] = useState<IdPhotoSide | null>(null);
   const [cameraReady, setCameraReady] = useState(false);
   const [cameraError, setCameraError] = useState('');
@@ -98,30 +103,15 @@ export default function OpsIdPhotoAssistPanel({
   }
 
   useEffect(() => {
-    setAssistConsentId(null);
-    setConsentOk(false);
-    setCameraSide(null);
-    toastedConsentRef.current = null;
-    stopCamera();
-  }, [member.id]);
-
-  useEffect(() => {
-    const sig = posDisplay.lastSignature;
-    if (!sig || !assistConsentId) return;
-    if (sig.purpose !== 'ID_PHOTO_ASSIST') return;
-    if (sig.consentSignatureId !== assistConsentId) return;
-    setConsentOk(true);
+    if (!consentOk || !assistConsentId) return;
     if (toastedConsentRef.current !== assistConsentId) {
       toastedConsentRef.current = assistConsentId;
       toast('客顯委託簽署完成，可開始拍攝證件', 'success');
     }
-  }, [posDisplay.lastSignature, assistConsentId, toast]);
+  }, [consentOk, assistConsentId, toast]);
 
   useEffect(() => {
-    if (!cameraSide) {
-      stopCamera();
-      return;
-    }
+    if (!cameraSide) return;
     let cancelled = false;
     void (async () => {
       setCameraError('');
@@ -162,7 +152,6 @@ export default function OpsIdPhotoAssistPanel({
       branchLabel: String(branchCode),
     });
     setAssistConsentId(id);
-    setConsentOk(false);
     toast(`已派送客顯委託書（${today}）`, 'info');
   }
 
@@ -223,7 +212,7 @@ export default function OpsIdPhotoAssistPanel({
     <Card title="臨櫃代辦證件上傳" subtitle="授權簽署先行 → 受控設備拍攝 → 記憶體浮水印上傳">
       <Alert tone="info">
         嚴禁私人手機翻拍後經 LINE／AirDrop／檔案選擇器帶入。須先派送客顯委託書取得親簽。
-        {posDisplay.displayLinked ? ' · 客顯已連線' : ' · 客顯尚未回報連線'}
+        {posDisplay.displayLinked ? ' · 客顯已連線' : ' · 客顯未連線（請重開客顯）'}
       </Alert>
 
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem', marginTop: '0.75rem' }}>
@@ -239,7 +228,6 @@ export default function OpsIdPhotoAssistPanel({
             variant="ghost"
             onClick={() => {
               setAssistConsentId(null);
-              setConsentOk(false);
               posDisplay.clearSignature();
               posDisplay.clearPendingConsent();
               posDisplay.postIdle();
@@ -288,7 +276,7 @@ export default function OpsIdPhotoAssistPanel({
         <div className="id-photo-camera" style={{ marginTop: '0.75rem' }}>
           <p className="id-photo-side__title">拍攝{SIDE_LABEL[cameraSide]}（導引框置中）</p>
           {cameraError ? (
-            <Alert tone="danger">{cameraError}</Alert>
+            <Alert tone="error">{cameraError}</Alert>
           ) : (
             <video
               ref={videoRef}

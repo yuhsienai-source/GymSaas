@@ -1,7 +1,44 @@
-// routes/hr.js — 員工考勤／請假／排班（HQ 管理 + 員工自助）
+// routes/hr.js — 員工考勤／請假／國定假日／排班（HQ 管理 + 員工自助）；商業規則在 lib/*Service.js
 import express from 'express';
 import prisma from '../lib/prisma.js';
 import { verifyStaff, requireAdmin } from '../middleware/jwtAuth.js';
+import { getMyRosterOverview, respondRosterAck, submitOffRequest } from '../lib/rosterService.js';
+import {
+  EFFECTIVE_SCHEDULE_OR,
+  createManualSchedule,
+  deleteManualSchedule,
+  listScheduleOverview,
+  updateManualSchedule,
+} from '../lib/staffScheduleService.js';
+import { getMyCoachPlans, saveMyCoachPlan, submitMyCoachPlan, withdrawMyCoachPlan } from '../lib/coachScheduleService.js';
+import {
+  backfillAttendance,
+  correctAttendance,
+  getMyAttendance,
+  listAttendance,
+  punchIn,
+  punchOut,
+  resolveDutyStatus,
+} from '../lib/attendanceService.js';
+import {
+  cancelMyLeave,
+  createLeaveByHq,
+  getMyLeaves,
+  leaveMonthReport,
+  listLeaves,
+  requestLeave,
+  reviewLeave,
+} from '../lib/staffLeaveService.js';
+import {
+  addHoliday,
+  deleteHoliday,
+  listHolidays,
+  parseHolidayYear,
+  renameHoliday,
+  seedDefaultHolidays,
+} from '../lib/publicHolidayService.js';
+import { buildPayrollExport } from '../lib/payrollExport.js';
+import { getMyPayslip, listMyPayslips } from '../lib/payrollService.js';
 
 /** 員工 JWT：staffId 在 id（相容 staffId 欄位） */
 function staffIdFromUser(user) {
@@ -18,26 +55,45 @@ function httpError(message, statusCode = 400) {
 
 function parseDate(value, fieldName) {
   const d = new Date(value);
-  if (Number.isNaN(d.getTime())) throw httpError(`${fieldName} 無效`);
+  if (value === undefined || value === null || value === '' || Number.isNaN(d.getTime())) {
+    throw httpError(`${fieldName} 無效`);
+  }
   return d;
 }
 
-function parseOptionalInt(value) {
+function parseOptionalInt(value, fieldName = 'id') {
   if (value === undefined || value === null || value === '') return null;
   const n = parseInt(value, 10);
-  if (!Number.isInteger(n) || n <= 0) throw httpError('branchId 無效');
+  if (!Number.isInteger(n) || n <= 0) throw httpError(`${fieldName} 無效`);
   return n;
+}
+
+function parseId(value, fieldName = 'id') {
+  const n = parseOptionalInt(value, fieldName);
+  if (!n) throw httpError(`${fieldName} 無效`);
+  return n;
+}
+
+function queryKey(value) {
+  return value ? String(value).trim().toUpperCase() : undefined;
 }
 
 function sendErr(res, error, fallback = '操作失敗') {
   if (error.statusCode) {
-    return res.status(error.statusCode).json({ status: 'error', message: error.message });
+    return res
+      .status(error.statusCode)
+      .json({ status: 'error', code: error.code || undefined, message: error.message, data: error.data });
   }
   console.error(error);
   return res.status(500).json({ status: 'error', message: fallback });
 }
 
-const staffInclude = { staff: { select: { id: true, name: true, displayName: true, role: true } } };
+/** 員工自助路由共用：身分一律取自 JWT */
+function selfStaffId(req) {
+  const staffId = staffIdFromUser(req.user);
+  if (!staffId) throw httpError('⛔ 憑證缺少員工 id', 403);
+  return staffId;
+}
 
 // ==========================================
 // HQ 管理：/api/hq/hr
@@ -45,19 +101,17 @@ const staffInclude = { staff: { select: { id: true, name: true, displayName: tru
 export const hrAdminRouter = express.Router();
 hrAdminRouter.use(verifyStaff, requireAdmin);
 
+// ── 考勤 ──
 hrAdminRouter.get('/attendance', async (req, res) => {
   try {
-    const where = {};
-    if (req.query.staffId) where.staffId = parseInt(req.query.staffId, 10);
-    if (req.query.from) where.punchIn = { ...(where.punchIn || {}), gte: parseDate(req.query.from, 'from') };
-    if (req.query.to) where.punchIn = { ...(where.punchIn || {}), lte: parseDate(req.query.to, 'to') };
-    const rows = await prisma.staffAttendance.findMany({
-      where,
-      include: staffInclude,
-      orderBy: { punchIn: 'desc' },
-      take: Math.min(500, parseInt(req.query.take, 10) || 200),
+    const data = await listAttendance({
+      from: req.query.from ? String(req.query.from) : undefined,
+      to: req.query.to ? String(req.query.to) : undefined,
+      branchId: parseOptionalInt(req.query.branchId, 'branchId'),
+      staffId: parseOptionalInt(req.query.staffId, 'staffId'),
+      flag: queryKey(req.query.flag),
     });
-    res.json({ status: 'success', data: rows });
+    res.json({ status: 'success', message: '考勤', data });
   } catch (error) {
     sendErr(res, error, '讀取考勤失敗');
   }
@@ -65,38 +119,64 @@ hrAdminRouter.get('/attendance', async (req, res) => {
 
 hrAdminRouter.post('/attendance', async (req, res) => {
   try {
-    const staffId = parseInt(req.body?.staffId, 10);
-    if (!Number.isInteger(staffId) || staffId <= 0) throw httpError('請提供 staffId');
-    const punchIn = parseDate(req.body?.punchIn || new Date(), 'punchIn');
-    const punchOut = req.body?.punchOut ? parseDate(req.body.punchOut, 'punchOut') : null;
-    const row = await prisma.staffAttendance.create({
-      data: {
-        staffId,
-        branchId: parseOptionalInt(req.body?.branchId),
-        punchIn,
-        punchOut,
-        note: req.body?.note ? String(req.body.note).slice(0, 200) : null,
-      },
-      include: staffInclude,
+    const data = await backfillAttendance({
+      staffId: parseId(req.body?.staffId, 'staffId'),
+      branchId: parseOptionalInt(req.body?.branchId, 'branchId'),
+      scheduleId: parseOptionalInt(req.body?.scheduleId, 'scheduleId'),
+      punchIn: parseDate(req.body?.punchIn, 'punchIn'),
+      punchOut: req.body?.punchOut ? parseDate(req.body.punchOut, 'punchOut') : null,
+      reason: req.body?.reason,
+      actorStaffId: staffIdFromUser(req.user),
     });
-    res.json({ status: 'success', message: '已建立考勤紀錄', data: row });
+    res.json({ status: 'success', message: '已補登考勤', data });
   } catch (error) {
-    sendErr(res, error, '建立考勤失敗');
+    sendErr(res, error, '補登考勤失敗');
   }
 });
 
+hrAdminRouter.patch('/attendance/:id', async (req, res) => {
+  try {
+    const data = await correctAttendance(parseId(req.params.id), {
+      punchIn: req.body?.punchIn ? parseDate(req.body.punchIn, 'punchIn') : undefined,
+      punchOut:
+        req.body?.punchOut === null ? null : req.body?.punchOut ? parseDate(req.body.punchOut, 'punchOut') : undefined,
+      reason: req.body?.reason,
+      actorStaffId: staffIdFromUser(req.user),
+    });
+    res.json({ status: 'success', message: '已更正考勤', data });
+  } catch (error) {
+    sendErr(res, error, '更正考勤失敗');
+  }
+});
+
+/** 相容舊報表：區間彙總（同 GET /attendance 之 byStaff） */
+hrAdminRouter.get('/attendance/report', async (req, res) => {
+  try {
+    const data = await listAttendance({
+      from: req.query.from ? String(req.query.from) : undefined,
+      to: req.query.to ? String(req.query.to) : undefined,
+      defaultDays: 30,
+    });
+    res.json({
+      status: 'success',
+      data: { from: data.from, to: data.to, items: data.byStaff, summary: data.summary },
+    });
+  } catch (error) {
+    sendErr(res, error, '匯出考勤報表失敗');
+  }
+});
+
+// ── 請假 ──
 hrAdminRouter.get('/leaves', async (req, res) => {
   try {
-    const where = {};
-    if (req.query.staffId) where.staffId = parseInt(req.query.staffId, 10);
-    if (req.query.status) where.status = String(req.query.status).toUpperCase();
-    const rows = await prisma.staffLeave.findMany({
-      where,
-      include: staffInclude,
-      orderBy: { createdAt: 'desc' },
-      take: Math.min(200, parseInt(req.query.take, 10) || 100),
+    const data = await listLeaves({
+      status: queryKey(req.query.status),
+      staffId: parseOptionalInt(req.query.staffId, 'staffId'),
+      branchId: parseOptionalInt(req.query.branchId, 'branchId'),
+      from: req.query.from ? String(req.query.from) : undefined,
+      to: req.query.to ? String(req.query.to) : undefined,
     });
-    res.json({ status: 'success', data: rows });
+    res.json({ status: 'success', message: '請假', data });
   } catch (error) {
     sendErr(res, error, '讀取請假失敗');
   }
@@ -104,23 +184,19 @@ hrAdminRouter.get('/leaves', async (req, res) => {
 
 hrAdminRouter.post('/leaves', async (req, res) => {
   try {
-    const staffId = parseInt(req.body?.staffId, 10);
-    if (!Number.isInteger(staffId) || staffId <= 0) throw httpError('請提供 staffId');
-    const startAt = parseDate(req.body?.startAt, 'startAt');
-    const endAt = parseDate(req.body?.endAt, 'endAt');
-    if (endAt <= startAt) throw httpError('結束時間須晚於開始時間');
-    const row = await prisma.staffLeave.create({
-      data: {
-        staffId,
-        startAt,
-        endAt,
-        reason: req.body?.reason ? String(req.body.reason).slice(0, 200) : null,
-        proofUrl: req.body?.proofUrl ? String(req.body.proofUrl).slice(0, 500) : null,
-        status: 'APPROVED',
+    const data = await createLeaveByHq(
+      parseId(req.body?.staffId, 'staffId'),
+      {
+        startAt: parseDate(req.body?.startAt, 'startAt'),
+        endAt: parseDate(req.body?.endAt, 'endAt'),
+        leaveType: req.body?.leaveType,
+        hours: req.body?.hours,
+        reason: req.body?.reason,
+        proofUrl: req.body?.proofUrl,
       },
-      include: staffInclude,
-    });
-    res.json({ status: 'success', message: '已建立請假', data: row });
+      staffIdFromUser(req.user),
+    );
+    res.json({ status: 'success', message: '已代登請假（已核准）', data });
   } catch (error) {
     sendErr(res, error, '建立請假失敗');
   }
@@ -128,38 +204,104 @@ hrAdminRouter.post('/leaves', async (req, res) => {
 
 hrAdminRouter.patch('/leaves/:id', async (req, res) => {
   try {
-    const id = parseInt(req.params.id, 10);
-    const status = String(req.body?.status || '').toUpperCase();
-    if (!['APPROVED', 'REJECTED'].includes(status)) {
-      throw httpError('status 須為 APPROVED 或 REJECTED');
-    }
-    const existing = await prisma.staffLeave.findUnique({ where: { id } });
-    if (!existing) return res.status(404).json({ status: 'error', message: '找不到請假紀錄' });
-    const row = await prisma.staffLeave.update({
-      where: { id },
-      data: { status },
-      include: staffInclude,
+    const status = queryKey(req.body?.status);
+    const data = await reviewLeave(parseId(req.params.id), {
+      status,
+      note: req.body?.note,
+      actorStaffId: staffIdFromUser(req.user),
     });
-    res.json({ status: 'success', message: status === 'APPROVED' ? '已核准' : '已拒絕', data: row });
+    const message = { APPROVED: '已核准', REJECTED: '已拒絕', CANCELLED: '已撤銷，額度已回補' }[status] ?? '已更新';
+    res.json({ status: 'success', message, data });
   } catch (error) {
     sendErr(res, error, '更新請假失敗');
   }
 });
 
+hrAdminRouter.get('/leaves/report', async (req, res) => {
+  try {
+    res.json({ status: 'success', data: await leaveMonthReport(req.query.month) });
+  } catch (error) {
+    sendErr(res, error, '匯出請假報表失敗');
+  }
+});
+
+// ── 工資核算匯出（僅彙整考勤／請假事實，CSV 由前端組檔） ──
+hrAdminRouter.get('/payroll-export', async (req, res) => {
+  try {
+    const branchId = parseOptionalInt(req.query.branchId, 'branchId');
+    const data = await buildPayrollExport({ month: String(req.query.month || ''), branchId });
+    await prisma.payrollExportLog.create({
+      data: {
+        month: data.month,
+        branchId,
+        staffCount: data.summary.rows.length,
+        generatedByStaffId: staffIdFromUser(req.user),
+      },
+    });
+    res.json({ status: 'success', message: '工資核算資料', data });
+  } catch (error) {
+    sendErr(res, error, '產生工資核算資料失敗');
+  }
+});
+
+// ── 國定假日曆 ──
+hrAdminRouter.get('/holidays', async (req, res) => {
+  try {
+    res.json({ status: 'success', message: '國定假日', data: await listHolidays(parseHolidayYear(req.query.year)) });
+  } catch (error) {
+    sendErr(res, error, '讀取國定假日失敗');
+  }
+});
+
+hrAdminRouter.post('/holidays', async (req, res) => {
+  try {
+    const data = await addHoliday({ date: String(req.body?.date || '').trim(), name: req.body?.name });
+    res.json({ status: 'success', message: '已新增國定假日', data });
+  } catch (error) {
+    sendErr(res, error, '新增國定假日失敗');
+  }
+});
+
+hrAdminRouter.post('/holidays/defaults', async (req, res) => {
+  try {
+    const year = parseHolidayYear(req.body?.year);
+    const data = await seedDefaultHolidays(year);
+    res.json({ status: 'success', message: `已補入 ${year} 年 ${data.count} 筆預設國定假日`, data });
+  } catch (error) {
+    sendErr(res, error, '補入預設國定假日失敗');
+  }
+});
+
+hrAdminRouter.patch('/holidays/:id', async (req, res) => {
+  try {
+    const data = await renameHoliday(parseId(req.params.id), { name: req.body?.name });
+    res.json({ status: 'success', message: '已更新國定假日', data });
+  } catch (error) {
+    sendErr(res, error, '更新國定假日失敗');
+  }
+});
+
+hrAdminRouter.delete('/holidays/:id', async (req, res) => {
+  try {
+    await deleteHoliday(parseId(req.params.id));
+    res.json({ status: 'success', message: '已刪除國定假日' });
+  } catch (error) {
+    sendErr(res, error, '刪除國定假日失敗');
+  }
+});
+
+// ── 班表總覽 ──
 hrAdminRouter.get('/schedules', async (req, res) => {
   try {
-    const where = {};
-    if (req.query.staffId) where.staffId = parseInt(req.query.staffId, 10);
-    if (req.query.branchId) where.branchId = parseInt(req.query.branchId, 10);
-    if (req.query.from) where.startAt = { ...(where.startAt || {}), gte: parseDate(req.query.from, 'from') };
-    if (req.query.to) where.startAt = { ...(where.startAt || {}), lte: parseDate(req.query.to, 'to') };
-    const rows = await prisma.staffSchedule.findMany({
-      where,
-      include: staffInclude,
-      orderBy: { startAt: 'asc' },
-      take: Math.min(500, parseInt(req.query.take, 10) || 200),
+    const data = await listScheduleOverview({
+      from: req.query.from ? String(req.query.from) : undefined,
+      to: req.query.to ? String(req.query.to) : undefined,
+      branchId: parseOptionalInt(req.query.branchId, 'branchId'),
+      staffId: parseOptionalInt(req.query.staffId, 'staffId'),
+      source: queryKey(req.query.source),
+      includeOff: req.query.includeOff === '1' || req.query.includeOff === 'true',
     });
-    res.json({ status: 'success', data: rows });
+    res.json({ status: 'success', message: '班表總覽', data });
   } catch (error) {
     sendErr(res, error, '讀取排班失敗');
   }
@@ -167,23 +309,15 @@ hrAdminRouter.get('/schedules', async (req, res) => {
 
 hrAdminRouter.post('/schedules', async (req, res) => {
   try {
-    const staffId = parseInt(req.body?.staffId, 10);
-    if (!Number.isInteger(staffId) || staffId <= 0) throw httpError('請提供 staffId');
-    const startAt = parseDate(req.body?.startAt, 'startAt');
-    const endAt = parseDate(req.body?.endAt, 'endAt');
-    if (endAt <= startAt) throw httpError('結束時間須晚於開始時間');
-    const row = await prisma.staffSchedule.create({
-      data: {
-        staffId,
-        branchId: parseOptionalInt(req.body?.branchId),
-        startAt,
-        endAt,
-        slotType: String(req.body?.slotType || 'SHIFT').toUpperCase(),
-        note: req.body?.note ? String(req.body.note).slice(0, 200) : null,
-      },
-      include: staffInclude,
+    const data = await createManualSchedule({
+      staffId: parseId(req.body?.staffId, 'staffId'),
+      branchId: parseOptionalInt(req.body?.branchId, 'branchId'),
+      startAt: parseDate(req.body?.startAt, 'startAt'),
+      endAt: parseDate(req.body?.endAt, 'endAt'),
+      note: req.body?.note,
+      actorStaffId: staffIdFromUser(req.user),
     });
-    res.json({ status: 'success', message: '已建立排班', data: row });
+    res.json({ status: 'success', message: '已建立臨時排班', data });
   } catch (error) {
     sendErr(res, error, '建立排班失敗');
   }
@@ -191,23 +325,13 @@ hrAdminRouter.post('/schedules', async (req, res) => {
 
 hrAdminRouter.patch('/schedules/:id', async (req, res) => {
   try {
-    const id = parseInt(req.params.id, 10);
-    const existing = await prisma.staffSchedule.findUnique({ where: { id } });
-    if (!existing) return res.status(404).json({ status: 'error', message: '找不到排班' });
-    const data = {};
-    if (req.body?.startAt) data.startAt = parseDate(req.body.startAt, 'startAt');
-    if (req.body?.endAt) data.endAt = parseDate(req.body.endAt, 'endAt');
-    if (req.body?.branchId !== undefined) data.branchId = parseOptionalInt(req.body.branchId);
-    if (req.body?.slotType) data.slotType = String(req.body.slotType).toUpperCase();
-    if (req.body?.note !== undefined) {
-      data.note = req.body.note ? String(req.body.note).slice(0, 200) : null;
-    }
-    const row = await prisma.staffSchedule.update({
-      where: { id },
-      data,
-      include: staffInclude,
+    const data = await updateManualSchedule(parseId(req.params.id), {
+      startAt: req.body?.startAt ? parseDate(req.body.startAt, 'startAt') : undefined,
+      endAt: req.body?.endAt ? parseDate(req.body.endAt, 'endAt') : undefined,
+      branchId: req.body?.branchId !== undefined ? parseOptionalInt(req.body.branchId, 'branchId') : undefined,
+      note: req.body?.note,
     });
-    res.json({ status: 'success', message: '已更新排班', data: row });
+    res.json({ status: 'success', message: '已更新排班', data });
   } catch (error) {
     sendErr(res, error, '更新排班失敗');
   }
@@ -215,111 +339,39 @@ hrAdminRouter.patch('/schedules/:id', async (req, res) => {
 
 hrAdminRouter.delete('/schedules/:id', async (req, res) => {
   try {
-    const id = parseInt(req.params.id, 10);
-    await prisma.staffSchedule.delete({ where: { id } });
+    await deleteManualSchedule(parseId(req.params.id));
     res.json({ status: 'success', message: '已刪除排班' });
   } catch (error) {
-    if (error.code === 'P2025') {
-      return res.status(404).json({ status: 'error', message: '找不到排班' });
-    }
     sendErr(res, error, '刪除排班失敗');
   }
 });
 
-hrAdminRouter.get('/attendance/report', async (req, res) => {
-  try {
-    const from = parseDate(req.query.from || new Date(Date.now() - 30 * 86400000), 'from');
-    const to = parseDate(req.query.to || new Date(), 'to');
-    const rows = await prisma.staffAttendance.findMany({
-      where: { punchIn: { gte: from, lte: to } },
-      include: { staff: { select: { id: true, name: true, displayName: true } } },
-    });
-    const summary = {};
-    for (const row of rows) {
-      const key = row.staffId;
-      if (!summary[key]) {
-        summary[key] = {
-          staffId: key,
-          staffName: row.staff?.name,
-          displayName: row.staff?.displayName,
-          shifts: 0,
-          totalMinutes: 0,
-          openShifts: 0,
-        };
-      }
-      summary[key].shifts += 1;
-      const out = row.punchOut || new Date();
-      summary[key].totalMinutes += Math.max(0, (out - row.punchIn) / 60000);
-      if (!row.punchOut) summary[key].openShifts += 1;
-    }
-    res.json({
-      status: 'success',
-      data: {
-        from,
-        to,
-        items: Object.values(summary),
-        recordCount: rows.length,
-      },
-    });
-  } catch (error) {
-    sendErr(res, error, '匯出考勤報表失敗');
-  }
-});
-
-hrAdminRouter.get('/leaves/report', async (req, res) => {
-  try {
-    const month = String(req.query.month || '').trim();
-    let start;
-    let end;
-    if (/^\d{4}-\d{2}$/.test(month)) {
-      const [y, m] = month.split('-').map((x) => parseInt(x, 10));
-      start = new Date(Date.UTC(y, m - 1, 1));
-      end = new Date(Date.UTC(y, m, 0, 23, 59, 59, 999));
-    } else {
-      const now = new Date();
-      start = new Date(now.getFullYear(), now.getMonth(), 1);
-      end = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999);
-    }
-    const rows = await prisma.staffLeave.findMany({
-      where: {
-        startAt: { lte: end },
-        endAt: { gte: start },
-        status: { in: ['APPROVED', 'PENDING'] },
-      },
-      include: { staff: { select: { id: true, name: true, displayName: true } } },
-      orderBy: { startAt: 'asc' },
-    });
-    res.json({ status: 'success', data: { month: month || `${start.getFullYear()}-${String(start.getMonth() + 1).padStart(2, '0')}`, items: rows } });
-  } catch (error) {
-    sendErr(res, error, '匯出請假報表失敗');
-  }
-});
-
 // ==========================================
-// 員工自助：/api/staff/hr
+// 員工自助：/api/staff/hr（身分一律取自 JWT）
 // ==========================================
 export const hrSelfRouter = express.Router();
 hrSelfRouter.use(verifyStaff);
 
+// 班表值勤判定（登入後前端輪詢；業務模組海關同一套規則）
+hrSelfRouter.get('/duty-status', async (req, res) => {
+  try {
+    const data = await resolveDutyStatus(req.user);
+    res.json({ status: 'success', message: data.message, data });
+  } catch (error) {
+    sendErr(res, error, '讀取值勤狀態失敗');
+  }
+});
+
 hrSelfRouter.post('/punch-in', async (req, res) => {
   try {
-    const staffId = staffIdFromUser(req.user);
-    if (!staffId) return res.status(403).json({ status: 'error', message: '⛔ 憑證缺少員工 id' });
-
-    const open = await prisma.staffAttendance.findFirst({
-      where: { staffId, punchOut: null },
-      orderBy: { punchIn: 'desc' },
+    const staffId = selfStaffId(req);
+    const { row, staleClosedId, shift } = await punchIn(req.user, staffId, parseOptionalInt(req.body?.branchId, 'branchId'));
+    const duty = await resolveDutyStatus(req.user);
+    res.json({
+      status: 'success',
+      message: staleClosedId ? '上班打卡成功（前一筆未打下班卡，請洽主管更正）' : '上班打卡成功',
+      data: { ...row, staleClosedId, shift, duty },
     });
-    if (open) throw httpError('尚有未下班的打卡紀錄，請先 punch-out');
-
-    const row = await prisma.staffAttendance.create({
-      data: {
-        staffId,
-        branchId: parseOptionalInt(req.body?.branchId) ?? req.user?.branchId ?? null,
-        punchIn: new Date(),
-      },
-    });
-    res.json({ status: 'success', message: '上班打卡成功', data: row });
   } catch (error) {
     sendErr(res, error, '上班打卡失敗');
   }
@@ -327,62 +379,83 @@ hrSelfRouter.post('/punch-in', async (req, res) => {
 
 hrSelfRouter.post('/punch-out', async (req, res) => {
   try {
-    const staffId = staffIdFromUser(req.user);
-    if (!staffId) return res.status(403).json({ status: 'error', message: '⛔ 憑證缺少員工 id' });
-
-    const open = await prisma.staffAttendance.findFirst({
-      where: { staffId, punchOut: null },
-      orderBy: { punchIn: 'desc' },
-    });
-    if (!open) throw httpError('找不到未下班的打卡紀錄');
-
-    const row = await prisma.staffAttendance.update({
-      where: { id: open.id },
-      data: { punchOut: new Date() },
-    });
-    res.json({ status: 'success', message: '下班打卡成功', data: row });
+    const row = await punchOut(selfStaffId(req));
+    const duty = await resolveDutyStatus(req.user);
+    res.json({ status: 'success', message: '下班打卡成功', data: { ...row, duty } });
   } catch (error) {
     sendErr(res, error, '下班打卡失敗');
   }
 });
 
+hrSelfRouter.get('/my-attendance', async (req, res) => {
+  try {
+    res.json({ status: 'success', message: '我的出勤', data: await getMyAttendance(selfStaffId(req)) });
+  } catch (error) {
+    sendErr(res, error, '讀取考勤失敗');
+  }
+});
+
+// ── 薪資單（僅本人、僅已結算批次） ──
+hrSelfRouter.get('/payslips', async (req, res) => {
+  try {
+    res.json({ status: 'success', message: '我的薪資單', data: await listMyPayslips(selfStaffId(req)) });
+  } catch (error) {
+    sendErr(res, error, '讀取薪資單失敗');
+  }
+});
+
+hrSelfRouter.get('/payslips/:month', async (req, res) => {
+  try {
+    res.json({ status: 'success', message: '薪資單明細', data: await getMyPayslip(selfStaffId(req), String(req.params.month)) });
+  } catch (error) {
+    sendErr(res, error, '讀取薪資單失敗');
+  }
+});
+
+hrSelfRouter.get('/my-leaves', async (req, res) => {
+  try {
+    res.json({ status: 'success', message: '我的請假', data: await getMyLeaves(selfStaffId(req)) });
+  } catch (error) {
+    sendErr(res, error, '讀取請假失敗');
+  }
+});
+
 hrSelfRouter.post('/leave-request', async (req, res) => {
   try {
-    const staffId = staffIdFromUser(req.user);
-    if (!staffId) return res.status(403).json({ status: 'error', message: '⛔ 憑證缺少員工 id' });
-
-    const startAt = parseDate(req.body?.startAt, 'startAt');
-    const endAt = parseDate(req.body?.endAt, 'endAt');
-    if (endAt <= startAt) throw httpError('結束時間須晚於開始時間');
-
-    const row = await prisma.staffLeave.create({
-      data: {
-        staffId,
-        startAt,
-        endAt,
-        reason: req.body?.reason ? String(req.body.reason).slice(0, 200) : null,
-        proofUrl: req.body?.proofUrl ? String(req.body.proofUrl).slice(0, 500) : null,
-        status: 'PENDING',
-      },
+    const data = await requestLeave(selfStaffId(req), {
+      startAt: parseDate(req.body?.startAt, 'startAt'),
+      endAt: parseDate(req.body?.endAt, 'endAt'),
+      leaveType: req.body?.leaveType,
+      hours: req.body?.hours,
+      reason: req.body?.reason,
+      proofUrl: req.body?.proofUrl,
     });
-    res.json({ status: 'success', message: '請假申請已送出', data: row });
+    res.json({ status: 'success', message: '請假申請已送出，待主管審核', data });
   } catch (error) {
     sendErr(res, error, '請假申請失敗');
   }
 });
 
+hrSelfRouter.post('/my-leaves/:id/cancel', async (req, res) => {
+  try {
+    await cancelMyLeave(selfStaffId(req), parseId(req.params.id));
+    res.json({ status: 'success', message: '已撤回請假申請' });
+  } catch (error) {
+    sendErr(res, error, '撤回請假失敗');
+  }
+});
+
 hrSelfRouter.get('/my-schedule', async (req, res) => {
   try {
-    const staffId = staffIdFromUser(req.user);
-    if (!staffId) return res.status(403).json({ status: 'error', message: '⛔ 憑證缺少員工 id' });
-
+    const staffId = selfStaffId(req);
     const from = req.query.from ? parseDate(req.query.from, 'from') : new Date();
-    const to = req.query.to
-      ? parseDate(req.query.to, 'to')
-      : new Date(from.getTime() + 30 * 86400000);
-
+    const to = req.query.to ? parseDate(req.query.to, 'to') : new Date(from.getTime() + 30 * 86400000);
     const rows = await prisma.staffSchedule.findMany({
-      where: { staffId, startAt: { gte: from, lte: to } },
+      where: {
+        staffId,
+        startAt: { gte: from, lte: to },
+        OR: EFFECTIVE_SCHEDULE_OR,
+      },
       orderBy: { startAt: 'asc' },
     });
     res.json({ status: 'success', data: rows });
@@ -391,19 +464,69 @@ hrSelfRouter.get('/my-schedule', async (req, res) => {
   }
 });
 
-hrSelfRouter.get('/my-attendance', async (req, res) => {
+// 排假申請：排班編制員工（場務／實習教練）於本期／下一期指定希望休假日；班表發布後截止
+hrSelfRouter.get('/off-requests', async (req, res) => {
   try {
-    const staffId = staffIdFromUser(req.user);
-    if (!staffId) return res.status(403).json({ status: 'error', message: '⛔ 憑證缺少員工 id' });
-
-    const take = Math.min(100, parseInt(req.query.take, 10) || 50);
-    const rows = await prisma.staffAttendance.findMany({
-      where: { staffId },
-      orderBy: { punchIn: 'desc' },
-      take,
-    });
-    res.json({ status: 'success', data: rows });
+    res.json({ status: 'success', data: await getMyRosterOverview(selfStaffId(req)) });
   } catch (error) {
-    sendErr(res, error, '讀取考勤失敗');
+    sendErr(res, error, '讀取排假資料失敗');
+  }
+});
+
+hrSelfRouter.put('/off-requests', async (req, res) => {
+  try {
+    const data = await submitOffRequest(selfStaffId(req), req.body || {});
+    const withdrawn = !(Array.isArray(req.body?.dates) && req.body.dates.length);
+    res.json({ status: 'success', message: withdrawn ? '已撤回排假申請' : '排假申請已遞交，店長排班時會優先安排', data });
+  } catch (error) {
+    sendErr(res, error, '遞交排假申請失敗');
+  }
+});
+
+// 班表確認回覆：發布後 72 小時內 { cycleStartDate, status: CONFIRMED|DISPUTED, message? }
+hrSelfRouter.post('/roster-ack', async (req, res) => {
+  try {
+    const data = await respondRosterAck(selfStaffId(req), req.body || {});
+    const disputed = String(req.body?.status || '').toUpperCase() === 'DISPUTED';
+    res.json({ status: 'success', message: disputed ? '已送出異議，店長將重新檢視班表' : '已確認班表', data });
+  } catch (error) {
+    sendErr(res, error, '班表確認回覆失敗');
+  }
+});
+
+// 週班表（轉正教練／店長／GM／FM）本人提報；/api/staff/week-plans 審核核准後生效（coach-plans 為舊路徑別名）
+const WEEK_PLAN_PATHS = ['/week-plans', '/coach-plans'];
+hrSelfRouter.get(WEEK_PLAN_PATHS, async (req, res) => {
+  try {
+    res.json({ status: 'success', data: await getMyCoachPlans(selfStaffId(req)) });
+  } catch (error) {
+    sendErr(res, error, '讀取週班表失敗');
+  }
+});
+
+hrSelfRouter.put(WEEK_PLAN_PATHS.map((p) => `${p}/:weekStart`), async (req, res) => {
+  try {
+    const data = await saveMyCoachPlan(selfStaffId(req), req.params.weekStart, req.body || {});
+    res.json({ status: 'success', message: data.evaluation?.hasError ? '已儲存草稿，尚有不符規定項目須修正' : '已儲存草稿', data });
+  } catch (error) {
+    sendErr(res, error, '儲存週班表失敗');
+  }
+});
+
+hrSelfRouter.post(WEEK_PLAN_PATHS.map((p) => `${p}/:weekStart/submit`), async (req, res) => {
+  try {
+    const data = await submitMyCoachPlan(selfStaffId(req), req.params.weekStart);
+    res.json({ status: 'success', message: '已送出審核，核准後生效', data });
+  } catch (error) {
+    sendErr(res, error, '送審週班表失敗');
+  }
+});
+
+hrSelfRouter.post(WEEK_PLAN_PATHS.map((p) => `${p}/:weekStart/withdraw`), async (req, res) => {
+  try {
+    const data = await withdrawMyCoachPlan(selfStaffId(req), req.params.weekStart);
+    res.json({ status: 'success', message: '已撤回送審', data });
+  } catch (error) {
+    sendErr(res, error, '撤回送審失敗');
   }
 });

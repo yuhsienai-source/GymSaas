@@ -1,23 +1,50 @@
-import { type FormEvent, useState } from 'react';
+import { type FormEvent, useEffect, useState } from 'react';
 import { Badge, Button, Card, Field, Input, Modal, PageSection, Select } from '../../../components/ui';
-import {
-  isValidTaiwanUbn,
-  normalizeUbnDigits,
-  validateOptionalSellerUbn,
-} from '../../../components/staff/InvoiceCarrierField';
 import { useToast } from '../../../contexts/ToastContext';
 import {
   createBranch,
   createVenue,
   deleteHqBranch,
   deleteHqVenue,
+  fetchHqLegalEntities,
   getErrorMessage,
   updateHqBranch,
   updateHqVenue,
 } from '../../../lib/api';
 import { staffBranchLabel } from '../../../lib/branchLabel';
-import type { Branch, Venue } from '../../../types/api';
+import {
+  ALL_BRANCH_TYPES,
+  BRANCH_TYPES,
+  type BranchType,
+  branchTypeOf,
+} from '../../../lib/orgStructure';
+import type { Branch, LegalEntity, Venue } from '../../../types/api';
 import type { HqDataProps } from './types';
+
+function LegalEntitySelect({
+  value,
+  onChange,
+  entities,
+}: {
+  value: number | '';
+  onChange: (id: number | '') => void;
+  entities: LegalEntity[];
+}) {
+  return (
+    <Field label="所屬營業人（統編）" hint="決定發票開立之 ezPay 商店與進貨／應付分帳；有庫存或發票後不可改（後端檢查）">
+      <Select value={value === '' ? '' : String(value)} onChange={(e) => onChange(Number(e.target.value) || '')}>
+        <option value="">— 未綁定（不可開發票／採購） —</option>
+        {entities
+          .filter((e) => e.isActive || e.id === value)
+          .map((e) => (
+            <option key={e.id} value={e.id}>
+              {e.name}（{e.ubn}）{e.ezpay.configured ? '' : ' · ezPay 金鑰未齊'}
+            </option>
+          ))}
+      </Select>
+    </Field>
+  );
+}
 
 function stationsToInput(v: Venue | null) {
   return (v?.stations || []).map((s) => s.name).join('、');
@@ -25,6 +52,92 @@ function stationsToInput(v: Venue | null) {
 
 function normalizeCodeInput(raw: string) {
   return raw.trim().replace(/\s+/g, '').slice(0, 32);
+}
+
+/** 可作為上層之分店：啟用、頂層、類型符合、非自己 */
+function parentCandidates(branches: Branch[], type: BranchType, selfId?: number) {
+  const allowed = BRANCH_TYPES[type].parentTypes;
+  return branches.filter(
+    (b) => b.isActive && !b.parentId && b.id !== selfId && allowed.includes(branchTypeOf(b)),
+  );
+}
+
+function branchParentHint(type: BranchType, parentId: number | ''): string | null {
+  return BRANCH_TYPES[type].requiresParent && parentId === ''
+    ? `${BRANCH_TYPES[type].label}必須選擇隸屬分店`
+    : null;
+}
+
+/** 頂層分店依序，隸屬分店緊接在上層之後 */
+function orderByHierarchy(branches: Branch[]) {
+  const ids = new Set(branches.map((b) => b.id));
+  const roots = branches.filter((b) => !b.parentId || !ids.has(b.parentId));
+  return roots.flatMap((r) => [r, ...branches.filter((b) => b.parentId === r.id)]);
+}
+
+function BranchTypeFields({
+  type,
+  parentId,
+  onType,
+  onParent,
+  branches,
+  selfId,
+}: {
+  type: BranchType;
+  parentId: number | '';
+  onType: (t: BranchType) => void;
+  onParent: (id: number | '') => void;
+  branches: Branch[];
+  selfId?: number;
+}) {
+  const def = BRANCH_TYPES[type];
+  const canHaveParent = def.parentTypes.length > 0;
+  const candidates = parentCandidates(branches, type, selfId);
+  return (
+    <>
+      <Field label="分店類型" hint="健身房設店長＋場務／教練；教室隸屬健身房、由該店長督導與支援（不直接綁員工）；學院由 FM 督導、僅教練部">
+        <Select
+          value={type}
+          onChange={(e) => {
+            const next = e.target.value as BranchType;
+            onType(next);
+            if (BRANCH_TYPES[next].parentTypes.length === 0) onParent('');
+          }}
+        >
+          {ALL_BRANCH_TYPES.map((t) => (
+            <option key={t} value={t}>{t} {BRANCH_TYPES[t].label}</option>
+          ))}
+        </Select>
+      </Field>
+      {canHaveParent && (
+        <Field label="隸屬分店" hint={def.requiresParent ? '必填；如熱河教室隸屬和平店' : '選填'}>
+          <Select
+            value={parentId === '' ? '' : String(parentId)}
+            onChange={(e) => onParent(Number(e.target.value) || '')}
+            required={def.requiresParent}
+          >
+            <option value="">{def.requiresParent ? '— 請選擇 —' : '— 無（獨立） —'}</option>
+            {candidates.map((b) => (
+              <option key={b.id} value={b.id}>{staffBranchLabel(b)} {b.name}</option>
+            ))}
+          </Select>
+        </Field>
+      )}
+    </>
+  );
+}
+
+function BranchNameCell({ branch }: { branch: Branch }) {
+  const type = branchTypeOf(branch);
+  return (
+    <div className={branch.parentId ? 'branch-name-cell branch-name-cell--child' : 'branch-name-cell'}>
+      <strong>{branch.name}</strong>
+      <Badge tone="neutral">{BRANCH_TYPES[type].label}</Badge>
+      {branch.parent && (
+        <span className="text-muted text-sm">隸屬 {staffBranchLabel(branch.parent)}</span>
+      )}
+    </div>
+  );
 }
 
 export default function HqBranchesTab({
@@ -35,23 +148,41 @@ export default function HqBranchesTab({
   const { toast } = useToast();
   const [branchName, setBranchName] = useState('');
   const [branchCode, setBranchCode] = useState('');
+  const [branchType, setBranchType] = useState<BranchType>('GYM');
+  const [branchParentId, setBranchParentId] = useState<number | ''>('');
   const [branchAddress, setBranchAddress] = useState('');
-  const [branchSellerName, setBranchSellerName] = useState('');
-  const [branchSellerUbn, setBranchSellerUbn] = useState('');
+  const [entities, setEntities] = useState<LegalEntity[]>([]);
+  const [branchEntityId, setBranchEntityId] = useState<number | ''>('');
   const [venueBranchId, setVenueBranchId] = useState<number | ''>(branches[0]?.id ?? '');
   const [venueName, setVenueName] = useState('');
   const [venueStations, setVenueStations] = useState('');
   const [editingBranch, setEditingBranch] = useState<Branch | null>(null);
   const [editBranchName, setEditBranchName] = useState('');
   const [editBranchCode, setEditBranchCode] = useState('');
+  const [editBranchType, setEditBranchType] = useState<BranchType>('GYM');
+  const [editBranchParentId, setEditBranchParentId] = useState<number | ''>('');
   const [editBranchAddress, setEditBranchAddress] = useState('');
-  const [editBranchSellerName, setEditBranchSellerName] = useState('');
-  const [editBranchSellerUbn, setEditBranchSellerUbn] = useState('');
+  const [editBranchEntityId, setEditBranchEntityId] = useState<number | ''>('');
   const [editBranchActive, setEditBranchActive] = useState(true);
   const [editingVenue, setEditingVenue] = useState<Venue | null>(null);
   const [editVenueName, setEditVenueName] = useState('');
   const [editVenueStations, setEditVenueStations] = useState('');
   const [busyKey, setBusyKey] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await fetchHqLegalEntities();
+        if (!cancelled) setEntities(res.data || []);
+      } catch (err) {
+        if (!cancelled) toast(getErrorMessage(err, '載入營業人失敗'), 'error');
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [toast]);
 
   async function handleCreateBranch(e: FormEvent) {
     e.preventDefault();
@@ -60,24 +191,25 @@ export default function HqBranchesTab({
       toast('請填寫分店代碼', 'error');
       return;
     }
-    const ubnErr = validateOptionalSellerUbn(branchSellerUbn);
-    if (ubnErr) {
-      toast(ubnErr, 'error');
+    const parentErr = branchParentHint(branchType, branchParentId);
+    if (parentErr) {
+      toast(parentErr, 'error');
       return;
     }
-    const ubn = normalizeUbnDigits(branchSellerUbn);
     try {
       const result = await createBranch(branchName, branchAddress || undefined, {
         code,
-        invoiceSellerName: branchSellerName.trim() || undefined,
-        invoiceSellerUbn: ubn || undefined,
+        type: branchType,
+        parentId: branchParentId === '' ? null : branchParentId,
+        legalEntityId: branchEntityId === '' ? null : branchEntityId,
       });
       toast(result.message || '分店建立成功', 'success');
       setBranchName('');
       setBranchCode('');
+      setBranchType('GYM');
+      setBranchParentId('');
       setBranchAddress('');
-      setBranchSellerName('');
-      setBranchSellerUbn('');
+      setBranchEntityId('');
       await onReload();
     } catch (err) {
       toast(getErrorMessage(err, '建立分店失敗'), 'error');
@@ -106,9 +238,10 @@ export default function HqBranchesTab({
     setEditingBranch(b);
     setEditBranchName(b.name);
     setEditBranchCode(b.code || '');
+    setEditBranchType(branchTypeOf(b));
+    setEditBranchParentId(b.parentId ?? '');
     setEditBranchAddress(b.address || '');
-    setEditBranchSellerName(b.invoiceSellerName || '');
-    setEditBranchSellerUbn(normalizeUbnDigits(b.invoiceSellerUbn || ''));
+    setEditBranchEntityId(b.legalEntityId ?? '');
     setEditBranchActive(b.isActive);
   }
 
@@ -120,19 +253,20 @@ export default function HqBranchesTab({
       toast('請填寫分店代碼', 'error');
       return;
     }
-    const ubnErr = validateOptionalSellerUbn(editBranchSellerUbn);
-    if (ubnErr) {
-      toast(ubnErr, 'error');
+    const parentErr = branchParentHint(editBranchType, editBranchParentId);
+    if (parentErr) {
+      toast(parentErr, 'error');
       return;
     }
-    const ubn = normalizeUbnDigits(editBranchSellerUbn);
+    const nextEntityId = editBranchEntityId === '' ? null : editBranchEntityId;
     try {
       const result = await updateHqBranch(editingBranch.id, {
         name: editBranchName,
         code,
+        type: editBranchType,
+        parentId: editBranchParentId === '' ? null : editBranchParentId,
         address: editBranchAddress || null,
-        invoiceSellerName: editBranchSellerName.trim() || null,
-        invoiceSellerUbn: ubn || null,
+        ...(nextEntityId !== (editingBranch.legalEntityId ?? null) ? { legalEntityId: nextEntityId } : {}),
         isActive: editBranchActive,
       });
       toast(result.message || '分店已更新', 'success');
@@ -209,7 +343,7 @@ export default function HqBranchesTab({
   return (
     <PageSection
       title="分店場地"
-      desc="開立分店、建立場地與站點；員工端關聯顯示「代碼」，會員介面顯示正式名稱"
+      desc="開立分店（類型／隸屬／營業人）、建立場地與站點；員工端關聯顯示「代碼」，會員介面顯示正式名稱"
     >
       <div className="staff-grid">
         <Card title="開立分店">
@@ -227,32 +361,17 @@ export default function HqBranchesTab({
                 autoComplete="off"
               />
             </Field>
+            <BranchTypeFields
+              type={branchType}
+              parentId={branchParentId}
+              onType={setBranchType}
+              onParent={setBranchParentId}
+              branches={branches}
+            />
             <Field label="地址">
               <Input value={branchAddress} onChange={(e) => setBranchAddress(e.target.value)} />
             </Field>
-            <Field
-              label="發票／折讓抬頭"
-              hint="營業人名稱；空白則用系統預設（環境變數）"
-            >
-              <Input
-                value={branchSellerName}
-                onChange={(e) => setBranchSellerName(e.target.value)}
-                placeholder="例：某某運動有限公司"
-              />
-            </Field>
-            <Field
-              label="抬頭統編"
-              hint="選填；填寫須為真實 8 碼統編（含檢查碼）。留空可直接存檔"
-            >
-              <Input
-                value={branchSellerUbn}
-                onChange={(e) => setBranchSellerUbn(normalizeUbnDigits(e.target.value))}
-                placeholder="選填"
-                inputMode="numeric"
-                maxLength={8}
-                autoComplete="off"
-              />
-            </Field>
+            <LegalEntitySelect value={branchEntityId} onChange={setBranchEntityId} entities={entities} />
             <Button type="submit">建立分店</Button>
           </form>
         </Card>
@@ -292,7 +411,7 @@ export default function HqBranchesTab({
                 <th>正式名稱</th>
                 <th>代碼</th>
                 <th>地址</th>
-                <th>發票抬頭</th>
+                <th>營業人／統編</th>
                 <th>分店狀態</th>
                 <th>場地</th>
                 <th>站點</th>
@@ -305,16 +424,16 @@ export default function HqBranchesTab({
                   <td colSpan={8} className="text-muted text-center">尚無分店</td>
                 </tr>
               ) : (
-                branches.flatMap((b) => {
+                orderByHierarchy(branches).flatMap((b) => {
                   const branchVenues = venues.filter((v) => v.branchId === b.id);
-                  const sellerCell = b.invoiceSellerName
-                    ? `${b.invoiceSellerName}${b.invoiceSellerUbn ? `（${b.invoiceSellerUbn}）` : ''}`
-                    : '系統預設';
+                  const sellerCell = b.legalEntity
+                    ? `${b.legalEntity.name}・統編 ${b.legalEntity.ubn || '—'}`
+                    : '未綁定';
                   if (branchVenues.length === 0) {
                     return [
                       <tr key={`b-${b.id}`}>
                         <td>
-                          <strong>{b.name}</strong>
+                          <BranchNameCell branch={b} />
                         </td>
                         <td className="mono">{b.code || '—'}</td>
                         <td>{b.address || '—'}</td>
@@ -345,7 +464,7 @@ export default function HqBranchesTab({
                   }
                   return branchVenues.map((v, idx) => (
                     <tr key={`v-${v.id}`}>
-                      <td>{idx === 0 ? <strong>{b.name}</strong> : ''}</td>
+                      <td>{idx === 0 ? <BranchNameCell branch={b} /> : ''}</td>
                       <td className="mono">{idx === 0 ? b.code || '—' : ''}</td>
                       <td>{idx === 0 ? b.address || '—' : ''}</td>
                       <td className="text-sm">{idx === 0 ? sellerCell : ''}</td>
@@ -425,38 +544,18 @@ export default function HqBranchesTab({
               autoComplete="off"
             />
           </Field>
+          <BranchTypeFields
+            type={editBranchType}
+            parentId={editBranchParentId}
+            onType={setEditBranchType}
+            onParent={setEditBranchParentId}
+            branches={branches}
+            selfId={editingBranch?.id}
+          />
           <Field label="地址">
             <Input value={editBranchAddress} onChange={(e) => setEditBranchAddress(e.target.value)} />
           </Field>
-          <Field
-            label="發票／折讓抬頭"
-            hint="營業人名稱；空白則用系統預設"
-          >
-            <Input
-              value={editBranchSellerName}
-              onChange={(e) => setEditBranchSellerName(e.target.value)}
-              placeholder="例：某某運動有限公司"
-            />
-          </Field>
-          <Field
-            label="抬頭統編"
-            hint={
-              editBranchSellerUbn && !isValidTaiwanUbn(editBranchSellerUbn)
-                ? editBranchSellerUbn.length < 8
-                  ? '尚缺碼數，或清空此欄即可存檔'
-                  : '檢查碼不正確；請改正或清空後再存'
-                : '選填；清空則清除已存統編'
-            }
-          >
-            <Input
-              value={editBranchSellerUbn}
-              onChange={(e) => setEditBranchSellerUbn(normalizeUbnDigits(e.target.value))}
-              placeholder="選填"
-              inputMode="numeric"
-              maxLength={8}
-              autoComplete="off"
-            />
-          </Field>
+          <LegalEntitySelect value={editBranchEntityId} onChange={setEditBranchEntityId} entities={entities} />
           <label className="checkbox-item">
             <input
               type="checkbox"

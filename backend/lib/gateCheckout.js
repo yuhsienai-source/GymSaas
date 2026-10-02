@@ -5,11 +5,8 @@ import { assertMemberBoundGateAccess } from './memberBranch.js';
 import { broadcastOccupancy } from './occupancy.js';
 import { broadcastGateAlert } from './gateAlert.js';
 import { formatGateAccessNo } from './gateAccessNo.js';
-import {
-  lockMemberRow,
-  lockActiveCheckInLog,
-  decrementWalletsAtomic,
-} from './dbLocks.js';
+import { lockMemberRow, lockActiveCheckInLog } from './dbLocks.js';
+import { WALLET_MODE, WALLET_TX, mutateMemberWallet, roundMoney } from './walletMutation.js';
 
 const FEE_PER_MINUTE = 1.3;
 
@@ -44,7 +41,7 @@ export async function processCheckOut({ memberId, exitMethod, branchId, logId = 
     }
 
     if (exitMethod === 'FACE') {
-      if (!(await memberHasSignedBiometricsConsent(memberId)) || !member.papagoFaceId) {
+      if (!(await memberHasSignedBiometricsConsent(memberId, tx)) || !member.papagoFaceId) {
         throw httpError('⛔ 人臉出場失敗：尚未完成生物辨識授權或人臉綁定。', 403);
       }
     }
@@ -106,52 +103,92 @@ export async function processCheckOut({ memberId, exitMethod, branchId, logId = 
     const durationInMinutes = Math.ceil(
       (checkOutTime - new Date(activeLog.checkInAt)) / (1000 * 60),
     );
-    const totalFee = parseFloat((durationInMinutes * FEE_PER_MINUTE).toFixed(1));
+    const totalFee = roundMoney(durationInMinutes * FEE_PER_MINUTE);
+    const availCash = roundMoney(member.cashWallet);
+    const availBonus = roundMoney(member.bonusWallet);
+    const available = roundMoney(availCash + availBonus);
 
-    // 在鎖內依目前餘額 clamp，絕不寫負數（配合 DB CHECK + 條件式 UPDATE）
-    const bonusBal = Number(member.bonusWallet) || 0;
-    const cashBal = Number(member.cashWallet) || 0;
-    const deductBonus = Math.min(bonusBal, totalFee);
-    const needCash = parseFloat((totalFee - deductBonus).toFixed(1));
-    const deductCash = Math.min(cashBal, needCash);
-    const shortfall = parseFloat((needCash - deductCash).toFixed(1));
+    // 餘額不足：不扣任何款項、維持在場（防補儲值重刷重複計費），記錄差額、閘機不開門
+    if (totalFee > available) {
+      const shortfall = roundMoney(totalFee - available);
+      const updatedLog = await tx.checkInLog.update({
+        where: { id: activeLog.id },
+        data: { shortfallAmt: shortfall },
+      });
+      return {
+        member,
+        log: updatedLog,
+        exitMethod,
+        feeDetails: { totalFee, paidByBonus: 0, paidByCash: 0, shortfall },
+        remaining: { cash: availCash, bonus: availBonus },
+        billingMode: activeLog.billingMode,
+        settled: false,
+        gateOpen: false,
+      };
+    }
+
+    // 先運動金後本金，一次全額扣款
+    const charged =
+      totalFee > 0
+        ? await mutateMemberWallet(tx, {
+            memberId,
+            txType: WALLET_TX.GATE_CHECKOUT,
+            mode: WALLET_MODE.WATERFALL_DEDUCT,
+            amount: totalFee,
+            reason: `計時出場 ${durationInMinutes} 分 × $${FEE_PER_MINUTE}`,
+            refType: 'CHECKIN',
+            refId: activeLog.id,
+            branchId,
+          })
+        : null;
+    const paidByBonus = charged ? -charged.delta.bonus : 0;
+    const paidByCash = charged ? -charged.delta.cash : 0;
+    const wallets = charged?.after ?? { cash: availCash, bonus: availBonus };
 
     const updatedLog = await tx.checkInLog.update({
       where: { id: activeLog.id },
-      data: { checkOutAt: checkOutTime, fee: totalFee },
+      data: {
+        checkOutAt: checkOutTime,
+        fee: totalFee,
+        deductedBonus: paidByBonus,
+        deductedCash: paidByCash,
+        shortfallAmt: 0,
+      },
     });
 
-    const wallets = await decrementWalletsAtomic(tx, memberId, deductBonus, deductCash);
-    if (!wallets) {
-      throw httpError('⛔ 出場扣款失敗：錢包餘額衝突，請重試或臨櫃處理。', 409, {
-        code: 'WALLET_DEDUCT_CONFLICT',
-        memberId,
-      });
-    }
-
     return {
-      member: { ...member, cashWallet: wallets.cashWallet, bonusWallet: wallets.bonusWallet },
+      member: { ...member, cashWallet: wallets.cash, bonusWallet: wallets.bonus },
       log: updatedLog,
       exitMethod,
-      feeDetails: {
-        totalFee,
-        paidByBonus: deductBonus,
-        paidByCash: deductCash,
-        shortfall,
-      },
-      remaining: {
-        cash: wallets.cashWallet,
-        bonus: wallets.bonusWallet,
-      },
+      feeDetails: { totalFee, paidByBonus, paidByCash, shortfall: 0 },
+      remaining: { cash: wallets.cash, bonus: wallets.bonus },
       billingMode: activeLog.billingMode,
-      // 餘額不足：結算仍完成（釋放在場），但閘機應拒開門／櫃檯介入
-      gateOpen: shortfall <= 0,
+      settled: true,
+      gateOpen: true,
     };
   });
 }
 
 export function broadcastCheckOut(result) {
-  broadcastOccupancy({ type: 'check-out', memberId: result.member.id }).catch(() => {});
+  const shortfall = Number(result.feeDetails?.shortfall) || 0;
+  if (result.settled !== false) {
+    broadcastOccupancy({ type: 'check-out', memberId: result.member.id }).catch(() => {});
+  }
+  if (shortfall > 0) {
+    try {
+      broadcastGateAlert({
+        code: 'EXIT_SHORTFALL',
+        title: '出場餘額不足',
+        severity: 'high',
+        message: `計時出場費 $${result.feeDetails.totalFee}，錢包不足 $${shortfall}，未扣款、仍在場，閘機不開門；請引導儲值後再刷出`,
+        memberId: result.member.id,
+        memberName: result.member.name,
+        branchId: result.log?.branchId ?? null,
+      });
+    } catch {
+      /* ignore */
+    }
+  }
 }
 
 export function checkOutSuccessPayload(result) {
@@ -164,8 +201,9 @@ export function checkOutSuccessPayload(result) {
     message: isMonthly
       ? '【體育客】月卡會員出場成功 (本次 0 元)！'
       : shortfall > 0
-        ? '【體育客】計時出場已結算，但餘額不足待補扣，閘機不開門。'
+        ? `【體育客】餘額不足 $${shortfall}，未扣款、尚未出場，閘機不開門；請儲值後再刷出。`
         : '【體育客】計時出場結算成功！',
+    settled: result.settled !== false,
     memberName: member.name,
     memberId: member.id,
     exitMethod,

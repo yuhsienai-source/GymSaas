@@ -1,4 +1,5 @@
 import { type FormEvent, useEffect, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
 import MemberLayout from '../../components/layout/MemberLayout';
 import {
   Alert,
@@ -16,7 +17,6 @@ import { useToast } from '../../contexts/ToastContext';
 import axios from 'axios';
 import {
   fetchMemberGiftCards,
-  fetchMemberMakeupSlots,
   fetchMemberPointsLedger,
   fetchMemberProfile,
   fetchMemberPromotions,
@@ -28,7 +28,6 @@ import {
   redirectToCheckOut,
   requestMemberCardBinding,
   fetchMemberCardBindingStatus,
-  submitMemberMakeupRegister,
   submitMemberSubscriptionCancel,
   submitMemberLeaveApplication,
 } from '../../lib/api';
@@ -105,9 +104,6 @@ export default function MemberMembershipPage() {
   const [shopBusyId, setShopBusyId] = useState<number | null>(null);
   const checkoutInFlightRef = useRef(false);
   const [pendingBuy, setPendingBuy] = useState<Promotion | null>(null);
-  const [makeupSlots, setMakeupSlots] = useState<
-    Awaited<ReturnType<typeof fetchMemberMakeupSlots>>['data']
-  >(undefined);
   const [reloadKey, setReloadKey] = useState(0);
 
   const [leaveStart, setLeaveStart] = useState(todayIsoDate);
@@ -156,10 +152,7 @@ export default function MemberMembershipPage() {
           if (cancelled) return;
           if (promoRes.status === 'success' && promoRes.data) setPromotions(promoRes.data);
         } else if (tab === 'leave') {
-          const [subRes, makeupRes] = await Promise.all([
-            fetchMemberSubscriptions(),
-            fetchMemberMakeupSlots(),
-          ]);
+          const subRes = await fetchMemberSubscriptions();
           if (cancelled) return;
           if (subRes.status === 'success' && subRes.data) {
             setSubscriptions(subRes.data);
@@ -168,7 +161,6 @@ export default function MemberMembershipPage() {
               setCancelSubId((prev) => prev || subRes.data![0].id);
             }
           }
-          if (makeupRes.status === 'success') setMakeupSlots(makeupRes.data);
         } else if (tab === 'subscription') {
           const subRes = await fetchMemberSubscriptions();
           if (cancelled) return;
@@ -368,19 +360,6 @@ export default function MemberMembershipPage() {
     }
   }
 
-  async function onMakeupRegister(slotId: number) {
-    setBusy(true);
-    try {
-      const res = await submitMemberMakeupRegister({ makeupSlotId: slotId });
-      toast(res.message || '已登記補課', res.status === 'success' ? 'success' : 'error');
-      if (res.status === 'success') setReloadKey((k) => k + 1);
-    } catch (err) {
-      toast(getErrorMessage(err, '補課登記失敗'), 'error');
-    } finally {
-      setBusy(false);
-    }
-  }
-
   const payLabel = shopPayMethod === 'LINEPAY' ? 'LinePay 線上付款' : '刷卡（PayUNi）';
   const panelLoading = profileLoading || tabLoading;
 
@@ -540,25 +519,14 @@ export default function MemberMembershipPage() {
                 </Button>
               </form>
             </Card>
-            {(makeupSlots?.slots || []).length > 0 && (
-              <Card title="補課名額" className="mt-md">
-                <ul className="member-list">
-                  {(makeupSlots?.slots || []).map((s) => (
-                    <li
-                      key={s.id}
-                      style={{ display: 'flex', justifyContent: 'space-between', gap: '0.5rem' }}
-                    >
-                      <span>
-                        {s.class?.title} · {fmt(s.class?.startAt)} · 剩 {s.remaining}
-                      </span>
-                      <Button size="sm" onClick={() => void onMakeupRegister(s.id)} disabled={busy}>
-                        登記
-                      </Button>
-                    </li>
-                  ))}
-                </ul>
-              </Card>
-            )}
+            <Card title="團課請假／補課" className="mt-md">
+              <p className="text-sm text-muted" style={{ marginTop: 0 }}>
+                團課為付費期班，開課前 24 小時請假可取得補課權，請至約課頁的「團課期班」操作。
+              </p>
+              <Link to="/member/book?tab=group" className="btn btn--secondary btn--sm">
+                前往團課期班
+              </Link>
+            </Card>
           </>
         ) : tab === 'subscription' ? (
           subscriptions.length === 0 ? (

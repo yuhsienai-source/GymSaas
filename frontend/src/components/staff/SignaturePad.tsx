@@ -1,22 +1,38 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useImperativeHandle, useRef, type Ref } from 'react';
 import { Button } from '../ui';
 
-type Props = {
-  onChange?: (dataUrl: string | null) => void;
-  disabled?: boolean;
-  height?: number;
+/** 呼叫端取記憶體 Canvas（壓浮水印、toBlob）與筆跡點數（防空白送出） */
+export type SignaturePadHandle = {
+  getCanvas: () => HTMLCanvasElement | null;
+  pointCount: () => number;
+  clear: () => void;
 };
 
-/** 臨櫃觸控／滑鼠簽名板，輸出 PNG data URL */
-export default function SignaturePad({ onChange, disabled, height = 160 }: Props) {
+type Props = {
+  /** 傳入才會在每筆結束時輸出 PNG data URL；Blob 流程請改用 padRef */
+  onChange?: (dataUrl: string | null) => void;
+  /** 筆跡點數變動（含清除歸零） */
+  onStrokeChange?: (points: number) => void;
+  padRef?: Ref<SignaturePadHandle>;
+  disabled?: boolean;
+  height?: number;
+  /** 由呼叫端自行提供清除按鈕 */
+  hideClear?: boolean;
+};
+
+/** 臨櫃觸控／滑鼠簽名板 */
+export default function SignaturePad({ onChange, onStrokeChange, padRef, disabled, height = 160, hideClear }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const drawing = useRef(false);
+  const points = useRef(0);
   const onChangeRef = useRef(onChange);
+  const onStrokeRef = useRef(onStrokeChange);
   const ready = useRef(false);
 
   useEffect(() => {
     onChangeRef.current = onChange;
-  }, [onChange]);
+    onStrokeRef.current = onStrokeChange;
+  }, [onChange, onStrokeChange]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -47,6 +63,7 @@ export default function SignaturePad({ onChange, disabled, height = 160 }: Props
   }
 
   function emit() {
+    onStrokeRef.current?.(points.current);
     const canvas = canvasRef.current;
     if (!canvas || !onChangeRef.current) return;
     onChangeRef.current(canvas.toDataURL('image/png'));
@@ -63,20 +80,30 @@ export default function SignaturePad({ onChange, disabled, height = 160 }: Props
     emit();
   }
 
-  function clear(e?: React.MouseEvent) {
-    e?.preventDefault();
-    e?.stopPropagation();
+  function clearCanvas() {
     const canvas = canvasRef.current;
     const ctx = canvas?.getContext('2d');
     if (!canvas || !ctx) return;
     const rect = canvas.getBoundingClientRect();
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
     const dpr = window.devicePixelRatio || 1;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.fillStyle = '#fff';
     ctx.fillRect(0, 0, rect.width, height);
+    points.current = 0;
+    onStrokeRef.current?.(0);
     onChangeRef.current?.(null);
   }
+
+  useImperativeHandle(
+    padRef,
+    () => ({
+      getCanvas: () => canvasRef.current,
+      pointCount: () => points.current,
+      clear: clearCanvas,
+    }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- clearCanvas 只讀 ref 與 height
+    [height],
+  );
 
   return (
     <div className="form-stack">
@@ -103,6 +130,7 @@ export default function SignaturePad({ onChange, disabled, height = 160 }: Props
           const p = pos(e);
           ctx.beginPath();
           ctx.moveTo(p.x, p.y);
+          points.current += 1;
           (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
         }}
         onPointerMove={(e) => {
@@ -113,6 +141,7 @@ export default function SignaturePad({ onChange, disabled, height = 160 }: Props
           const p = pos(e);
           ctx.lineTo(p.x, p.y);
           ctx.stroke();
+          points.current += 1;
         }}
         onPointerUp={(e) => {
           e.preventDefault();
@@ -126,9 +155,21 @@ export default function SignaturePad({ onChange, disabled, height = 160 }: Props
         }}
         // 勿在 pointerLeave 結束：易誤觸，且 label 內可能連動點到「清除」
       />
-      <Button type="button" variant="ghost" size="sm" onClick={clear} disabled={disabled}>
-        清除簽名
-      </Button>
+      {!hideClear && (
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          onClick={(e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            clearCanvas();
+          }}
+          disabled={disabled}
+        >
+          清除簽名
+        </Button>
+      )}
     </div>
   );
 }

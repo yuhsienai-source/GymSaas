@@ -11,6 +11,11 @@
 - `AUTH_*`／`DEVICE_MISMATCH`／401 → 硬導登入。
 - `CONTRACT_REQUIRED`／`NO_ACTIVE_CHECKIN`／`CONSENT_REQUIRED` 須明示。櫃檯進場列表訂閱 `/ws/gate-alert`。
 - 出場成功但 `gateOpen=false`／`feeDetails.shortfall>0`：視為拒開門（待補扣），不得當綠燈。
+- 分店類型、部門、職位、教練等級只取 `lib/orgStructure.ts`（後端 `lib/orgStructure.js` 鏡像，改一邊必同步另一邊）；權限／導向取 `lib/staffPermissions.ts`；**禁止**在頁面另寫職位字串比對或標籤表。僅 `ADMIN` 導向 `/staff/hq`，GM／FM 依模組權限導向。
+- HQ「員工管理」＝組織架構樹（總公司 → GM／FM → 分店；CLASS 巢狀於上層 GYM 並顯示上層店長督導；主管依分店類型顯示），點節點篩選名單；分店下拉只列符合職位之分店（CLASS 不列）；職位必備模組鎖定勾選；新增／編輯走 Modal，送出以 ref 鎖防連點。
+- 員工照片：編輯員工 Modal 內 `StaffPhotoPanel`（前鏡頭拍攝或選檔，記憶體 canvas 縮至 ≤1280 JPEG，不落盤）；人臉辨識須先經 `StaffFaceConsentSection` 由員工本人閱讀條文、勾選同意並以 `SignaturePad` 親簽（送 `bodyHash`），簽署有效（`current`）前「註冊人臉」勾選鎖定、僅能傳頭像；禁止以勾選取代簽名。勞動條件：員工表單「勞動條件」區（工作型態、到職日、兼職／實習週工時、實習是否具勞雇關係），名單顯示工作型態、年資、特休／國休「已用／總」，一律取後端 `leaveBalance`；正職特休以日、兼職以時數顯示（`lib/laborLaw.ts`）。總部 HR（`HqHrTab` 僅切換）＝`HqAttendancePanel`（考勤：旗標／曠職／彙總一律顯示後端 `flags`／`absences`／`byStaff`，**禁止**前端自算遲到早退；補登與更正必填原因）、`HqLeavePanel`（請假：待審優先，核准／拒絕／撤銷依後端狀態機，拒絕與撤銷經 `ReasonModal` 填原因；`conflicts` 顯示「班表衝突」提醒）、`HqSchedulePanel`、`HqHolidayPanel`（年度切換、改名、僅在後端 `missingDefaults > 0` 時顯示補入預設）。員工自助打卡與請假在側欄「我的出勤」`/staff/my-attendance`（`MyAttendancePage`，所有員工可見；打卡、送出請假須 ref 鎖；狀態、額度、班次一律取後端），**禁止**再把自助打卡放回 HQ。**班表值勤**：`StaffAuthContext` 持有後端 `duty`（登入回應帶入、`/staff/hr/duty-status` 每 60 秒與回到前景時更新、打卡回應 `duty` 覆寫、攔截 403 `OFF_DUTY` 經 `STAFF_OFF_DUTY_EVENT` 覆寫），`isOffDuty` 時側欄只留自助項（`selfService`）、隱藏 ⌘K、`PermissionRoute`／`DutyRoute`／`ManagerRoute` 導回我的出勤，`StaffDutyBanner` 顯示非值勤／未打卡提示；登入後 `duty.canPunchIn` 導 `/staff/my-attendance?punch=1` 彈出打卡確認。上班打卡鈕只依後端 `duty.canPunchIn`，**禁止**前端自算值勤窗或送 `branchId`（分店由後端依班次決定）；`OFF_DUTY` **不得**當登出。HQ 自曠職列補登須帶 `scheduleId` 綁班次。時間格式化共用 `lib/hrFormat.ts`（僅標籤／台北時間，不含規則）。總部 HR「排班」＝`hq/HqSchedulePanel`，分「四週排班（分店班表）」「週班表審核」「班表總覽」三頁：總覽只顯示後端 `source`／`label`／`rosterStatus`／`coachPlanStatus`，刪除鈕僅依後端 `deletable`，四週排班列只提供「至四週排班」導回、禁止在總覽改格；**已移除**「總部臨時排班」新增表單（所有非 ADMIN 皆有四週排班或週班表），既有臨時班次僅可刪除。「週班表審核」頁＝`CoachPlanReviewPanel`（不帶 `kind`，ADMIN 可切換管理職／教練）。場務排班共用 `components/staff/ShiftRosterPanel`：總部 HR「排班 → 四週排班」與店長以上側欄「場務排班」`/staff/roster`（`ManagerRoute`／`canManageRoster`，分店清單取後端 `/staff/roster/configs`，禁止前端自組可管分店；面板顯示「員工排假申請」收件匣與申請日虛框）；員工「我的排班」`/staff/my-roster`（`MyRosterPage`，除 ADMIN 外皆可見（`staffCanRequestOff`），是否列入編制與上限一律依後端 `eligible`／`maxOffDays`）點選日期遞交排假，送出鈕須 ref 鎖；截止日與鎖定一律用後端 `offRequestDeadline`／`locked`，班表確認（確認／異議）用後端 `ack`（`autoConfirmed` 顯示「逾期自動視為同意」），禁止前端自算期限放行或自行標記同意；店長面板顯示確認追蹤（`summary.acks`）；格值只經 `setRosterCell` 寫入，自動排班／發布／撤回走後端；違規、缺額、工時與例休統計**一律顯示後端 `issues`／`stats`／`coverage`**，禁止前端自算合規或繞過發布阻擋；發布後格子唯讀。週班表對象（後端 `weekPlanRole`：轉正教練 `COACH`、店長／GM／FM `MANAGER`）之「我的排班」改顯示 `components/staff/CoachWeekPlanPanel`（審核者文字用後端 `approverLabel`，GM／FM 依後端 `allowNoBranch` 顯示「總部（不指定分店）」；按週提報時段＋例假／休息日 → 儲存草稿取回後端 `evaluation` → 送審；可否編輯只依後端 `editable`，工時／違規只顯示後端 `evaluation.issues`／`stats`，有未儲存變更時須標示檢查結果為舊版本；送審前若有變更先儲存；送出共用 ref 鎖）；`/staff/roster` 下方 `components/staff/CoachPlanReviewPanel kind="COACH"`（僅 `staffCanReviewWeekPlans`＝店長／FM／ADMIN 顯示，GM 不顯示；審核鈕只依後端 `canReview`、核准鈕依 `evaluation.hasError` 停用，退回／撤回核准經 `ReasonModal`；**禁止**前端自判審核鏈）。教練服務台「工時」分頁顯示後端 `workSlots` 與 `TrainerTimeOffPanel`（「不開放預約」：行政／備課等，**禁止**標示為排休或休假）；`employed === false` 須顯示不得排課提醒；首頁 `TrainerPerformanceCard` 只顯示後端 `/trainer/performance` 試算。總部「教練業績」分頁 `hq/HqCoachTab`：月度試算與合規旗標只顯示後端 `/hq/coach/performance`，獎金規則經 `PUT /hq/coach/commission-rules`（**禁止**輸入底薪、扣除費率或鐘點制；比例以 % 輸入僅換算小數送出），底薪只在「薪資 → 薪資設定」。通知與 LINE 推播：「我的出勤」內 `components/staff/StaffNotificationsCard`（通知匣、綁定／暫停／解除／測試，狀態一律取後端 `loginConfigured`／`pushConfigured`）；LINE 回流頁 `/staff/line/callback`（`StaffLineCallbackPage`，須在員工登入狀態，以 ref 防重複送出 `code`／`state` 並立即清除網址參數），**禁止**前端自行換 token 或保存 LINE userId。總部 HR「工資匯出」＝`hq/HqPayrollPanel`：按「產生」才呼叫 API（每次留稽核紀錄，禁止隨篩選自動重抓），預覽與合計只顯示後端 `summary`／`totals`／`warnings`，CSV 經 `lib/csv.ts`（BOM、CRLF、防公式注入，下載後 `revokeObjectURL`），**禁止**前端自算工時或旗標。總部「薪資」分頁＝`hq/HqPayrollTab`（僅切換）：`PayrollRunPanel`（批次、加班核定、手動項、結算／撤銷；每個動作皆回傳整批明細並整批替換，送出共用 ref 鎖；撤銷經 `ReasonModal`；CSV 用後端 `table`）、`PayProfilePanel`（員工薪資設定）、`PayrollRatesPanel`（費率，須提示依公告核對）；員工薪資單在「我的出勤」`components/staff/MyPayslipCard`。薪資明細共用 `components/staff/PayslipLines`，**一律只顯示後端 `lines`／合計**，**禁止**前端加總、換算倍率或預估金額（輸入欄位僅送原始值）。頭像一律用 `StaffAvatar`（依 `photoUpdatedAt` 版本快取，無照片顯示姓名首字），禁止直接拼影像 URL。
+- HQ「分店場地」：建立／編輯須可設 `type` 與 `parentId`（CLASS 隸屬選單必填），一覽依隸屬排序。
+- 教練角色用 `isManagerTrainer`／`trainerRoleOf`；ADMIN 判斷用 `staffIsAdmin`／`isPosition`，禁止 `role === 'ADMIN'`／`'MANAGER'` 字串比對。
 
 ## 閘機
 - `gateApi` 逾時 ≈2.5s；逾時／斷網顯示「網路通訊重試中」，不清配對。
@@ -18,17 +23,41 @@
 
 ## 合規 UI
 - 註冊／登入入口：左「會員登入」（LINE 快速／Email）；右「查詢／註冊」（手機＋證件辨識 → Email → 選用 LINE → 完成資料）。
+- 註冊各步驟須可「上一步」返回；證件僅允許本機相機拍攝（JPEG），禁止檔案／相簿選檔。
 - 「LINE 快速登入」僅已綁 LINE 會員；新客走「查詢／註冊」。
 - 閘機單路相機。容留尊重 `occupancy-settings`。
-- 臨櫃：`YIPAY`＋`opsConfirmYipay`；端末成功先 `yipay/captures`；LinePay 只傳 `linePayOneTimeKey`。
-- 客顯：`/staff/customer-display`＋`usePosDisplayHost`（CART／CONSENT／IDLE）。
+- 臨櫃：`YIPAY`＋`opsConfirmYipay`；端末成功先 `yipay/captures`；LinePay 只傳 `linePayOneTimeKey`。乙禾確認視窗之「作廢待付款」僅 `staffHasDutyRankOrAbove` 顯示，經 `ReasonModal`＋必勾「已確認端末／金流未扣款」呼叫 `opsCancelPendingPayment`（只送 `reason`／`checked`）；零錢包回補金額只顯示後端 `walletRestored`，**禁止**前端自算。購物車含計時儲值（非 `UNLIMITED` 購案）時選零錢包須警示並鎖結帳鈕（後端 400 `TOPUP_NO_WALLET` 為準）。閘機出場 `gateOpen=false`／`settled=false` 須明示「餘額不足、尚未出場、請儲值後再刷出」，不得顯示為已結算。
+- 臨櫃結帳兩步驟：① 選品（商品／購案／私教／團課）→ ② 付款與發票；未開班鎖定結帳。
+
+## 團課付費期班
+- 顯示用標籤與格式、POS 草稿鍵共用 `lib/groupClass.ts`（不含規則）。整期／插班報價、剩餘名額、單堂空位、可否請假（`canLeave`）、退費試算與管道**一律只顯示後端欄位**，**禁止**前端按比例計價、加總退費或判斷名額／期限。
+- 會員：約課頁 `/member/book?tab=group`（`MemberBookingPage` 分頁＋`components/member/MemberGroupClassPanel`）：報名只送 `seriesId`／`kind`／`classId`／`payMethod`（禁帶金額），付款鈕 ref 鎖，導向 PayUNi（`redirectToCheckOut`）或 LINE Pay；候補、遞補限時報名、請假取得補課權、選擇補課堂次、取消補課。付款回流 `PayReturnPage` 遇 `kind=group` 不輪詢錢包、導回團課頁。會籍頁舊「補課名額」已移除（後端 410）。
+- 櫃檯：POS 選品頁 `components/staff/OpsGroupClassPanel`（整期／插班／單堂入車為 `GROUP` 行，數量固定 1，結帳送 `groupItems`；需選會員、**禁止**選零錢包付款；代登候補；會員團課列表 DUTY+ 顯示「退費試算」，確認經 `ReasonModal` 只送原因）。
+- 總部：`PtDashboardPage` 開班須選 GROUP 課程方案（選單依場地分店／上層 GYM 過濾僅為提示，堂數不符以後端 400 為準），`components/staff/GroupSeriesAdminPanel` 顯示後端報名統計、`needsDecision`、名單；「取消期班」僅 `isAdmin` 顯示並經 `ReasonModal`。課程方案 GROUP 型可設單堂價與最低開班人數，且不顯示定期定額。
+- 客顯：`/staff/customer-display`＋`usePosDisplayHost`（CART／CONSENT／IDLE）；折讓簽名另由 `features/pos-display/AllowanceSignView` 自行訂閱（見退費段）。
+  Host↔客顯心跳（PING／PONG，逾時約 12s 降為未連線）；簽名須 `SIGNATURE_ACK` 後客顯才回待機。
 - 證件：一般櫃檯僅「已建檔」；DUTY+ `requestOpsMemberIdPhotoPresign`（原因必填）→ `<img src={url}>`。
 
 ## 臨櫃代辦證件（Master SOP）
-- 客顯 `CONSENT`（`ID_PHOTO_ASSIST`）→ `consentSignatureId` → USB／UVC 記憶體浮水印 → `POST /ops/members/:id/id-photo`。
+- 客顯 `CONSENT`（`purpose='ID_PHOTO_ASSIST'`）→ `consentSignatureId` → USB／UVC 記憶體浮水印 → `POST /ops/members/:id/id-photo`。
 - **禁止**私載／本機落盤／檔案選擇器當主流程。
 
+## 進銷存／電子發票
+- 總部「進銷存／發票」分頁（`pages/staff/hq/HqInventoryTab.tsx`＋`hq/inventory/*Panel.tsx`）：商品主檔、分店庫存、採購／驗收、應付／付款、供應商、營業人、電子發票。門市 `InventoryOpsPage`：**只能依採購單驗收數量**（禁送進價）、報損／盤點／調撥（DUTY+）。
+- 金額（應付、平均成本、發票稅額、付款沖銷剩餘）一律顯示後端值，**禁止**前端自算回填；營業人表單**禁止**出現 HashKey／HashIV 欄位，只顯示後端 `ezpay.configured`／`missing`。電子發票面板之 ezPay 呼叫紀錄（`EInvoiceLogModal`）唯讀顯示後端 `EInvoiceLog`，不得自行判定可否重試。
+- 門市發票對帳（HQ 進銷存「發票對帳」`SalesReconciliationPanel`）：按「查詢」才呼叫 API；分頁（發票清冊／發票品項／折讓單／商品銷貨明細）定義於 `RECON_DATASETS`，預覽、合計列與匯出只用後端各組 `columns`／列與 `summary`（發票期別下拉僅帶入日期）。匯出唯一經 `lib/reconExport.ts`：Excel 以 `import('exceljs')` 動態載入（**禁止**靜態 import 拖大主包），CSV 經 `lib/csv.ts`；**禁止**前端加總、拆稅或補算未稅金額。
+- 作廢／取消／短交結案等原因走 `components/staff/ReasonModal`；付款、驗收、調撥送出按鈕必須 ref 同步鎖。標籤／格式共用 `lib/inventoryLabels.ts`。
+
+## 交易取消／退費／折讓
+- 唯一入口 `components/staff/RefundDialog`（HQ 報表列「退費」與櫃檯「交易異動 → 退費／折讓」）：查單（母單 CHK 展開各分腿子單，每張子單列出 ezPay 發票號與狀態：已開立／已部分折讓／已全額折讓／已作廢／開立失敗，標籤只依後端 `status`＋`allowanceTotal`）→ 選子單 → 選 `scope`（SAL 勾選品項＋退貨數量；TYK／CRS／私教依合約規則由後端試算）→ 顯示後端試算（應退、退款管道、發票作廢／折讓、警示）→ 必填原因 → 送出。**只送** `quoteToken`（原樣帶回後端試算所發）、`scope`、`items[{orderItemId, qty}]`、`reason`、`buyerEmail`，**禁止**帶任何金額或自算退費／稅額；試算須對應目前選項（選項變更、試算未回來前鎖送出），`QUOTE_STALE`／`QUOTE_EXPIRED` 時自動重新試算並以警示框請經辦核對新金額。須由父層條件式掛載（開啟才 render），關閉即卸載重置。
+- 退費單後續 `components/staff/RefundRecordView`：乙禾端末退刷（步驟引導＋顯示後端 `payments[].original` 原交易 RRN／授權碼／末四碼供核對，末四碼不符前端先擋、後端 409 `CARD_MISMATCH` 為準）、線上退款失敗改臨櫃現金、重試改打 `POST /ops/refunds/:id/retry-gateway`（成功後顯示後端 `stepSummary`）。LINE Pay／PayUNi 無 `providerRef` 且結果不明時，必勾「我已確認後台未完成退刷」，送出必須帶 `confirmGatewayNotRefunded: true`（改現金同此欄位）。409 `REFUND_RETRY_IN_PROGRESS` 鎖定重試鈕並提示 90 秒後可接手、不登出；403 `DUTY_ROLE_REQUIRED_FOR_RETRY` 只示警、不登出。409 `YIPAY_TERMINAL_VOUCHER_REQUIRED` 展開乙禾回填。409 `INVOICE_RESULT_UNKNOWN` 開啟核對藍新。狀態 `GATEWAY_RETRYING` 表示同步中、中止（`ReasonModal`）。**退費單 `invoiceResolve` 非 null（ezPay 折讓結果不明、預占保留中）時**：禁止顯示「已確認」勾選與重試鈕、中止鈕必須 disabled（作廢／折讓任一結果不明皆同）並註明原因，改顯示「核對藍新結果」對話框（`InvoiceResolveModal`）：`ISSUED` 必填 `ezPayAllowanceNo`＋原因、`NOT_ISSUED` 須勾「已於藍新後台確認尚未開立」並送 `confirmEzPayNotIssued: true`＋必填原因，body 只能經 `resolveRefundInvoice()` 組白名單欄位；403 於對話框內明示須 DUTY+，不得登出；補登後若 `SIGNATURE_PENDING` 直接推送客顯簽名。「確認取消／送出折讓／確認乙禾退刷」等寫入按鈕必須 `useRef` 同步鎖（`refundInFlightRef`）**且**請求中 `disabled`（`Button` 之 `loading` 一律優先於傳入的 `disabled`）。退費建單必帶 `Idempotency-Key`（`newRefundIdempotencyKey()`，`RefundDialog` 每次選子單產生、逾時重按沿用；`replayed` 時以 info 提示回傳原單）。`PARTIAL_INVOICE` 須明示「退款已完成、發票待重試」，不得當失敗。
+- 錯誤明示：退費相關錯誤一律經 `lib/refundErrors.ts`（`describeRefundError`）＋`components/staff/RefundErrorAlert` 顯示警示框（標題＋後端訊息＋處置建議＋code），**禁止**只用 toast 或吞錯；`WALLET_INSUFFICIENT_FOR_VOID` 須提供「改用子單退費（未使用退費）」；模組 403 顯示「權限不足」，**不得**登出。
+- 折讓簽名（契約 `types/posDisplayBus.ts`，傳輸 `lib/allowanceSignChannel.ts`）：主機 `features/pos/hooks/usePosAllowanceBus` 先 `POST /ops/refunds/:id/signature-preview` 取後端明細＋`previewToken`／`requestId` → 送 `ALLOWANCE_SIGN_REQUEST`（3 秒內無 `ALLOWANCE_VIEW_ACK` 顯示「客顯未開啟」）→ 客顯 `AllowanceSignView` 顯示原發票號、子單、品項、未稅／稅額／總額與錢包扣回（數值**只取**預覽，**禁止**前端算稅）、勾選確認＋`SignaturePad`（筆畫點數下限防空白、`useRef` 送出鎖），記憶體 canvas 壓浮水印「僅供體育客電子發票折讓憑證｜分店｜日期時間」→ `ALLOWANCE_SIGN_COMPLETE` 帶 `signatureBlob: Blob` → 主機以 `refundInFlightRef` 鎖、`FormData` 上傳 `POST /ops/refunds/:id/signature` → `ALLOWANCE_SIGN_FINALIZED` 回執（失敗可重送；token 過期／資料變動須重新推送）；任一方可送 `ALLOWANCE_SIGN_CANCEL`。此通道**只走 BroadcastChannel**、**禁止** localStorage 備援，簽名**禁止** Base64 或寫入任何 Storage；訊息須以 `requestId`＋`from` 過濾，**禁止**與 CONSENT（如 `ID_PHOTO_ASSIST`）互相取用簽名。
+- 折讓單列印唯一經 `components/staff/AllowancePrintView`（`lib/useAllowancePrint.ts` 取 `GET /ops/allowances/:id/print-payload?purpose=print`，後端計次、`print.isReprint` 時印「補印」；客顯推送一律 `purpose=display`；portal 至 body＋`body.alw-printing` 之 `@media print` 只印本區塊，A4 四聯／80mm 熱感各自 `@page`，簽名圖僅接受 `data:image/png;base64,`、載入後才 `window.print()`，`afterprint` 卸載）。**禁止**開新視窗寫 HTML 字串列印。列表匯出必須呼叫 `POST /ops/allowances/export`：篩選 `exportState`＝`ALL`｜`UNEXPORTED`｜`EXPORTED`；「僅下載 CSV／Excel」送 `markExported: false`（不寫 `exportedToAcctAt`，已匯出單可再下載），「下載並標記已結轉」才送 `markExported: true`。再經 `lib/allowanceExport.ts` 排版（依日期區間＋作業分店；CSV 走 `lib/csv.ts` UTF-8 BOM＋防公式注入、Excel 動態 `import('exceljs')`），只用後端 `columns`／`rows`，**禁止**前端自行標記已匯出。
+- 交班頁「班內現金退款」只在揭示應有現金後顯示（盲盤期間不得預顯）。
+
 ## 待覆蓋
-- 交班盲盤／進銷存報損：後端＋基本 UI 已落地（`OpsShiftHandoverTab` 盲點、`InventoryOpsPage` DUTY+）；細節 polish 可另開。
+- 交班盲盤／進銷存報損：後端＋基本 UI 已落地；**臨櫃結帳須已開班**（未開班鎖定結帳鈕並導向交接班；後端亦強制，收到 409 `SHIFT_NOT_OPEN` 須顯示訊息並切回交接班分頁）。
+  班別：**早班 07:00–15:30**、**晚班 15:30–00:00**。
 - 消保契約退費預覽（前端禁自算金額）。
-- 乙禾日結／開票 FAILED：交接班「刷卡機日結核對」＋頂部 `OpsInvoiceFailBanner`（已落地）。
+- 乙禾日結／開票 FAILED：交接班「刷卡機日結核對」＋頂部 `OpsInvoiceFailBanner`（已落地）；乙禾確認文案須對齊「開票失敗不沖回已收款」。

@@ -1,4 +1,4 @@
-import { type FormEvent, useCallback, useEffect, useState } from 'react';
+import { type FormEvent, useEffect, useState } from 'react';
 import { Button, Card, Field, Input, PageSection, Select } from '../../../components/ui';
 import { useToast } from '../../../contexts/ToastContext';
 import {
@@ -37,22 +37,24 @@ export default function HqMarketingTab() {
   const [giftAmount, setGiftAmount] = useState('500');
   const [poolName, setPoolName] = useState('');
 
-  const load = useCallback(async () => {
-    try {
-      const [campRes, poolRes] = await Promise.all([
-        fetchHqMarketingCampaigns(),
-        fetchHqLotteryPools(),
-      ]);
-      if (campRes.status === 'success' && campRes.data) setCampaigns(campRes.data);
-      if (poolRes.status === 'success' && poolRes.data) setPools(poolRes.data);
-    } catch (err) {
-      toast(getErrorMessage(err, '載入行銷資料失敗'), 'error');
-    }
-  }, [toast]);
+  const [reloadKey, setReloadKey] = useState(0);
+  const load = () => setReloadKey((k) => k + 1);
 
   useEffect(() => {
-    void load();
-  }, [load]);
+    let cancelled = false;
+    Promise.all([fetchHqMarketingCampaigns(), fetchHqLotteryPools()])
+      .then(([campRes, poolRes]) => {
+        if (cancelled) return;
+        if (campRes.status === 'success' && campRes.data) setCampaigns(campRes.data);
+        if (poolRes.status === 'success' && poolRes.data) setPools(poolRes.data);
+      })
+      .catch((err) => {
+        if (!cancelled) toast(getErrorMessage(err, '載入行銷資料失敗'), 'error');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [reloadKey, toast]);
 
   async function loadDormant() {
     setBusy(true);

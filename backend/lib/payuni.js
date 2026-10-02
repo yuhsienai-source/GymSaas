@@ -231,11 +231,6 @@ export function getPayuniReturnBaseUrl() {
   return getPayuniCallbackBaseUrl();
 }
 
-/** @deprecated 請改用 getPayuniNotifyBaseUrl / getPayuniReturnBaseUrl */
-function getApiPublicBaseUrl() {
-  return getPayuniCallbackBaseUrl();
-}
-
 function getPayuniBackUrl() {
   const fe = stripEnvUrl(process.env.FRONTEND_URL || '');
   if (!fe) return null;
@@ -1160,6 +1155,35 @@ export async function cancelPayuniAuth({ tradeNo } = {}) {
   const tn = String(tradeNo || '').trim();
   if (!tn) return { ok: false, message: '缺少 TradeNo' };
   return postPayuniEncrypted(getPayuniTradeCancelUrl(), { TradeNo: tn });
+}
+
+export function getPayuniTradeCloseUrl() {
+  return (
+    (process.env.PAYUNI_TRADE_CLOSE_URL || '').trim() ||
+    `${getPayuniApiBase()}/api/trade/close`
+  );
+}
+
+/**
+ * 信用卡已請款交易退款（官方 SDK：/api/trade/close，CloseType=2 退款）
+ * 已確認：端點、MerID／TradeNo／CloseType／Timestamp 必填。
+ * 未經官方文件確認（PAYUNI_REFUND_SPEC_UNVERIFIED）：部分退款金額欄位 CloseAmt、成功回應欄位（以解密 Status=SUCCESS 判定）。
+ * 上線前須以 PayUNi 測試環境驗證部分退款；未驗證前可設 PAYUNI_PARTIAL_REFUND=false 讓部分退款改走臨櫃人工。
+ * @returns {Promise<{ ok: boolean, status?: string, message?: string, data?: object, ambiguous?: boolean }>}
+ */
+export async function refundPayuniTrade({ tradeNo, amount, fullAmount } = {}) {
+  const tn = String(tradeNo || '').trim();
+  const amt = Math.round(Number(amount) || 0);
+  if (!tn) return { ok: false, message: '缺少 PayUNi TradeNo' };
+  if (!(amt > 0)) return { ok: false, message: '退款金額必須為正整數' };
+  const partial = fullAmount != null && amt < Math.round(Number(fullAmount) || 0);
+  if (partial && String(process.env.PAYUNI_PARTIAL_REFUND ?? 'true').toLowerCase() === 'false') {
+    return { ok: false, message: 'PayUNi 部分退款未啟用（PAYUNI_PARTIAL_REFUND=false），請改臨櫃人工退款' };
+  }
+  const params = { TradeNo: tn, CloseType: '2' };
+  if (partial) params.CloseAmt = String(amt);
+  const result = await postPayuniEncrypted(getPayuniTradeCloseUrl(), params);
+  return { ...result, ambiguous: !result.ok && !result.status };
 }
 
 /**

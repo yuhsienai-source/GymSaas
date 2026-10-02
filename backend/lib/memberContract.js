@@ -213,8 +213,8 @@ export function mapCoursePlanContracts(coursePlan) {
 }
 
 /** 購課前：檢查課程方案連結的目前版本皆已 SIGNED */
-export async function assertMemberSignedCoursePlanContracts(memberId, coursePlanId) {
-  const links = await prisma.coursePlanMembershipContract.findMany({
+export async function assertMemberSignedCoursePlanContracts(memberId, coursePlanId, db = prisma) {
+  const links = await db.coursePlanMembershipContract.findMany({
     where: { coursePlanId },
     include: {
       contract: { select: { id: true, title: true, shortName: true, status: true } },
@@ -233,12 +233,12 @@ export async function assertMemberSignedCoursePlanContracts(memberId, coursePlan
       missing.push(`${link.contract.title}（已作廢）`);
       continue;
     }
-    const version = await getCurrentContractVersion(prisma, link.contractId);
+    const version = await getCurrentContractVersion(db, link.contractId);
     if (!version) {
       missing.push(link.contract.title);
       continue;
     }
-    const signed = await prisma.memberContractSignature.findFirst({
+    const signed = await db.memberContractSignature.findFirst({
       where: {
         memberId,
         contractVersionId: version.id,

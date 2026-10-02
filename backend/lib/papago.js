@@ -4,6 +4,8 @@
 const PAPAGO_API_BASE_URL = (process.env.PAPAGO_API_BASE_URL || 'https://api.face8.ai/v1').replace(/\/$/, '');
 const PAPAGO_API_KEY = (process.env.PAPAGO_API_KEY || '').trim();
 const PAPAGO_GROUP_ID = (process.env.PAPAGO_GROUP_ID || 'gymsaas-members').trim();
+/** 員工人臉群組：必須與會員群組分離，避免閘機 1:N 比對命中員工 */
+const PAPAGO_STAFF_GROUP_ID = (process.env.PAPAGO_STAFF_GROUP_ID || 'gymsaas-staff').trim();
 const PAPAGO_SIMILARITY_THRESHOLD = parseFloat(process.env.PAPAGO_SIMILARITY_THRESHOLD || '0.85');
 const PAPAGO_MOCK_MODE = process.env.PAPAGO_MOCK_MODE === 'true' || !PAPAGO_API_KEY;
 
@@ -12,6 +14,7 @@ const ENDPOINTS = {
   identify: process.env.PAPAGO_IDENTIFY_PATH || '/face/identify',
   verify: process.env.PAPAGO_VERIFY_PATH || '/face/verify',
   liveness: process.env.PAPAGO_LIVENESS_PATH || '/face/liveness',
+  remove: process.env.PAPAGO_REMOVE_PATH || '/face/delete',
 };
 
 function buildHeaders() {
@@ -49,10 +52,10 @@ function normalizeFaceResult(raw) {
 }
 
 /**
- * 臨櫃註冊：將會員人臉照片註冊至 Face8 群組
+ * 註冊人臉至 Face8 群組（預設會員群組；員工須傳 groupId: staffFaceGroupId()）
  * @returns {{ faceId: string, confidence: number }}
  */
-export async function registerFace({ imageBase64, externalId, displayName }) {
+export async function registerFace({ imageBase64, externalId, displayName, groupId = PAPAGO_GROUP_ID }) {
   if (!imageBase64) {
     throw new Error('缺少人臉影像');
   }
@@ -64,7 +67,7 @@ export async function registerFace({ imageBase64, externalId, displayName }) {
   }
 
   const data = await callPapagoApi(ENDPOINTS.register, {
-    groupId: PAPAGO_GROUP_ID,
+    groupId,
     externalId: String(externalId),
     displayName: displayName || `Member-${externalId}`,
     image: imageBase64,
@@ -156,6 +159,20 @@ export async function verifyFace({ imageBase64, faceId }) {
     confidence: result.confidence,
     livenessPassed: result.livenessPassed,
   };
+}
+
+/** 自 Face8 群組刪除人臉特徵（撤回生物辨識同意時必呼叫） */
+export async function removeFace({ faceId, groupId = PAPAGO_GROUP_ID }) {
+  if (!faceId) return;
+  if (PAPAGO_MOCK_MODE) {
+    console.log(`[PAPAGO Mock] 刪除人臉 groupId=${groupId}`);
+    return;
+  }
+  await callPapagoApi(ENDPOINTS.remove, { groupId, faceId });
+}
+
+export function staffFaceGroupId() {
+  return PAPAGO_STAFF_GROUP_ID;
 }
 
 export function isMockMode() {
