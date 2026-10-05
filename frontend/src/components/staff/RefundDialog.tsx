@@ -629,6 +629,11 @@ export default function RefundDialog({
                       此單據開立折讓後須由買受人當場於客顯親簽，且開立後不可中止。請先開啟副螢幕客顯並確認顧客在場。
                     </Alert>
                   )}
+                  {preview.calc?.medicalSuspension?.exemptEligible && (
+                    <Alert tone="info">
+                      會員因傷病暫停累計 {preview.calc.medicalSuspension.days} 日（已滿六個月），依契約第十二條末款終止不得收取手續費，後端已將手續費鎖定為 $0。
+                    </Alert>
+                  )}
                   {preview.isContractExpired && (
                     <Alert tone="error">
                       ⚠️ 本課程已逾契約效期（單堂 10 日，到期日 {twDate(preview.contractExpiresAt)}）。依紙本契約原則不予退費，若需專案退費須由值班主管（DUTY+）核准。

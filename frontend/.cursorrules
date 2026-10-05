@@ -28,6 +28,7 @@
 - 閘機單路相機。容留尊重 `occupancy-settings`。
 - 臨櫃：`YIPAY`＋`opsConfirmYipay`；端末成功先 `yipay/captures`；LinePay 只傳 `linePayOneTimeKey`。乙禾確認視窗之「作廢待付款」僅 `staffHasDutyRankOrAbove` 顯示，經 `ReasonModal`＋必勾「已確認端末／金流未扣款」呼叫 `opsCancelPendingPayment`（只送 `reason`／`checked`）；零錢包回補金額只顯示後端 `walletRestored`，**禁止**前端自算。購物車含計時儲值（非 `UNLIMITED` 購案）時選零錢包須警示並鎖結帳鈕（後端 400 `TOPUP_NO_WALLET` 為準）。閘機出場 `gateOpen=false`／`settled=false` 須明示「餘額不足、尚未出場、請儲值後再刷出」，不得顯示為已結算。
 - 臨櫃結帳兩步驟：① 選品頁以頁籤切換商品／購案／私教／團課加入購物車 → ② 付款與發票；未開班鎖定結帳。
+- 會員權暫停（第十二條）：會員頁送出只顯示「待審」並列申請紀錄（傷病／疫情未附證明者可補件）；櫃檯 `MemberLeaveReviewPanel` 代建／核准／退回（`ReasonModal`）／調閱證明（**必經 `ReasonModal` 填原因 ≥4 字** → `requestOpsMemberLeaveProofAccess` 取短效 URL 直接 `<img>` 顯示並標示失效時間，**禁止**下載、轉 Base64 或寫入 Storage）。事由標籤與日期提示鏡像 `lib/memberLeave.ts`，**禁止**前端自算天數、凍結天數、審核期限或審核結果；退費試算 `calc.medicalSuspension.exemptEligible` 僅顯示「後端已鎖定手續費 $0」，**禁止**前端改費用。
 - 會員管理（`OpsMemberAdminPanel`）以頁籤切換：會員備註／臨櫃代辦證件上傳／證件狀態與調閱／調整會籍日期；各頁籤保持掛載（`hidden` 切換），代辦證件之委託簽署狀態不得因切頁遺失，離開該頁籤須關閉相機串流。
 
 ## 團課付費期班

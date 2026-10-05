@@ -255,18 +255,46 @@ export interface CardSubscription {
   charges?: CardSubscriptionCharge[];
 }
 
+/** 契約第十二條暫停事由 */
+export type MemberLeaveCategory =
+  | 'OVERSEAS'
+  | 'MEDICAL'
+  | 'FAMILY_CARE'
+  | 'MILITARY'
+  | 'RELOCATION'
+  | 'OTHER'
+  | 'EPIDEMIC';
+
+export type MemberLeaveStatus = 'PENDING' | 'APPROVED' | 'ACTIVE' | 'ENDED' | 'REJECTED' | 'CANCELLED';
+
 export interface MemberLeave {
   id: number;
   memberId: number;
   subscriptionId?: string | null;
+  category?: MemberLeaveCategory | null;
+  categoryLabel?: string | null;
+  source?: 'MEMBER' | 'STAFF' | null;
   days: number;
   startAt: string;
   endAt: string;
   expireDateBefore?: string | null;
   nextChargeAtBefore?: string | null;
-  status: string;
+  status: MemberLeaveStatus | string;
   reason?: string | null;
   staffId?: number | null;
+  hasProof?: boolean;
+  proofFileName?: string | null;
+  proofUploadedAt?: string | null;
+  /** 傷病／疫情先送件之補證明期限 */
+  proofDueAt?: string | null;
+  /** 七工作日審核期限 */
+  reviewDueAt?: string | null;
+  reviewOverdue?: boolean;
+  reviewedByStaffId?: number | null;
+  reviewedAt?: string | null;
+  reviewNote?: string | null;
+  /** 已結束之實際凍結天數 */
+  frozenDays?: number | null;
   createdAt: string;
   endedAt?: string | null;
   member?: {
@@ -2379,7 +2407,12 @@ export interface RefundPreview {
   branchId: number | null;
   scope: RefundScope;
   lines: RefundLine[] | null;
-  calc: { note?: string; [k: string]: unknown };
+  calc: {
+    note?: string;
+    /** 月卡：契約第十二條傷病暫停累計（滿 180 日後端強制手續費 $0） */
+    medicalSuspension?: { days: number; exemptEligible: boolean };
+    [k: string]: unknown;
+  };
   grossAmount: number;
   feeAmount: number;
   /** 契約手續費上限（調降不得超過；0＝不收） */

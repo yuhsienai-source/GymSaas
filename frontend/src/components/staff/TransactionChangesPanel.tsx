@@ -10,13 +10,10 @@ import { useStaffAuth } from '../../contexts/StaffAuthContext';
 import { useToast } from '../../contexts/ToastContext';
 import {
   cancelOpsCardSubscription,
-  completeOpsMemberLeave,
-  endOpsMemberLeave,
   exportAllowancesForAccounting,
   fetchAllowances,
   fetchOpsCardSubscriptionRebindStatus,
   fetchOpsCardSubscriptions,
-  fetchOpsMemberLeaves,
   fetchRefunds,
   fetchReportBranches,
   getErrorMessage,
@@ -26,7 +23,6 @@ import {
   previewCancelCardSubscription,
   rebindOpsCardSubscription,
   resumeOpsCardSubscription,
-  startOpsMemberLeave,
 } from '../../lib/api';
 import { resolveBranchId } from '../../lib/resolveBranchId';
 import { defaultReportRange } from '../../lib/csvExport';
@@ -34,7 +30,8 @@ import { downloadAllowanceCsv, downloadAllowanceXlsx } from '../../lib/allowance
 import { useAllowancePrint } from '../../lib/useAllowancePrint';
 import { describeRefundError, type RefundErrorInfo } from '../../lib/refundErrors';
 import { REFUND_STATUS_LABEL, refundStatusTone } from '../../lib/refundLabels';
-import type { AllowanceListPayload, Branch, CardSubscription, MemberLeave, RefundRecord } from '../../types/api';
+import type { AllowanceListPayload, Branch, CardSubscription, RefundRecord } from '../../types/api';
+import MemberLeaveReviewPanel, { type LeavePrefill } from './MemberLeaveReviewPanel';
 import HqReportsTab from '../../pages/staff/hq/HqReportsTab';
 
 type TxSubTab = 'reports' | 'refund' | 'cancel' | 'subscription';
@@ -42,7 +39,7 @@ type TxSubTab = 'reports' | 'refund' | 'cancel' | 'subscription';
 const TX_TABS: { key: TxSubTab; label: string }[] = [
   { key: 'reports', label: '一般報表' },
   { key: 'refund', label: '退費／折讓' },
-  { key: 'subscription', label: '月卡訂閱／請假' },
+  { key: 'subscription', label: '月卡訂閱／暫停' },
   { key: 'cancel', label: '取消進出場' },
 ];
 
@@ -101,17 +98,13 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
   const [busy, setBusy] = useState(false);
 
   const [subs, setSubs] = useState<CardSubscription[]>([]);
-  const [leaves, setLeaves] = useState<MemberLeave[]>([]);
   const [subMemberFilter, setSubMemberFilter] = useState('');
   const [selectedSubId, setSelectedSubId] = useState('');
   const [expirePolicy, setExpirePolicy] = useState<ExpirePolicy>('KEEP');
   const [cancelSubReason, setCancelSubReason] = useState('');
   const [doAllowance, setDoAllowance] = useState(true);
   const [previewText, setPreviewText] = useState('');
-  const [leaveMemberNo, setLeaveMemberNo] = useState('');
-  const [leaveDays, setLeaveDays] = useState('7');
-  const [leaveReason, setLeaveReason] = useState('');
-  const [leaveSubId, setLeaveSubId] = useState('');
+  const [leavePrefill, setLeavePrefill] = useState<LeavePrefill | null>(null);
   const [pendingRebind, setPendingRebind] = useState<{
     subscriptionId: string;
     label: string;
@@ -149,20 +142,6 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
     }
   }, [subMemberFilter, toast]);
 
-  const loadLeaves = useCallback(async () => {
-    try {
-      const params: { memberNo?: string; status?: string } = { status: 'ACTIVE' };
-      const no = (leaveMemberNo || subMemberFilter).trim().toUpperCase();
-      if (/^[A-Z0-9]{6}$/.test(no)) params.memberNo = no;
-      const res = await fetchOpsMemberLeaves(params);
-      if (res.status === 'success' && Array.isArray(res.data)) {
-        setLeaves(res.data as MemberLeave[]);
-      }
-    } catch (err) {
-      toast(getErrorMessage(err, '讀取請假失敗'), 'error');
-    }
-  }, [leaveMemberNo, subMemberFilter, toast]);
-
   useEffect(() => {
     if (subTab !== 'subscription') return;
     let cancelled = false;
@@ -170,13 +149,11 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
       await Promise.resolve();
       if (cancelled) return;
       await loadSubscriptions();
-      if (cancelled) return;
-      await loadLeaves();
     })();
     return () => {
       cancelled = true;
     };
-  }, [subTab, loadSubscriptions, loadLeaves]);
+  }, [subTab, loadSubscriptions]);
 
   useEffect(() => {
     if (!pendingRebind?.subscriptionId) return;
@@ -434,42 +411,6 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
       setBusy(false);
     }
   }, [selectedSubId, expirePolicy, doAllowance, cancelSubReason, toast, loadSubscriptions, printAllowanceNo]);
-
-  const handleStartLeave = useCallback(async () => {
-    const memberNo = leaveMemberNo.trim().toUpperCase();
-    const days = Number(leaveDays);
-    if (!memberNo) {
-      toast('請輸入會員編號', 'error');
-      return;
-    }
-    if (!Number.isInteger(days) || days <= 0) {
-      toast('請假天數須為正整數', 'error');
-      return;
-    }
-    if (
-      !window.confirm(
-        `確定為會員 ${memberNo} 請假 ${days} 天？\n效期將預先順延、進場暫停月費通行，定期定額暫停並順延扣款日。`,
-      )
-    )
-      return;
-    setBusy(true);
-    try {
-      const result = await startOpsMemberLeave({
-        memberNo,
-        days,
-        reason: leaveReason || undefined,
-        subscriptionId: leaveSubId.trim() || undefined,
-      });
-      toast(result.message || '請假已建立', 'success');
-      setLeaveReason('');
-      await loadLeaves();
-      await loadSubscriptions();
-    } catch (err) {
-      toast(getErrorMessage(err, '請假失敗'), 'error');
-    } finally {
-      setBusy(false);
-    }
-  }, [leaveMemberNo, leaveDays, leaveReason, leaveSubId, toast, loadLeaves, loadSubscriptions]);
 
   const branchName =
     branchId === ''
@@ -791,8 +732,7 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
                                 checked={selectedSubId === s.id}
                                 onChange={() => {
                                   setSelectedSubId(s.id);
-                                  setLeaveSubId(s.id);
-                                  setLeaveMemberNo(s.member?.memberNo || '');
+                                  setLeavePrefill({ subscriptionId: s.id, memberNo: s.member?.memberNo || '' });
                                 }}
                               />
                             </td>
@@ -948,139 +888,11 @@ export default function TransactionChangesPanel({ branches: branchesProp }: Prop
               </div>
             </Card>
 
-            <Card
-              title="無限使用請假"
-              subtitle="效期預先順延；請假期間禁止月費進場；定期定額暫停並順延 nextChargeAt"
-            >
-              <div className="form-stack">
-                <Field label="會員編號">
-                  <Input
-                    value={leaveMemberNo}
-                    onChange={(e) => setLeaveMemberNo(e.target.value)}
-                    placeholder="6 碼英數，例如 A1B2C3"
-                  />
-                </Field>
-                <Field label="請假天數">
-                  <Input
-                    value={leaveDays}
-                    onChange={(e) => setLeaveDays(e.target.value)}
-                    inputMode="numeric"
-                  />
-                </Field>
-                <Field label="訂閱編號（選填）" hint="不填則自動帶此會員 ACTIVE／PAUSED 訂閱">
-                  <Input
-                    value={leaveSubId}
-                    onChange={(e) => setLeaveSubId(e.target.value)}
-                    placeholder="CRS…"
-                  />
-                </Field>
-                <Field label="原因（選填）">
-                  <Input
-                    value={leaveReason}
-                    onChange={(e) => setLeaveReason(e.target.value)}
-                    placeholder="例：出國、傷病"
-                  />
-                </Field>
-                <Button
-                  onClick={() => void handleStartLeave()}
-                  disabled={busy || !leaveMemberNo.trim()}
-                >
-                  開始請假
-                </Button>
-              </div>
-            </Card>
-
-            <Card title="進行中請假" subtitle="提早銷假會扣回未休天數的效期與扣款順延">
-              <div className="table-wrap">
-                <table className="data-table">
-                  <thead>
-                    <tr>
-                      <th>ID</th>
-                      <th>會員編號</th>
-                      <th>會員</th>
-                      <th>天數</th>
-                      <th>起迄</th>
-                      <th>訂閱</th>
-                      <th></th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {leaves.length === 0 ? (
-                      <tr>
-                        <td colSpan={7} className="text-muted text-center">
-                          尚無進行中請假
-                        </td>
-                      </tr>
-                    ) : (
-                      leaves.map((lv) => (
-                        <tr key={lv.id}>
-                          <td>{lv.id}</td>
-                          <td className="text-sm">{lv.member?.memberNo || '—'}</td>
-                          <td className="text-sm">
-                            {lv.member?.name || `#${lv.memberId}`}
-                          </td>
-                          <td>{lv.days}</td>
-                          <td className="text-sm">
-                            {fmtDate(lv.startAt)}～{fmtDate(lv.endAt)}
-                          </td>
-                          <td className="text-sm">{lv.subscriptionId || '—'}</td>
-                          <td>
-                            <div className="btn-row">
-                              <Button
-                                variant="secondary"
-                                disabled={busy}
-                                onClick={() =>
-                                  void (async () => {
-                                    if (!window.confirm('確定提早銷假？')) return;
-                                    setBusy(true);
-                                    try {
-                                      const r = await endOpsMemberLeave(lv.id);
-                                      toast(r.message || '已銷假', 'success');
-                                      await loadLeaves();
-                                      await loadSubscriptions();
-                                    } catch (e) {
-                                      toast(getErrorMessage(e, '銷假失敗'), 'error');
-                                    } finally {
-                                      setBusy(false);
-                                    }
-                                  })()
-                                }
-                              >
-                                提早銷假
-                              </Button>
-                              <Button
-                                variant="secondary"
-                                disabled={busy}
-                                onClick={() =>
-                                  void (async () => {
-                                    setBusy(true);
-                                    try {
-                                      const r = await completeOpsMemberLeave(lv.id);
-                                      toast(r.message || '已結案', 'success');
-                                      await loadLeaves();
-                                      await loadSubscriptions();
-                                    } catch (e) {
-                                      toast(getErrorMessage(e, '結案失敗'), 'error');
-                                    } finally {
-                                      setBusy(false);
-                                    }
-                                  })()
-                                }
-                              >
-                                期滿結案
-                              </Button>
-                            </div>
-                          </td>
-                        </tr>
-                      ))
-                    )}
-                  </tbody>
-                </table>
-              </div>
-              <Button variant="secondary" onClick={() => void loadLeaves()} disabled={busy}>
-                重新載入請假
-              </Button>
-            </Card>
+            <MemberLeaveReviewPanel
+              memberNoFilter={subMemberFilter}
+              prefill={leavePrefill}
+              onSubscriptionsChanged={loadSubscriptions}
+            />
           </div>
         </PageSection>
       )}

@@ -30,21 +30,26 @@ import {
   fetchMemberCardBindingStatus,
   submitMemberSubscriptionCancel,
   submitMemberLeaveApplication,
+  fetchMemberLeaveApplications,
+  uploadMemberLeaveProof,
 } from '../../lib/api';
 import type {
   MemberGiftCards,
+  MemberLeave,
+  MemberLeaveCategory,
   MemberPointsLedgerEntry,
   MemberProfile,
   MemberSubscription,
   Promotion,
 } from '../../types/api';
 import { formatPromotionOptionLabel } from '../../lib/promotionLabels';
+import { LEAVE_CATEGORY_OPTIONS, isDeferrableLeaveCategory, leaveStatusLabel } from '../../lib/memberLeave';
 
 type Tab = 'shop' | 'leave' | 'subscription' | 'points' | 'gift';
 
 const TABS: { key: Tab; label: string }[] = [
   { key: 'shop', label: '線上購案' },
-  { key: 'leave', label: '請假' },
+  { key: 'leave', label: '暫停' },
   { key: 'subscription', label: '訂閱' },
   { key: 'points', label: '點數' },
   { key: 'gift', label: '禮物卡' },
@@ -79,6 +84,23 @@ function addDaysIso(iso: string, days: number) {
   return `${y}-${m}-${day}`;
 }
 
+function fmtDate(iso?: string | null) {
+  if (!iso) return '—';
+  return new Date(iso).toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei' });
+}
+
+/** endAt 為迄日次日 00:00（不含） */
+function leaveLastDay(endAt: string) {
+  return fmtDate(new Date(new Date(endAt).getTime() - 1).toISOString());
+}
+
+function leaveStatusTone(status: string): 'neutral' | 'success' | 'warning' | 'danger' | 'info' {
+  if (status === 'PENDING') return 'warning';
+  if (status === 'APPROVED' || status === 'ACTIVE') return 'success';
+  if (status === 'REJECTED') return 'danger';
+  return 'neutral';
+}
+
 function inclusiveDays(start: string, end: string): number | null {
   if (!start || !end) return null;
   const a = new Date(`${start}T00:00:00`);
@@ -106,6 +128,10 @@ export default function MemberMembershipPage() {
   const [pendingBuy, setPendingBuy] = useState<Promotion | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
 
+  const [leaveCategory, setLeaveCategory] = useState<MemberLeaveCategory | ''>('');
+  const [leaveApps, setLeaveApps] = useState<MemberLeave[]>([]);
+  const leaveInFlightRef = useRef(false);
+  const [proofUploadingId, setProofUploadingId] = useState<number | null>(null);
   const [leaveStart, setLeaveStart] = useState(todayIsoDate);
   const [leaveEnd, setLeaveEnd] = useState(() => addDaysIso(todayIsoDate(), 6));
   const [leaveReason, setLeaveReason] = useState('');
@@ -121,6 +147,9 @@ export default function MemberMembershipPage() {
   const [pendingRebindId, setPendingRebindId] = useState<string | null>(null);
   const [rebindBusy, setRebindBusy] = useState(false);
   const leaveDaysPreview = inclusiveDays(leaveStart, leaveEnd);
+  const leaveDeferrable = isDeferrableLeaveCategory(leaveCategory);
+  const leaveCategoryHint = LEAVE_CATEGORY_OPTIONS.find((o) => o.value === leaveCategory)?.hint;
+  const hasOpenLeave = leaveApps.some((l) => ['PENDING', 'APPROVED', 'ACTIVE'].includes(l.status));
 
   useEffect(() => {
     let cancelled = false;
@@ -152,8 +181,9 @@ export default function MemberMembershipPage() {
           if (cancelled) return;
           if (promoRes.status === 'success' && promoRes.data) setPromotions(promoRes.data);
         } else if (tab === 'leave') {
-          const subRes = await fetchMemberSubscriptions();
+          const [subRes, appsRes] = await Promise.all([fetchMemberSubscriptions(), fetchMemberLeaveApplications()]);
           if (cancelled) return;
+          if (appsRes.status === 'success' && appsRes.data) setLeaveApps(appsRes.data);
           if (subRes.status === 'success' && subRes.data) {
             setSubscriptions(subRes.data);
             if (subRes.data[0]) {
@@ -235,17 +265,24 @@ export default function MemberMembershipPage() {
 
   async function onSubscriptionLeave(e: FormEvent) {
     e.preventDefault();
-    if (!leaveStart || !leaveEnd) {
-      toast('請填寫請假起迄日', 'error');
+    if (leaveInFlightRef.current) return;
+    if (!leaveCategory) {
+      toast('請選擇暫停事由', 'error');
       return;
     }
-    if (leaveDaysPreview == null) {
-      toast('結束日不可早於起始日', 'error');
+    if (!leaveStart || !leaveEnd || leaveDaysPreview == null) {
+      toast('暫停起迄日無效（結束日不可早於起始日）', 'error');
       return;
     }
+    if (!leaveProof && !isDeferrableLeaveCategory(leaveCategory)) {
+      toast('請上傳事由證明文件', 'error');
+      return;
+    }
+    leaveInFlightRef.current = true;
     setBusy(true);
     try {
       const res = await submitMemberLeaveApplication({
+        category: leaveCategory,
         startDate: leaveStart,
         endDate: leaveEnd,
         proofFile: leaveProof,
@@ -253,18 +290,34 @@ export default function MemberMembershipPage() {
         subscriptionId: leaveSubId || undefined,
       });
       toast(
-        res.message || (res.status === 'success' ? '已申請請假' : '失敗'),
+        res.message || (res.status === 'success' ? '已送出暫停申請' : '失敗'),
         res.status === 'success' ? 'success' : 'error',
       );
       if (res.status === 'success') {
         setLeaveProof(null);
+        setLeaveReason('');
         if (leaveProofRef.current) leaveProofRef.current.value = '';
         setReloadKey((k) => k + 1);
       }
     } catch (err) {
-      toast(getErrorMessage(err, '請假失敗'), 'error');
+      toast(getErrorMessage(err, '送出暫停申請失敗'), 'error');
     } finally {
+      leaveInFlightRef.current = false;
       setBusy(false);
+    }
+  }
+
+  async function onUploadLeaveProof(leaveId: number, file: File | undefined) {
+    if (!file || proofUploadingId != null) return;
+    setProofUploadingId(leaveId);
+    try {
+      const res = await uploadMemberLeaveProof(leaveId, file);
+      toast(res.message || '已補附證明', res.status === 'success' ? 'success' : 'error');
+      if (res.status === 'success') setReloadKey((k) => k + 1);
+    } catch (err) {
+      toast(getErrorMessage(err, '補附證明失敗'), 'error');
+    } finally {
+      setProofUploadingId(null);
     }
   }
 
@@ -449,15 +502,33 @@ export default function MemberMembershipPage() {
         ) : tab === 'leave' ? (
           <>
             <Card
-              title="會籍請假"
-              subtitle="填寫起迄日與請假證明；效期順延、進場暫停，定期定額同步暫停"
+              title="會員權暫停申請"
+              subtitle="依契約第十二條：送出後由門市於七個工作日內審核，核准後效期順延、進場暫停，定期定額同步暫停"
             >
               <form onSubmit={onSubscriptionLeave} className="form-stack">
                 {profile?.leaveUntil && new Date(profile.leaveUntil) > new Date() && (
                   <Alert tone="info">
-                    請假中至 {fmt(profile.leaveUntil)}，期滿後自動恢復訂閱扣款
+                    暫停中至 {fmt(profile.leaveUntil)}，期滿後自動恢復訂閱扣款
                   </Alert>
                 )}
+                {hasOpenLeave && (
+                  <Alert tone="warning">您已有待審、已核准或進行中的暫停申請，需結案後才能再申請</Alert>
+                )}
+                <Field label="暫停事由" hint={leaveCategoryHint}>
+                  <select
+                    className="input"
+                    value={leaveCategory}
+                    onChange={(e) => setLeaveCategory(e.target.value as MemberLeaveCategory | '')}
+                    required
+                  >
+                    <option value="">請選擇</option>
+                    {LEAVE_CATEGORY_OPTIONS.map((o) => (
+                      <option key={o.value} value={o.value}>
+                        {o.label}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
                 {subscriptions.length > 0 && (
                   <Field label="訂閱">
                     <select
@@ -473,10 +544,14 @@ export default function MemberMembershipPage() {
                     </select>
                   </Field>
                 )}
-                <Field label="請假起始日">
+                <Field
+                  label="暫停起始日"
+                  hint={leaveDeferrable ? '傷病／疫情可於事由發生後 30 日內補辦' : '須事先申請，起始日不可早於今日'}
+                >
                   <Input
                     type="date"
                     value={leaveStart}
+                    min={leaveDeferrable ? addDaysIso(todayIsoDate(), -30) : todayIsoDate()}
                     onChange={(e) => {
                       const v = e.target.value;
                       setLeaveStart(v);
@@ -485,7 +560,7 @@ export default function MemberMembershipPage() {
                     required
                   />
                 </Field>
-                <Field label="請假結束日">
+                <Field label="暫停結束日">
                   <Input
                     type="date"
                     value={leaveEnd}
@@ -495,9 +570,19 @@ export default function MemberMembershipPage() {
                   />
                 </Field>
                 {leaveDaysPreview != null && (
-                  <p className="text-sm text-muted">請假天數（含起迄日）：{leaveDaysPreview} 天</p>
+                  <p className="text-sm text-muted">
+                    暫停天數（含起迄日）：{leaveDaysPreview} 天
+                    {leaveCategory === 'OVERSEAS' && leaveDaysPreview < 31 ? '（出國事由須至少 31 日）' : ''}
+                  </p>
                 )}
-                <Field label="請假證明" hint="請上傳證明圖檔（JPG／PNG／WebP）">
+                <Field
+                  label="事由證明"
+                  hint={
+                    leaveDeferrable
+                      ? '可先送件，30 日內於下方申請紀錄補附（JPG／PNG／WebP）；逾期未補自動退回'
+                      : '必附（JPG／PNG／WebP）'
+                  }
+                >
                   <input
                     ref={leaveProofRef}
                     type="file"
@@ -514,10 +599,55 @@ export default function MemberMembershipPage() {
                 <Field label="原因（選填）">
                   <Input value={leaveReason} onChange={(e) => setLeaveReason(e.target.value)} />
                 </Field>
-                <Button type="submit" className="id-photo-touch-btn" loading={busy}>
-                  申請請假
+                <Button type="submit" className="id-photo-touch-btn" loading={busy} disabled={hasOpenLeave}>
+                  送出暫停申請
                 </Button>
               </form>
+            </Card>
+            <Card title="我的暫停申請" className="mt-md">
+              {leaveApps.length === 0 ? (
+                <p className="text-sm text-muted" style={{ margin: 0 }}>尚無申請紀錄</p>
+              ) : (
+                <ul className="member-list">
+                  {leaveApps.map((lv) => (
+                    <li key={lv.id} className="form-stack" style={{ gap: '0.35rem' }}>
+                      <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', flexWrap: 'wrap' }}>
+                        <Badge tone={leaveStatusTone(lv.status)}>{leaveStatusLabel(lv.status)}</Badge>
+                        <strong>{lv.categoryLabel || '會籍暫停'}</strong>
+                      </div>
+                      <span className="text-sm">
+                        {fmtDate(lv.startAt)} ～ {leaveLastDay(lv.endAt)}（{lv.days} 天
+                        {lv.status === 'ENDED' && lv.frozenDays != null && lv.frozenDays !== lv.days
+                          ? `，實際 ${lv.frozenDays} 天`
+                          : ''}
+                        ）
+                      </span>
+                      {lv.status === 'REJECTED' && lv.reviewNote && (
+                        <span className="text-sm" style={{ color: 'var(--danger)' }}>退回原因：{lv.reviewNote}</span>
+                      )}
+                      {lv.status === 'PENDING' && !lv.hasProof && (
+                        <Field label="補附證明" hint={`請於 ${fmtDate(lv.proofDueAt)} 前上傳，逾期自動退回`}>
+                          <input
+                            type="file"
+                            accept="image/jpeg,image/png,image/webp"
+                            className="input"
+                            disabled={proofUploadingId != null}
+                            onChange={(e) => {
+                              void onUploadLeaveProof(lv.id, e.target.files?.[0]);
+                              e.target.value = '';
+                            }}
+                          />
+                        </Field>
+                      )}
+                      {lv.status === 'PENDING' && lv.hasProof && (
+                        <span className="text-sm text-muted">
+                          審核期限 {fmtDate(lv.reviewDueAt)}；如有疑問請洽門市
+                        </span>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              )}
             </Card>
             <Card title="團課請假／補課" className="mt-md">
               <p className="text-sm text-muted" style={{ marginTop: 0 }}>

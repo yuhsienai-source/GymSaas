@@ -138,6 +138,8 @@ import type {
   RefundRecord,
   RefundScope,
   RefundTerminationClause,
+  MemberLeave,
+  MemberLeaveCategory,
 } from '../types/api';
 import type { AllowanceSignPreview } from '../types/posDisplayBus';
 import type { StaffInfo, StaffRole } from './storage';
@@ -1571,14 +1573,60 @@ export async function fetchOpsMemberLeaves(params?: {
   return data;
 }
 
-export async function startOpsMemberLeave(body: {
+/** 櫃檯代建暫停申請（契約第十二條）；approveNow 限 DUTY+ 當場核准（後端強制） */
+export async function createOpsMemberLeave(body: {
   memberNo?: string;
   memberId?: number;
-  days: number;
+  category: MemberLeaveCategory;
+  startDate: string;
+  endDate: string;
   reason?: string;
   subscriptionId?: string;
+  proofFile?: File | null;
+  approveNow?: boolean;
 }) {
-  const { data } = await staffApi.post('/ops/member-leaves', body);
+  const form = new FormData();
+  if (body.memberNo) form.append('memberNo', body.memberNo);
+  if (body.memberId != null) form.append('memberId', String(body.memberId));
+  form.append('category', body.category);
+  form.append('startDate', body.startDate);
+  form.append('endDate', body.endDate);
+  if (body.reason?.trim()) form.append('reason', body.reason.trim());
+  if (body.subscriptionId) form.append('subscriptionId', body.subscriptionId);
+  if (body.approveNow) form.append('approveNow', 'true');
+  if (body.proofFile) form.append('proof', body.proofFile);
+  const { data } = await staffApi.post('/ops/member-leaves', form);
+  return data;
+}
+
+export async function approveOpsMemberLeave(leaveId: number, note?: string) {
+  const { data } = await staffApi.post(`/ops/member-leaves/${leaveId}/approve`, note?.trim() ? { note: note.trim() } : {});
+  return data;
+}
+
+export async function rejectOpsMemberLeave(leaveId: number, reason: string) {
+  const { data } = await staffApi.post(`/ops/member-leaves/${leaveId}/reject`, { reason });
+  return data;
+}
+
+export async function uploadOpsMemberLeaveProof(leaveId: number, proofFile: File) {
+  const form = new FormData();
+  form.append('proof', proofFile);
+  const { data } = await staffApi.post(`/ops/member-leaves/${leaveId}/proof`, form);
+  return data;
+}
+
+/** 調閱暫停證明（特種個資）：DUTY+ 必填原因，後端寫稽核並簽發 3～5 分短效 URL */
+export async function requestOpsMemberLeaveProofAccess(leaveId: number, reason: string) {
+  const { data } = await staffApi.post<
+    ApiResponse<{
+      url: string;
+      expiresAt: string;
+      expiresIn: number;
+      mode: 'r2_presign' | 'local_token' | string;
+      fileName: string | null;
+    }>
+  >(`/ops/member-leaves/${leaveId}/proof-access`, { reason });
   return data;
 }
 
@@ -3478,54 +3526,56 @@ export async function bookMemberGroupMakeup(payload: { creditId: number; classId
   return data;
 }
 
-export async function submitMemberSubscriptionLeave(payload: {
-  days?: number;
-  reason?: string;
-  subscriptionId?: string;
-}) {
-  const { data } = await memberApi.post<ApiResponse>('/member/subscription-leave', payload);
-  return data;
-}
-
 /**
- * 會員自助請假（起迄日＋證明圖）。
- * `POST /member/leave-application`：multipart（欄位 proof）或 JSON（proofImage data URL）。
+ * 會員自助申請會籍暫停（契約第十二條）：一律待審，由櫃檯 DUTY+ 核准後生效。
+ * `POST /member/leave-application`：multipart（欄位 proof）或 JSON（傷病／疫情可先送件後補證明）。
  * 不傳 memberId。
  */
 export async function submitMemberLeaveApplication(payload: {
+  category: MemberLeaveCategory;
   startDate: string;
   endDate: string;
   proofFile?: File | null;
   reason?: string;
   subscriptionId?: string;
 }) {
-  const start = new Date(`${payload.startDate}T00:00:00`);
-  const end = new Date(`${payload.endDate}T00:00:00`);
-  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
-    throw new Error('請假日期無效');
-  }
-  if (end < start) {
-    throw new Error('結束日不可早於起始日');
+  if (!payload.startDate || !payload.endDate || payload.endDate < payload.startDate) {
+    throw new Error('暫停起迄日無效（結束日不可早於起始日）');
   }
 
   if (payload.proofFile) {
     const form = new FormData();
+    form.append('category', payload.category);
     form.append('startDate', payload.startDate);
     form.append('endDate', payload.endDate);
     if (payload.reason?.trim()) form.append('reason', payload.reason.trim());
     if (payload.subscriptionId) form.append('subscriptionId', payload.subscriptionId);
     form.append('proof', payload.proofFile);
     // 勿手設 Content-Type，讓瀏覽器帶 multipart boundary
-    const { data } = await memberApi.post<ApiResponse>('/member/leave-application', form);
+    const { data } = await memberApi.post<ApiResponse<MemberLeave>>('/member/leave-application', form);
     return data;
   }
 
-  const { data } = await memberApi.post<ApiResponse>('/member/leave-application', {
+  const { data } = await memberApi.post<ApiResponse<MemberLeave>>('/member/leave-application', {
+    category: payload.category,
     startDate: payload.startDate,
     endDate: payload.endDate,
     reason: payload.reason?.trim() || undefined,
     subscriptionId: payload.subscriptionId || undefined,
   });
+  return data;
+}
+
+export async function fetchMemberLeaveApplications() {
+  const { data } = await memberApi.get<ApiResponse<MemberLeave[]>>('/member/leave-applications');
+  return data;
+}
+
+/** 傷病／疫情先送件者補附證明 */
+export async function uploadMemberLeaveProof(leaveId: number, proofFile: File) {
+  const form = new FormData();
+  form.append('proof', proofFile);
+  const { data } = await memberApi.post<ApiResponse<MemberLeave>>(`/member/leave-applications/${leaveId}/proof`, form);
   return data;
 }
 
