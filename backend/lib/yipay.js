@@ -13,6 +13,7 @@ import { issueSaleInvoice, issueOrderInvoice, invoiceSummaryMap } from './einvoi
 import { markYipayCaptureConfirmed } from './yipayCapture.js';
 import { buildCardCheckoutRequest, resolveBindVerifyAmount } from './payuni.js';
 import { deductSaleStock } from './inventory.js';
+import { remainingCourseChargeDates } from './coursePlan.js';
 
 function httpError(message, statusCode = 400) {
   const err = new Error(message);
@@ -26,8 +27,16 @@ function sanitizeTerminalRef(raw) {
   return s.slice(0, 80);
 }
 
+/** 課程分期首期付款日（扣款日 1／16 日之起算點）；非課程分期回 null */
+async function courseInstallmentOriginAt(session) {
+  if (!session.orderId) return null;
+  const order = await prisma.order.findUnique({ where: { id: session.orderId }, select: { itemDesc: true, createdAt: true } });
+  if (!String(order?.itemDesc || '').startsWith('課程定期定額首期')) return null;
+  return order.createdAt;
+}
+
 /** 乙禾首期入帳後：開 PayUNi 續期頁（臨櫃 FAmt＝$1 驗卡授權→取消；PeriodAmt＝第2期起原價） */
-function tryBuildPeriodBind(session, checkoutId) {
+function tryBuildPeriodBind(session, checkoutId, courseOriginAt = null) {
   const periodAmt = Number(session.recurringAmount);
   const totalTimes = parseInt(session.periodTimes, 10);
   const remainTimes =
@@ -50,6 +59,7 @@ function tryBuildPeriodBind(session, checkoutId) {
       recurringAmount: periodAmt,
       payuniPeriodHash: session.payuniPeriodHash || null,
       channel: 'counter',
+      ...(courseOriginAt ? { periodDates: remainingCourseChargeDates(totalTimes, remainTimes, courseOriginAt) } : {}),
     };
     const verifyAmt = resolveBindVerifyAmount(bindOrder);
     const { actionUrl, payload } = buildCardCheckoutRequest({
@@ -104,7 +114,7 @@ export async function confirmYipayCheckout(checkoutId, { terminalRef, staffId } 
     };
     // 已入帳但尚未約定續期：仍可重開 PayUNi 頁（補綁 CreditHash）
     if (String(session.cardMode || '').toUpperCase() === 'RECURRING' && !session.creditHash) {
-      Object.assign(already, tryBuildPeriodBind(session, id));
+      Object.assign(already, tryBuildPeriodBind(session, id, await courseInstallmentOriginAt(session)));
     }
     return already;
   }
@@ -152,7 +162,7 @@ export async function confirmYipayCheckout(checkoutId, { terminalRef, staffId } 
 
   // 月卡／課程定期定額：乙禾收首期後，再開 PayUNi 續期頁約定後續（TradeAmt＝PeriodAmt，期數＝剩餘）
   if (String(session.cardMode || '').toUpperCase() === 'RECURRING') {
-    Object.assign(result, tryBuildPeriodBind(session, id));
+    Object.assign(result, tryBuildPeriodBind(session, id, await courseInstallmentOriginAt(session)));
   }
 
   return result;

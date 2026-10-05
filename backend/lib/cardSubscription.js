@@ -23,6 +23,7 @@ import {
 } from './promotion.js';
 import { issueOrderInvoice } from './einvoice.js';
 import { generateSubscriptionOrderId } from './orderIds.js';
+import { remainingCourseChargeDates } from './coursePlan.js';
 
 const MAX_FAILS = 3;
 const DEFAULT_TICK_MS = 60_000;
@@ -572,6 +573,12 @@ export async function buildSubscriptionRebindRequest(
     coursePlan: sub.coursePlan,
   });
 
+  const courseOriginAt = sub.coursePlanId
+    ? (sub.originOrderId
+        ? (await prisma.order.findUnique({ where: { id: sub.originOrderId }, select: { createdAt: true } }))?.createdAt
+        : null) || sub.createdAt
+    : null;
+
   const bindMerTradeNo = `${id}R${String(Date.now()).slice(-6)}`.slice(0, 25);
   const itemDesc = sub.promotion?.name || sub.coursePlan?.name || '定期定額換卡';
 
@@ -596,6 +603,9 @@ export async function buildSubscriptionRebindRequest(
       channel: periodChannel,
       promotion: sub.promotion,
       coursePlan: sub.coursePlan,
+      ...(courseOriginAt
+        ? { periodDates: remainingCourseChargeDates(sub.periodTimes, remainTimes, courseOriginAt) }
+        : {}),
     };
     const verifyAmt = resolveBindVerifyAmount(bindOrder);
     const { actionUrl, payload } = buildCardCheckoutRequest({

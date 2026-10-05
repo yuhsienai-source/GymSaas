@@ -8,6 +8,39 @@ import {
 } from './promotion.js';
 
 export const COURSE_PLAN_KINDS = ['SALE', 'COMPENSATION'];
+
+const TW_OFFSET_MS = 8 * 3600 * 1000;
+const INSTALLMENT_PERIOD_DAYS = 30;
+
+function twYmd(date) {
+  return new Date(new Date(date).getTime() + TW_OFFSET_MS).toISOString().slice(0, 10);
+}
+
+/**
+ * 客製化教練課分期扣款日（台灣日）：第 k 期＝首期付款日 + 30k 日，
+ * 落在 1～15 日者扣當月 1 日、16～31 日者扣當月 16 日
+ * @returns {string[]} 第 2 期起 times 筆 YYYY-MM-DD
+ */
+export function courseInstallmentChargeDates(times, from = new Date()) {
+  const n = parseInt(times, 10);
+  if (!Number.isInteger(n) || n <= 0) return [];
+  const [y, m, d] = twYmd(from).split('-').map(Number);
+  const out = [];
+  for (let k = 1; k <= n; k += 1) {
+    const t = new Date(Date.UTC(y, m - 1, d + INSTALLMENT_PERIOD_DAYS * k));
+    const day = t.getUTCDate() <= 15 ? 1 : 16;
+    out.push(`${t.getUTCFullYear()}-${String(t.getUTCMonth() + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`);
+  }
+  return out;
+}
+
+/** 換卡續約：沿用首期付款日之扣款表，取今日之後剩餘 times 筆（不足回 null，交由 PayUNi 預設排程） */
+export function remainingCourseChargeDates(totalTimes, times, originAt, now = new Date()) {
+  const today = twYmd(now);
+  const future = courseInstallmentChargeDates(Math.max(0, parseInt(totalTimes, 10) - 1), originAt).filter((x) => x > today);
+  const n = parseInt(times, 10);
+  return Number.isInteger(n) && n > 0 && future.length >= n ? future.slice(-n) : null;
+}
 export const PT_CONTRACT_SOURCES = ['PURCHASE', 'COMPENSATION'];
 
 export function normalizeCoursePlanKind(value) {

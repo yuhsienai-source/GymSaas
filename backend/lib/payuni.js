@@ -471,7 +471,7 @@ export function buildPeriodPayload(orderData) {
     // FAmt＝當下驗證授權：臨櫃預設 $1（Notify 後 trade_cancel）；線上預設 $0；PeriodAmt＝第 2 期起原價
     innerParams.FAmt = String(verifyAmt ?? 0);
     innerParams.FType = pt;
-    const schedule = buildFuturePeriodDates(pt, times, orderData.firstChargeAt);
+    const schedule = resolveBindSchedule(pt, times, orderData);
     if (schedule.length > 0) {
       // Date＝自訂未來扣款日（不可含今日）；PeriodDate＝首扣日（YYYY-MM-DD）
       innerParams.PeriodDate = schedule[0];
@@ -500,6 +500,19 @@ export function buildPeriodPayload(orderData) {
   );
 
   return packEncryptPayload(innerParams);
+}
+
+/**
+ * 綁卡續期排程：課程分期固定扣款日（1／16 日，台灣日）須筆數相符且皆晚於台灣今日，
+ * 否則退回預設排程（PayUNi 不收今日或過去日）
+ */
+export function resolveBindSchedule(periodType, times, { periodDates, firstChargeAt } = {}, now = new Date()) {
+  const today = new Date(now.getTime() + 8 * 3600 * 1000).toISOString().slice(0, 10);
+  const fixed = Array.isArray(periodDates) ? periodDates.map(String) : null;
+  if (fixed && fixed.length === times && fixed.every((x) => /^\d{4}-\d{2}-\d{2}$/.test(x) && x > today)) {
+    return fixed;
+  }
+  return buildFuturePeriodDates(periodType, times, firstChargeAt);
 }
 
 /** 自 now／指定日起算，產出 periodTimes 筆「嚴格未來」扣款日 YYYY-MM-DD（不可含今日） */
