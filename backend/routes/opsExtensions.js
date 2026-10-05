@@ -16,7 +16,8 @@ import {
   markYipayCaptureOrphan,
 } from '../lib/yipayCapture.js';
 import { isCrossBranchUser, staffBranchIds } from '../lib/staffAccess.js';
-import { addPaymentDebt } from '../lib/paymentDebt.js';
+import { addPaymentDebt, clearPaymentDebt } from '../lib/paymentDebt.js';
+import { clientIp } from '../lib/memberDeviceAudit.js';
 
 const router = express.Router();
 router.use(verifyStaff, requireDutyOrAbove);
@@ -219,13 +220,17 @@ router.post('/payment-blacklist', async (req, res) => {
 
 router.post('/payment-blacklist/:memberId/clear', async (req, res) => {
   try {
-    const memberId = Number(req.params.memberId);
-    await prisma.paymentBlacklist.updateMany({
-      where: { memberId, isActive: true },
-      data: { isActive: false, clearedAt: new Date() },
+    const row = await clearPaymentDebt(prisma, {
+      memberId: req.params.memberId,
+      reason: req.body?.reason,
+      user: req.user,
+      clientIp: clientIp(req),
     });
-    return res.json({ status: 'success', message: '已解除黑名單' });
+    return res.json({ status: 'success', message: '已結清欠款並解除黑名單', data: row });
   } catch (error) {
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({ status: 'error', code: error.code, message: error.message });
+    }
     console.error(error);
     return res.status(500).json({ status: 'error', message: '解除黑名單失敗' });
   }

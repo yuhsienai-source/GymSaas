@@ -31,6 +31,7 @@ import {
   opsBindFace,
   opsCancelPendingPayment,
   opsCheckout,
+  opsClearPaymentDebt,
   opsConfirmYipay,
   openPayuniCheckoutInNewTab,
   redirectToCheckOut,
@@ -354,6 +355,7 @@ export default function OpsDashboardPage() {
   const [yipayConfirmBusy, setYipayConfirmBusy] = useState(false);
   const [voidPendingOpen, setVoidPendingOpen] = useState(false);
   const [voidPendingChecked, setVoidPendingChecked] = useState(false);
+  const [clearDebtOpen, setClearDebtOpen] = useState(false);
   /** 臨櫃結帳：選品 → 付款 */
   const [checkoutStep, setCheckoutStep] = useState<'catalog' | 'pay'>('catalog');
   /** 選品頁一次只展開一種來源，縮短直向版面 */
@@ -1886,6 +1888,28 @@ export default function OpsDashboardPage() {
     }
   }
 
+  async function handleClearPaymentDebt(reason: string): Promise<boolean> {
+    const member = selectedMember;
+    if (!member?.paymentDebt) return false;
+    if (reason.length < 2) {
+      toast('請填寫收款單號或清償說明（至少 2 字）', 'error');
+      return false;
+    }
+    try {
+      const result = await opsClearPaymentDebt(member.id, reason);
+      if (result.status !== 'success') {
+        toast(result.message || '結清欠款失敗', 'error');
+        return false;
+      }
+      toast(result.message || '已結清欠款', 'success');
+      setSelectedMember((prev) => (prev?.id === member.id ? { ...prev, paymentDebt: null } : prev));
+      return true;
+    } catch (err) {
+      toast(getErrorMessage(err, '結清欠款失敗'), 'error');
+      return false;
+    }
+  }
+
   async function handleConfirmYipay() {
     if (!pendingYipay?.checkoutId || yipayConfirmBusy) return;
     setYipayConfirmBusy(true);
@@ -2363,7 +2387,14 @@ export default function OpsDashboardPage() {
         <Alert tone="error">
           ⚠️ 此會員有未清償欠款：{selectedMember.paymentDebt.reason}
           {selectedMember.paymentDebt.note ? `（${selectedMember.paymentDebt.note}）` : ''}。
-          清償前不可購買課程／課程分期；收訖後由值班主管於「欠款黑名單」解除。入場與已購課程不受影響。
+          清償前不可購買課程／課程分期；收訖後由值班主管按「結清欠款」並填寫收款單號。入場與已購課程不受影響。
+          {staffHasDutyRankOrAbove(staff) ? (
+            <div style={{ marginTop: '0.5rem' }}>
+              <Button size="sm" variant="secondary" onClick={() => setClearDebtOpen(true)}>
+                結清欠款
+              </Button>
+            </div>
+          ) : null}
         </Alert>
       ) : null}
 
@@ -3531,6 +3562,22 @@ export default function OpsDashboardPage() {
           />
         </Field>
       </Modal>
+
+      {clearDebtOpen && selectedMember?.paymentDebt ? (
+        <ReasonModal
+          title={`結清欠款 ${selectedMember.memberNo || `#${selectedMember.id}`} ${selectedMember.name}`}
+          label="收款單號／清償說明"
+          confirmLabel="確認結清"
+          onSubmit={handleClearPaymentDebt}
+          onClose={() => setClearDebtOpen(false)}
+        >
+          <Alert tone="warning">
+            欠款事由：{selectedMember.paymentDebt.reason}
+            {selectedMember.paymentDebt.note ? `（${selectedMember.paymentDebt.note}）` : ''}。
+            請先於 POS 收訖款項，再填寫收款單號或清償說明；結清紀錄將留存經辦人員與原欠款快照，不可撤銷。
+          </Alert>
+        </ReasonModal>
+      ) : null}
 
       {voidPendingOpen && pendingYipay ? (
         <ReasonModal

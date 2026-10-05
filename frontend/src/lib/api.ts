@@ -4341,6 +4341,15 @@ export async function fetchOpsPaymentBlacklist() {
   return data;
 }
 
+/** 結清欠款（DUTY+）：reason＝POS 收款單號或清償說明（後端必填 ≥2 字並寫稽核） */
+export async function opsClearPaymentDebt(memberId: number, reason: string) {
+  const { data } = await staffApi.post<ApiResponse<{ memberId: number; isActive: boolean; clearedAt: string }>>(
+    `/ops/payment-blacklist/${memberId}/clear`,
+    { reason },
+  );
+  return data;
+}
+
 export async function fetchAnalyticsYoy(year?: number) {
   const { data } = await staffApi.get<
     ApiResponse<{
