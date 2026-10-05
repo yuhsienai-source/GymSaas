@@ -275,6 +275,15 @@ const OPS_TABS: { key: OpsTab; label: string }[] = [
   { key: 'shift', label: '交接班結算' },
 ];
 
+type CheckoutCatalogPane = 'product' | 'promo' | 'course' | 'group';
+
+const CHECKOUT_CATALOG_TABS: { key: CheckoutCatalogPane; label: string }[] = [
+  { key: 'product', label: '選品' },
+  { key: 'promo', label: '購案' },
+  { key: 'course', label: '私教課程' },
+  { key: 'group', label: '團課' },
+];
+
 function fetchCatalog() {
   return Promise.all([fetchOpsPromotions(), fetchOpsBranches(), fetchOpsTrainers()]);
 }
@@ -347,6 +356,8 @@ export default function OpsDashboardPage() {
   const [voidPendingChecked, setVoidPendingChecked] = useState(false);
   /** 臨櫃結帳：選品 → 付款 */
   const [checkoutStep, setCheckoutStep] = useState<'catalog' | 'pay'>('catalog');
+  /** 選品頁一次只展開一種來源，縮短直向版面 */
+  const [catalogPane, setCatalogPane] = useState<CheckoutCatalogPane>('product');
   /** 未開班不得結帳（對齊交班盲盤） */
   const [shiftResult, setShiftResult] = useState<{ key: string; branchId: number; open: boolean } | null>(
     null,
@@ -2471,6 +2482,28 @@ export default function OpsDashboardPage() {
         {checkoutStep === 'catalog' && (
         <div className="staff-grid ops-checkout-catalog">
             <div className="form-stack">
+            <nav className="hq-tabs ops-checkout-catalog-tabs" role="tablist" aria-label="加入購物車">
+              {CHECKOUT_CATALOG_TABS.map((item) => (
+                <button
+                  key={item.key}
+                  type="button"
+                  role="tab"
+                  id={`ops-catalog-tab-${item.key}`}
+                  aria-selected={catalogPane === item.key}
+                  aria-controls={`ops-catalog-panel-${item.key}`}
+                  className={`hq-tabs__btn ${catalogPane === item.key ? 'is-active' : ''}`}
+                  onClick={() => setCatalogPane(item.key)}
+                >
+                  {item.label}
+                </button>
+              ))}
+            </nav>
+            <div
+              id={`ops-catalog-panel-${catalogPane}`}
+              role="tabpanel"
+              aria-labelledby={`ops-catalog-tab-${catalogPane}`}
+            >
+            {catalogPane === 'product' && (
             <Card
               title="選品"
               subtitle={
@@ -2537,7 +2570,9 @@ export default function OpsDashboardPage() {
                 </div>
               </div>
             </Card>
+            )}
 
+            {catalogPane === 'promo' && (
             <Card title="購案">
               <div className="form-stack">
                 {!selectedMember && (
@@ -2639,7 +2674,9 @@ export default function OpsDashboardPage() {
                 </Button>
               </div>
             </Card>
+            )}
 
+            {catalogPane === 'course' && (
             <Card title="私教課程">
               <div className="form-stack">
                 {!selectedMember && (
@@ -2778,7 +2815,9 @@ export default function OpsDashboardPage() {
               </Button>
             </div>
           </Card>
+            )}
 
+            {catalogPane === 'group' && (
             <OpsGroupClassPanel
               branchId={posBranchId}
               member={selectedMember}
@@ -2786,6 +2825,8 @@ export default function OpsDashboardPage() {
               onAdd={addGroupToCart}
               reloadSignal={groupReload}
             />
+            )}
+            </div>
           </div>
 
           <Card
