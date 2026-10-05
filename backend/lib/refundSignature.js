@@ -7,11 +7,20 @@ import prisma from './prisma.js';
 import { deleteIdPhotoObject, getIdPhotoObject, putIdPhotoObject } from './idPhotoStorage.js';
 import { readToken, signToken } from './signedToken.js';
 import { clientIp, clientUserAgent } from './memberDeviceAudit.js';
+import { hasPendingYipayTerminal } from './refundRules.js';
 import { finalizeRefund, loadRefundForStaff, serializeRefund, withRefundLock, writeAudit } from './refundService.js';
 
 export const MAX_SIGNATURE_BYTES = 512 * 1024;
+/** 與客顯 SignaturePad 送出門檻一致；後端另以近黑像素把關，不採信此數字當筆跡證明 */
+export const MIN_SIGNATURE_POINTS = 25;
+export const MIN_SIGNATURE_STROKES = 1;
+/** CSS px；與客顯路徑長度門檻一致 */
+export const MIN_SIGNATURE_PATH_PX = 60;
 const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-/** 灰階 < 128 視為筆跡；客顯浮水印須淺於此值，才不會讓空白簽名通過 */
+/**
+ * 近黑才算筆跡（簽名板 #0f172a：通道最大值 < 128 且非偏青）。
+ * 深青防偽底欄 #083D4F（綠／藍明显高于紅）與淺色斜向浮水印不計入，空白畫布壓了底欄仍須拒絕。
+ */
 const INK_THRESHOLD = 128;
 const MIN_INK_PIXELS = 120;
 const PREVIEW_TTL_MS = 10 * 60 * 1000;
@@ -37,6 +46,9 @@ function verifyPreviewToken(token) {
 async function loadSignable(user, refundId) {
   const refund = await loadRefundForStaff(user, refundId);
   if (refund.status === 'ABORTED') throw httpError(409, 'REFUND_NOT_SIGNABLE', '已中止之退費單不可簽名');
+  if (hasPendingYipayTerminal(refund.payments)) {
+    throw httpError(409, 'YIPAY_TERMINAL_VOUCHER_REQUIRED', '乙禾端末尚未刷退回填 RRN／授權碼，請先完成刷退再請顧客簽署折讓');
+  }
   if (refund.signatureId) throw httpError(409, 'SIGNATURE_EXISTS', '此退費單已完成簽名');
   const allowances = await prisma.invoiceAllowance.findMany({
     where: { refundId: refund.id, status: 'ISSUED' },
@@ -49,6 +61,43 @@ async function loadSignable(user, refundId) {
   });
   if (!allowances.length) throw httpError(409, 'NO_ALLOWANCE', '此退費單尚無已開立之折讓單，無須簽名');
   return { refund, allowances };
+}
+
+/**
+ * 單次簽署綁定雜湊：折讓單號｜原發票號碼｜該張含稅額（多張以分號串接）。
+ * 與 contentDigest 一併寫入 preview；上傳時重算，客顯回傳值不符即拒（防 A 單簽名貼到 B 單）。
+ */
+export function allowancePayloadHash(allowances) {
+  const canon = allowances.map((a) => `${a.allowanceNo}|${a.invoiceNumber}|${a.totalAmt}`).join(';');
+  return crypto.createHash('sha256').update(canon).digest('hex');
+}
+
+function hashesEqual(claimed, expected) {
+  const left = Buffer.from(String(claimed || ''), 'utf8');
+  const right = Buffer.from(String(expected || ''), 'utf8');
+  if (left.length !== 64 || right.length !== 64 || left.length !== right.length) return false;
+  return crypto.timingSafeEqual(left, right);
+}
+
+function parsePointCount(raw) {
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < MIN_SIGNATURE_POINTS || n > 200_000) {
+    throw httpError(400, 'SIGNATURE_REQUIRED', '簽名筆跡不足，請顧客完整親簽');
+  }
+  return n;
+}
+
+/** 客顯申報的筆畫數與路徑長度。空白與否仍以近黑像素為準，此處只擋明顯未簽。 */
+function parseStrokeStats(strokeCount, pathLength) {
+  const strokes = Number(strokeCount);
+  const length = Number(pathLength);
+  if (!Number.isInteger(strokes) || strokes < MIN_SIGNATURE_STROKES || strokes > 10_000) {
+    throw httpError(400, 'SIGNATURE_STROKE_TOO_SHORT', '消費者親簽筆跡過短或為空白，請重新簽署');
+  }
+  if (!Number.isFinite(length) || length < MIN_SIGNATURE_PATH_PX || length > 1_000_000) {
+    throw httpError(400, 'SIGNATURE_STROKE_TOO_SHORT', '消費者親簽筆跡過短或為空白，請重新簽署');
+  }
+  return { strokeCount: strokes, pathLength: length };
 }
 
 /** 顧客所見內容之摘要（折讓單號、原發票、品項、金額、實退）；任一變動即使 previewToken 失效 */
@@ -108,6 +157,7 @@ export async function buildSignPreview(user, refundId, req = null) {
   ]);
   const docs = allowances.map(toDoc);
   const digest = contentDigest(refund, allowances);
+  const payloadHash = allowancePayloadHash(allowances);
   const requestId = `ASR${crypto.randomBytes(8).toString('hex').toUpperCase()}`;
   const exp = Date.now() + PREVIEW_TTL_MS;
   const previewToken = signToken(PREVIEW_TOKEN_PURPOSE, { v: 1, rid: refund.id, req: requestId, sid: user.id, dg: digest, exp });
@@ -122,7 +172,7 @@ export async function buildSignPreview(user, refundId, req = null) {
     refund,
     user,
     req,
-    after: { requestId, digest, allowances: docs.map((d) => d.allowanceNo) },
+    after: { requestId, digest, payloadHash, allowances: docs.map((d) => d.allowanceNo) },
   }).catch((e) => console.error('客顯簽署預覽稽核寫入失敗:', e.message));
 
   return {
@@ -136,6 +186,7 @@ export async function buildSignPreview(user, refundId, req = null) {
     memberName: member?.name || null,
     signatureRequired: refund.signatureRequired,
     statement: SIGN_STATEMENT,
+    payloadHash,
     docs,
     totals: {
       untaxed: docs.reduce((s, d) => s + d.untaxed, 0),
@@ -147,7 +198,14 @@ export async function buildSignPreview(user, refundId, req = null) {
   };
 }
 
-/** multipart 上傳之 PNG：magic bytes、大小、尺寸、筆跡像素（浮水印不計入） */
+/** 近黑筆跡；深青底欄與白字、淺色浮水印回 false */
+function isInkPixel(r, g, b) {
+  if (Math.max(r, g, b) >= INK_THRESHOLD) return false;
+  if (g - r > 25 || b - r > 40) return false;
+  return true;
+}
+
+/** multipart 上傳之 PNG：magic bytes、大小、尺寸、近黑筆跡（深青防偽底欄不計入） */
 export async function validateSignaturePng(buf) {
   if (!Buffer.isBuffer(buf) || !buf.length) throw httpError(400, 'SIGNATURE_REQUIRED', '缺少簽名影像');
   if (buf.length > MAX_SIGNATURE_BYTES) throw httpError(400, 'SIGNATURE_REQUIRED', '簽名影像過大');
@@ -156,11 +214,14 @@ export async function validateSignaturePng(buf) {
   try {
     const { data, info } = await sharp(buf, { limitInputPixels: 4096 * 4096 })
       .flatten({ background: '#ffffff' })
-      .greyscale()
+      .removeAlpha()
       .raw()
       .toBuffer({ resolveWithObject: true });
     if (info.width < 200 || info.height < 80) throw httpError(400, 'SIGNATURE_REQUIRED', '簽名影像尺寸過小');
-    for (let i = 0; i < data.length; i += 1) if (data[i] < INK_THRESHOLD) ink += 1;
+    const channels = info.channels || 3;
+    for (let i = 0; i < data.length; i += channels) {
+      if (isInkPixel(data[i], data[i + 1], data[i + 2])) ink += 1;
+    }
   } catch (e) {
     if (e.statusCode) throw e;
     throw httpError(400, 'SIGNATURE_REQUIRED', '無法解析簽名影像');
@@ -172,7 +233,7 @@ export async function validateSignaturePng(buf) {
  * POST /api/ops/refunds/:id/signature（multipart：previewToken、requestId、signature＝PNG Blob）
  * 驗 token（HMAC／效期／退費單／經辦／requestId）→ 重算內容摘要 → 驗影像 → 私有儲存 → 歸檔；SIGNATURE_PENDING 者簽後自動結案
  */
-export async function attachRefundSignature(user, refundId, { previewToken, requestId, signature } = {}, req = null) {
+export async function attachRefundSignature(user, refundId, { previewToken, requestId, payloadHash, pointCount, strokeCount, pathLength, signature } = {}, req = null) {
   const claims = verifyPreviewToken(previewToken);
   const { refund, allowances } = await loadSignable(user, refundId);
   if (claims.rid !== refund.id || claims.sid !== user.id || claims.req !== String(requestId || '')) {
@@ -181,8 +242,15 @@ export async function attachRefundSignature(user, refundId, { previewToken, requ
   if (claims.dg !== contentDigest(refund, allowances)) {
     throw httpError(409, 'PREVIEW_STALE', '折讓內容已變動，顧客所簽版本失效，請重新推送客顯');
   }
+  if (!payloadHash) throw httpError(400, 'PAYLOAD_HASH_REQUIRED', '缺少折讓簽署摘要，請重新推送客顯');
+  if (!hashesEqual(payloadHash, allowancePayloadHash(allowances))) {
+    throw httpError(409, 'PAYLOAD_HASH_MISMATCH', '簽名與折讓單號或金額不符，請重新推送客顯');
+  }
+  parsePointCount(pointCount);
+  parseStrokeStats(strokeCount, pathLength);
   await validateSignaturePng(signature);
 
+  const sha256 = crypto.createHash('sha256').update(signature).digest('hex');
   const id = `RSG${new Date().toISOString().replace(/[-:T.Z]/g, '').slice(0, 8)}${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
   const storageKey = `allowance-signatures/${refund.id}/${id}.png`;
   await putIdPhotoObject(storageKey, signature, 'image/png');
@@ -218,7 +286,7 @@ export async function attachRefundSignature(user, refundId, { previewToken, requ
           id,
           refundId: refund.id,
           storageKey,
-          sha256: crypto.createHash('sha256').update(signature).digest('hex'),
+          sha256,
           requestId: claims.req,
           previewDigest: claims.dg,
           staffId: user.id,
@@ -232,7 +300,7 @@ export async function attachRefundSignature(user, refundId, { previewToken, requ
         refund,
         user,
         req,
-        after: { signatureId: id, requestId: claims.req, digest: claims.dg },
+        after: { signatureId: id, requestId: claims.req, digest: claims.dg, sha256 },
       });
     });
   }

@@ -21,6 +21,27 @@ describe('validateSignaturePng（防空白簽名）', () => {
     await rejectsSignature(await makePng({ background: [0, 0, 0, 0] }));
   });
 
+  test('簽名板色筆跡通過；純深青底欄加白字被拒（底欄不計入墨跡）', async () => {
+    await validateSignaturePng(await makePng({ strokes: [{ x: 40, y: 80, w: 280, h: 3, rgba: [15, 23, 42, 255] }] }));
+    await rejectsSignature(await makePng({
+      height: 236,
+      strokes: [
+        { x: 0, y: 200, w: 400, h: 36, rgba: [8, 61, 79, 255] },
+        { x: 12, y: 210, w: 220, h: 14, rgba: [255, 255, 255, 255] },
+      ],
+    }));
+  });
+
+  test('深青底欄加上近黑筆跡仍通過', async () => {
+    await validateSignaturePng(await makePng({
+      height: 236,
+      strokes: [
+        { x: 40, y: 90, w: 280, h: 3, rgba: [15, 23, 42, 255] },
+        { x: 0, y: 200, w: 400, h: 36, rgba: [8, 61, 79, 255] },
+      ],
+    }));
+  });
+
   test('僅有淺色浮水印（灰階 ≥128）不算筆跡', async () => {
     await rejectsSignature(await makePng({ strokes: [{ x: 0, y: 0, w: 400, h: 200, rgba: [200, 200, 200, 255] }] }));
   });

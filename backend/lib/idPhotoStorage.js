@@ -83,6 +83,7 @@ export async function putIdPhotoObject(storageKey, buf, contentType = 'image/jpe
         Key: storageKey,
         Body: buf,
         ContentType: contentType,
+        ServerSideEncryption: 'AES256',
       }),
     );
     return { driver, storageKey };

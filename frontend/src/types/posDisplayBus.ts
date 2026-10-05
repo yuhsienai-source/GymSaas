@@ -9,6 +9,14 @@
 
 export const ALLOWANCE_BUS_VERSION = 1 as const;
 
+/** 客顯送出門檻；後端 `MIN_SIGNATURE_POINTS` 必須相同（墨跡像素仍以後端為準） */
+export const MIN_SIGNATURE_POINTS = 25;
+export const MIN_SIGNATURE_STROKES = 1;
+/** 筆跡路徑總長（CSS px） */
+export const MIN_SIGNATURE_PATH_PX = 60;
+/** 筆畫外接框下限（CSS px），擋單點誤觸 */
+export const MIN_SIGNATURE_SPAN = { width: 48, height: 20 } as const;
+
 export const ALLOWANCE_BUS_TYPES = {
   SIGN_REQUEST: 'ALLOWANCE_SIGN_REQUEST',
   VIEW_ACK: 'ALLOWANCE_VIEW_ACK',
@@ -49,6 +57,8 @@ export interface AllowanceSignPreview {
   memberName: string | null;
   signatureRequired: boolean;
   statement: string;
+  /** sha256(`折讓單號|原發票|含稅額`)，由後端簽發；回傳簽名時必須原樣帶回 */
+  payloadHash: string;
   docs: AllowanceSignDoc[];
   totals: { untaxed: number; tax: number; total: number };
   refund: { grossAmount: number; feeAmount: number; payoutAmount: number };
@@ -69,7 +79,7 @@ export interface AllowanceSignRequestMsg extends AllowanceBusBase {
   preview: AllowanceSignPreview;
 }
 
-/** 客顯 → 主機：已收到並顯示（主機 3 秒內未收到 → 提示未開啟客顯） */
+/** 客顯 → 主機：折讓明細已渲染（主機 2 秒內未收到 → 提示未開啟客顯） */
 export interface AllowanceViewAckMsg extends AllowanceBusBase {
   type: typeof ALLOWANCE_BUS_TYPES.VIEW_ACK;
   from: 'display';
@@ -80,9 +90,13 @@ export interface AllowanceSignCompleteMsg extends AllowanceBusBase {
   type: typeof ALLOWANCE_BUS_TYPES.SIGN_COMPLETE;
   from: 'display';
   previewToken: string;
+  /** 須與本次預覽的 payloadHash 一致 */
+  payloadHash: string;
   signatureBlob: Blob;
   signedAt: string;
   strokePoints: number;
+  strokeCount: number;
+  pathLength: number;
 }
 
 /** 任一端取消（主機撤回／顧客有疑問） */
@@ -124,7 +138,15 @@ export function isAllowanceBusMessage(x: unknown): x is AllowanceBusMessage {
   if (typeof m.requestId !== 'string' || !m.requestId) return false;
   if (m.type === ALLOWANCE_BUS_TYPES.SIGN_COMPLETE) {
     const c = m as Partial<AllowanceSignCompleteMsg>;
-    return c.signatureBlob instanceof Blob && typeof c.previewToken === 'string';
+    return (
+      c.signatureBlob instanceof Blob
+      && typeof c.previewToken === 'string'
+      && typeof c.payloadHash === 'string'
+      && c.payloadHash.length === 64
+      && typeof c.strokePoints === 'number'
+      && typeof c.strokeCount === 'number'
+      && typeof c.pathLength === 'number'
+    );
   }
   if (m.type === ALLOWANCE_BUS_TYPES.SIGN_REQUEST) {
     const r = m as Partial<AllowanceSignRequestMsg>;

@@ -92,6 +92,8 @@ export interface OpsMember {
   bonusWallet: number;
   papagoFaceId: string | null;
   isAlert: boolean;
+  /** 欠款黑名單（有效中）；有值時禁止新購課程／課程分期 */
+  paymentDebt?: { reason: string; note: string | null; since: string } | null;
   allowBiometrics?: boolean;
   /** 櫃檯勾選啟用人臉；為 true 時生物辨識同意書才必簽 */
   faceEnabled?: boolean;
@@ -2323,6 +2325,8 @@ export type RefundPaymentStatus =
   | 'CANCELLED';
 
 export type RefundScope = 'FULL' | 'ITEMS' | 'UNUSED';
+/** 契約第九條自願終止／第十四條不可歸責（受傷、懷孕、遷居、教練無法履約）免手續費 */
+export type RefundTerminationClause = 'VOLUNTARY' | 'EXEMPT';
 
 export type RefundOrderKind = 'SALE' | 'TOPUP' | 'MEMBERSHIP' | 'PT' | 'GROUP' | 'COURSE_SUB' | 'OTHER';
 
@@ -2378,12 +2382,20 @@ export interface RefundPreview {
   calc: { note?: string; [k: string]: unknown };
   grossAmount: number;
   feeAmount: number;
+  /** 契約手續費上限（調降不得超過；0＝不收） */
+  feeMax: number;
+  clause: RefundTerminationClause;
   consumedValue: number;
   payoutAmount: number;
   fullRefund: boolean;
   legs: RefundLegPreview[];
   invoicePlan: RefundInvoicePlan;
   signatureRequired: boolean;
+  /** 課程合約已逾效期：退費須 DUTY+ 專案核准 */
+  isContractExpired: boolean;
+  contractExpiresAt: string | null;
+  /** 課程分期應補繳差額（>0 須勾選確認收訖才可送出） */
+  shortfall: number;
   warnings: string[];
 }
 

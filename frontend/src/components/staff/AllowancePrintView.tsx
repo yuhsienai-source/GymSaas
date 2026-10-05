@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import type { AllowancePrintPayload } from '../../types/api';
 
@@ -41,7 +41,17 @@ function ReprintMark({ p }: { p: AllowancePrintPayload }) {
   return <div className="alw-reprint">補印（第 {p.print.count} 次列印）</div>;
 }
 
-function A4Copy({ p, label, sigUrl }: { p: AllowancePrintPayload; label: string; sigUrl: string | null }) {
+function A4Copy({
+  p,
+  label,
+  sigUrl,
+  sigRef,
+}: {
+  p: AllowancePrintPayload;
+  label: string;
+  sigUrl: string | null;
+  sigRef?: (el: HTMLImageElement | null) => void;
+}) {
   const inv = p.originalInvoice;
   return (
     <section className="alw-a4__copy">
@@ -113,7 +123,7 @@ function A4Copy({ p, label, sigUrl }: { p: AllowancePrintPayload; label: string;
           <div className="alw-slot">原銷貨營業人蓋章</div>
           <div className="alw-slot">
             原買受人簽收
-            {sigUrl ? <img className="alw-sig" src={sigUrl} alt="買受人簽名" /> : null}
+            {sigUrl ? <img ref={sigRef} className="alw-sig" src={sigUrl} alt="買受人簽名" /> : null}
             <SignatureNote p={p} />
           </div>
         </div>
@@ -122,7 +132,15 @@ function A4Copy({ p, label, sigUrl }: { p: AllowancePrintPayload; label: string;
   );
 }
 
-function Thermal({ p, sigUrl }: { p: AllowancePrintPayload; sigUrl: string | null }) {
+function Thermal({
+  p,
+  sigUrl,
+  sigRef,
+}: {
+  p: AllowancePrintPayload;
+  sigUrl: string | null;
+  sigRef?: (el: HTMLImageElement | null) => void;
+}) {
   const inv = p.originalInvoice;
   return (
     <div className="alw-thermal">
@@ -153,7 +171,7 @@ function Thermal({ p, sigUrl }: { p: AllowancePrintPayload; sigUrl: string | nul
       <div className="alw-hr" />
       <div>原因：{p.allowance.reason || '—'}</div>
       <div style={{ marginTop: '3mm' }}>買受人簽收：</div>
-      {sigUrl ? <img className="alw-sig" src={sigUrl} alt="買受人簽名" /> : <div className="alw-slot" />}
+      {sigUrl ? <img ref={sigRef} className="alw-sig" src={sigUrl} alt="買受人簽名" /> : <div className="alw-slot" />}
       <div className="alw-sub"><SignatureNote p={p} /></div>
     </div>
   );
@@ -161,7 +179,7 @@ function Thermal({ p, sigUrl }: { p: AllowancePrintPayload; sigUrl: string | nul
 
 /**
  * 折讓證明單列印：只排版後端 print-payload（禁止前端重算金額或稅額）。
- * 掛載後以 portal 置於 body，`@media print` 只印本區塊，簽名圖載入後呼叫 window.print()，列印結束 onDone 卸載。
+ * 掛載後以 portal 置於 body，`@media print` 只印本區塊。含簽名時須等畫面上每一張 `<img>` `decode()` 完成才 `window.print()`。
  */
 export default function AllowancePrintView({
   payload,
@@ -173,35 +191,78 @@ export default function AllowancePrintView({
   onDone: () => void;
 }) {
   const rawSigUrl = payload.signature.dataUrl && PNG_DATA_URL.test(payload.signature.dataUrl) ? payload.signature.dataUrl : null;
-  const [sigReady, setSigReady] = useState(!rawSigUrl);
+  const signedButMissing = payload.signature.signed && !rawSigUrl;
+  const [sigReady, setSigReady] = useState(!rawSigUrl && !signedButMissing);
   const [sigBroken, setSigBroken] = useState(false);
   const sigUrl = sigBroken ? null : rawSigUrl;
+  const imgRefs = useRef<Array<HTMLImageElement | null>>([]);
+  const [bindTick, setBindTick] = useState(0);
+  const sigCopies = format === 'THERMAL_80MM' ? 1 : 4;
+
+  function bindSig(index: number) {
+    return (el: HTMLImageElement | null) => {
+      imgRefs.current[index] = el;
+    };
+  }
 
   useEffect(() => {
     document.body.classList.add('alw-printing');
     return () => document.body.classList.remove('alw-printing');
   }, []);
 
-  useEffect(() => {
-    if (!rawSigUrl) return;
+  useLayoutEffect(() => {
+    if (!rawSigUrl || sigBroken) return;
     let alive = true;
-    const img = new Image();
-    img.onload = () => {
-      if (alive) setSigReady(true);
+    const imgs = imgRefs.current.slice(0, sigCopies).filter((n): n is HTMLImageElement => n != null);
+    if (imgs.length < sigCopies) {
+      if (bindTick >= 8) {
+        setSigBroken(true);
+        return;
+      }
+      const raf = window.requestAnimationFrame(() => {
+        if (alive) setBindTick((n) => n + 1);
+      });
+      return () => {
+        alive = false;
+        window.cancelAnimationFrame(raf);
+      };
+    }
+    let left = imgs.length;
+    const timer = window.setTimeout(() => {
+      if (alive) setSigBroken(true);
+    }, 8000);
+    const done = () => {
+      left -= 1;
+      if (alive && left <= 0) {
+        window.clearTimeout(timer);
+        setSigReady(true);
+      }
     };
-    img.onerror = () => {
+    const fail = () => {
       if (!alive) return;
+      alive = false;
+      window.clearTimeout(timer);
       setSigBroken(true);
-      setSigReady(true);
     };
-    img.src = rawSigUrl;
+    for (const img of imgs) {
+      const onReady = () => {
+        const decoded = typeof img.decode === 'function' ? img.decode() : Promise.resolve();
+        decoded.then(done).catch(fail);
+      };
+      if (img.complete && img.naturalWidth > 0) onReady();
+      else {
+        img.addEventListener('load', onReady, { once: true });
+        img.addEventListener('error', fail, { once: true });
+      }
+    }
     return () => {
       alive = false;
+      window.clearTimeout(timer);
     };
-  }, [rawSigUrl]);
+  }, [rawSigUrl, sigBroken, sigCopies, payload, bindTick]);
 
   useEffect(() => {
-    if (!sigReady) return;
+    if (!sigReady || sigBroken || signedButMissing) return;
     let finished = false;
     let fallback: number | undefined;
     const finish = () => {
@@ -219,28 +280,43 @@ export default function AllowancePrintView({
       if (fallback) window.clearTimeout(fallback);
       window.removeEventListener('afterprint', finish);
     };
-  }, [sigReady, onDone]);
+  }, [sigReady, sigBroken, signedButMissing, onDone]);
 
   const pageRule = format === 'THERMAL_80MM' ? '@page { size: 80mm auto; margin: 3mm; }' : '@page { size: A4; margin: 8mm; }';
 
-  return createPortal(
+  const blocked = signedButMissing || sigBroken;
+  const sheet = (
     <div className={`alw-print-root alw-print-root--${format === 'THERMAL_80MM' ? 'thermal' : 'a4'}`}>
       <style>{pageRule}</style>
       {format === 'THERMAL_80MM' ? (
-        <Thermal p={payload} sigUrl={sigUrl} />
+        <Thermal p={payload} sigUrl={sigUrl} sigRef={bindSig(0)} />
       ) : (
-        [COPY_LABELS.slice(0, 2), COPY_LABELS.slice(2, 4)].map((pair, i) => (
-          <div key={i} className="alw-a4__page">
+        [COPY_LABELS.slice(0, 2), COPY_LABELS.slice(2, 4)].map((pair, page) => (
+          <div key={page} className="alw-a4__page">
             {pair.map((label, j) => (
               <div key={label} className="alw-a4__half">
                 {j === 1 ? <div className="alw-a4__cut" /> : null}
-                <A4Copy p={payload} label={label} sigUrl={sigUrl} />
+                <A4Copy p={payload} label={label} sigUrl={sigUrl} sigRef={bindSig(page * 2 + j)} />
               </div>
             ))}
           </div>
         ))
       )}
-    </div>,
-    document.body,
+    </div>
+  );
+
+  return (
+    <>
+      {blocked
+        ? createPortal(
+            <div className="alw-print-block" role="alert">
+              <p>簽名影像未能載入，已取消列印，以免簽名欄空白。</p>
+              <p>請再按一次列印，重新取得簽名。</p>
+              <button type="button" onClick={onDone}>關閉</button>
+            </div>,
+            document.body,
+          )
+        : createPortal(sheet, document.body)}
+    </>
   );
 }

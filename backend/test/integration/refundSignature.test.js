@@ -79,6 +79,19 @@ async function createSignableRefund() {
   return { refund, allowance };
 }
 
+function signArgs(preview, signature, extra = {}) {
+  return {
+    previewToken: preview.previewToken,
+    requestId: preview.requestId,
+    payloadHash: preview.payloadHash,
+    pointCount: 40,
+    strokeCount: 2,
+    pathLength: 180,
+    signature,
+    ...extra,
+  };
+}
+
 async function assertNotSigned(refundId) {
   assert.equal(await prisma.refundSignature.count({ where: { refundId } }), 0);
   const r = await prisma.refundRequest.findUnique({ where: { id: refundId }, select: { signatureId: true, status: true } });
@@ -92,12 +105,9 @@ describe('折讓簽名 previewToken', () => {
     const preview = await buildSignPreview(user, refund.id);
     assert.deepEqual(preview.totals, { untaxed: 476, tax: 24, total: 500 });
     assert.equal(preview.docs[0].buyerLabel, '測試股份有限公司（12345678）');
+    assert.equal(preview.payloadHash.length, 64);
 
-    const out = await attachRefundSignature(user, refund.id, {
-      previewToken: preview.previewToken,
-      requestId: preview.requestId,
-      signature: await inkedSignature(),
-    });
+    const out = await attachRefundSignature(user, refund.id, signArgs(preview, await inkedSignature()));
     assert.equal(out.status, 'COMPLETED');
     const sig = await prisma.refundSignature.findFirst({ where: { refundId: refund.id } });
     assert.equal(sig.previewDigest.length, 64);
@@ -110,11 +120,7 @@ describe('折讓簽名 previewToken', () => {
     const preview = await buildSignPreview(user, refund.id);
     await prisma.invoiceAllowance.update({ where: { id: allowance.id }, data: { untaxedAmt: 477, taxAmt: 23 } });
     await assert.rejects(
-      attachRefundSignature(user, refund.id, {
-        previewToken: preview.previewToken,
-        requestId: preview.requestId,
-        signature: await inkedSignature(),
-      }),
+      attachRefundSignature(user, refund.id, signArgs(preview, await inkedSignature())),
       isError(409, 'PREVIEW_STALE'),
     );
     await assertNotSigned(refund.id);
@@ -125,14 +131,14 @@ describe('折讓簽名 previewToken', () => {
     const p1 = await buildSignPreview(user, refund.id);
     await prisma.invoiceAllowanceItem.updateMany({ where: { allowanceId: allowance.id }, data: { name: '其他品項' } });
     await assert.rejects(
-      attachRefundSignature(user, refund.id, { previewToken: p1.previewToken, requestId: p1.requestId, signature: await inkedSignature() }),
+      attachRefundSignature(user, refund.id, signArgs(p1, await inkedSignature())),
       isError(409, 'PREVIEW_STALE'),
     );
 
     const p2 = await buildSignPreview(user, refund.id);
     await prisma.refundRequest.update({ where: { id: refund.id }, data: { payoutAmount: 400 } });
     await assert.rejects(
-      attachRefundSignature(user, refund.id, { previewToken: p2.previewToken, requestId: p2.requestId, signature: await inkedSignature() }),
+      attachRefundSignature(user, refund.id, signArgs(p2, await inkedSignature())),
       isError(409, 'PREVIEW_STALE'),
     );
     assert.equal(await prisma.refundSignature.count({ where: { refundId: refund.id } }), 0);
@@ -143,18 +149,18 @@ describe('折讓簽名 previewToken', () => {
     const preview = await buildSignPreview(user, refund.id);
     const signature = await inkedSignature();
     await assert.rejects(
-      attachRefundSignature(user, refund.id, { previewToken: preview.previewToken, requestId: 'ASRWRONG', signature }),
+      attachRefundSignature(user, refund.id, signArgs(preview, signature, { requestId: 'ASRWRONG' })),
       isError(400, 'PREVIEW_TOKEN_INVALID'),
     );
     const otherUser = await createStaffUser('ADMIN');
     await assert.rejects(
-      attachRefundSignature(otherUser, refund.id, { previewToken: preview.previewToken, requestId: preview.requestId, signature }),
+      attachRefundSignature(otherUser, refund.id, signArgs(preview, signature)),
       isError(400, 'PREVIEW_TOKEN_INVALID'),
     );
     const payload = JSON.parse(Buffer.from(preview.previewToken.split('.')[0], 'base64url').toString('utf8'));
     const expired = signToken('allowance-sign-preview', { ...payload, exp: Date.now() - 1 });
     await assert.rejects(
-      attachRefundSignature(user, refund.id, { previewToken: expired, requestId: preview.requestId, signature }),
+      attachRefundSignature(user, refund.id, signArgs(preview, signature, { previewToken: expired })),
       isError(409, 'PREVIEW_EXPIRED'),
     );
     await assertNotSigned(refund.id);
@@ -164,7 +170,49 @@ describe('折讓簽名 previewToken', () => {
     const { refund } = await createSignableRefund();
     const preview = await buildSignPreview(user, refund.id);
     await assert.rejects(
-      attachRefundSignature(user, refund.id, { previewToken: preview.previewToken, requestId: preview.requestId, signature: await makePng() }),
+      attachRefundSignature(user, refund.id, signArgs(preview, await makePng())),
+      isError(400, 'SIGNATURE_REQUIRED'),
+    );
+    await assertNotSigned(refund.id);
+  });
+
+  test('payloadHash 與折讓單不符 → 409，不落檔', async () => {
+    const { refund } = await createSignableRefund();
+    const preview = await buildSignPreview(user, refund.id);
+    await assert.rejects(
+      attachRefundSignature(user, refund.id, signArgs(preview, await inkedSignature(), { payloadHash: 'a'.repeat(64) })),
+      isError(409, 'PAYLOAD_HASH_MISMATCH'),
+    );
+    await assertNotSigned(refund.id);
+  });
+
+  test('乙禾未回填 RRN 不可預覽簽名', async () => {
+    const { refund } = await createSignableRefund();
+    await prisma.refundPayment.create({
+      data: { id: testId('RFP'), refundId: refund.id, method: 'YIPAY', amount: 500, status: 'AWAITING_TERMINAL' },
+    });
+    await assert.rejects(
+      () => buildSignPreview(user, refund.id),
+      (e) => e.statusCode === 409 && e.code === 'YIPAY_TERMINAL_VOUCHER_REQUIRED',
+    );
+  });
+
+  test('路徑過短 → 400，不落檔', async () => {
+    const { refund } = await createSignableRefund();
+    const preview = await buildSignPreview(user, refund.id);
+    const png = await inkedSignature();
+    await assert.rejects(
+      () => attachRefundSignature(user, refund.id, signArgs(preview, png, { pathLength: 12 })),
+      (e) => e.statusCode === 400 && e.code === 'SIGNATURE_STROKE_TOO_SHORT',
+    );
+    await assertNotSigned(refund.id);
+  });
+
+  test('pointCount 不足 → 400，不落檔', async () => {
+    const { refund } = await createSignableRefund();
+    const preview = await buildSignPreview(user, refund.id);
+    await assert.rejects(
+      attachRefundSignature(user, refund.id, signArgs(preview, await inkedSignature(), { pointCount: 3 })),
       isError(400, 'SIGNATURE_REQUIRED'),
     );
     await assertNotSigned(refund.id);
@@ -178,7 +226,7 @@ describe('孤兒簽名檔清除', () => {
     const signature = await inkedSignature();
     await withRefundLock(refund.id, async () => {
       await assert.rejects(
-        attachRefundSignature(user, refund.id, { previewToken: preview.previewToken, requestId: preview.requestId, signature }),
+        attachRefundSignature(user, refund.id, signArgs(preview, signature)),
         isError(409, 'REFUND_IN_PROGRESS'),
       );
     });
@@ -191,8 +239,8 @@ describe('孤兒簽名檔清除', () => {
     const p2 = await buildSignPreview(user, refund.id);
     const signature = await inkedSignature();
     const results = await Promise.allSettled([
-      attachRefundSignature(user, refund.id, { previewToken: p1.previewToken, requestId: p1.requestId, signature }),
-      attachRefundSignature(user, refund.id, { previewToken: p2.previewToken, requestId: p2.requestId, signature }),
+      attachRefundSignature(user, refund.id, signArgs(p1, signature)),
+      attachRefundSignature(user, refund.id, signArgs(p2, signature)),
     ]);
     const ok = results.filter((r) => r.status === 'fulfilled');
     const failed = results.filter((r) => r.status === 'rejected');

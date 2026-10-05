@@ -19,6 +19,9 @@ export function useAllowancePrint() {
     try {
       const res = await fetchAllowancePrintPayload(allowanceIdOrNo, 'print');
       if (!res.data?.allowance?.allowanceNo) throw new Error(res.message || '讀取折讓單失敗');
+      if (res.data.signature?.signed && !res.data.signature.dataUrl) {
+        throw new Error('簽名影像讀取失敗，請重新列印');
+      }
       setJob({ payload: res.data, format });
     } finally {
       printInFlightRef.current = false;

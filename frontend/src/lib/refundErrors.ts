@@ -20,10 +20,35 @@ const CODE_GUIDE: Record<string, { title: string; hint?: string; tone?: 'error' 
   },
   TOPUP_GRANT_UNKNOWN: { title: '此儲值單缺少入帳快照', hint: '無法判定原入帳金額，請洽總部人工處理。' },
   MEMBER_CHECKED_IN: {
-    title: '會員目前在館內，暫不可回收儲值',
-    hint: '計時進場尚未出場結算。請待會員刷卡出場、扣款完成後再辦理；若為異常滯留，請先於「在場紀錄」處理該筆進場。',
+    title: '會員目前在館內，暫不可退費',
+    hint: '尚有未出場之進場紀錄。請待會員刷卡出場（計時者扣款完成）後再辦理；若為異常滯留，請先於「在場紀錄」處理該筆進場。',
     tone: 'warning',
   },
+  COURSE_SESSION_IN_PROGRESS: {
+    title: '課程進行中，暫不可退費',
+    hint: '此合約有正在上課中的堂次，請於下課後再辦理解約退費。',
+    tone: 'warning',
+  },
+  NOT_LATEST_MEMBERSHIP: {
+    title: '此月卡之後已有續購',
+    hint: '效期已疊加，請先退最新一筆月卡購案，再退此筆。',
+    tone: 'warning',
+  },
+  COOLING_OFF_EXPIRED: { title: '已逾 7 日無條件解約期', hint: '請改選「契約第九條：未履約退費」。', tone: 'warning' },
+  COURSE_SESSIONS_EXHAUSTED: { title: '堂數已全數使用', hint: '已無未上堂數可退。', tone: 'warning' },
+  FEE_EXCEEDS_CONTRACT_LIMIT: {
+    title: '手續費超過契約上限',
+    hint: '只能調降手續費，不可高於試算顯示之契約手續費上限。',
+    tone: 'warning',
+  },
+  DUTY_ROLE_REQUIRED_FOR_FEE_WAIVER: {
+    title: '無權減免手續費',
+    hint: '套用第十四條或調降手續費須值星（DUTY）以上主管操作。',
+    tone: 'warning',
+  },
+  CLAUSE_INVALID: { title: '終止條款無效', hint: '請重新選擇終止條款。' },
+  INVALID_FEE_AMOUNT: { title: '手續費格式錯誤', hint: '手續費須為 0 以上之整數。', tone: 'warning' },
+  FEE_POLICY_NOT_APPLICABLE: { title: '此單據不適用手續費減免', hint: '商品退貨與儲值原單取消不收手續費，無須選條款。' },
   PT_CONTRACT_UNLINKED: { title: '私教訂單未連結合約', hint: '請洽總部人工處理。' },
   CONTRACT_REQUIRED: {
     title: '會員尚未完成入會契約簽署',
@@ -82,9 +107,15 @@ const CODE_GUIDE: Record<string, { title: string; hint?: string; tone?: 'error' 
   CARD_MISMATCH: { title: '卡號末四碼與原交易不符', hint: '乙禾退貨必須退回原刷卡片；請核對簽單後重新輸入。' },
   YIPAY_RRN_DUPLICATE: { title: 'RRN 已被使用', hint: '此調閱編號已登錄於其他退款，請核對端末退貨簽單。' },
   ABORT_FORBIDDEN: { title: '不可中止此退費單', hint: '已有款項退出或發票已處理，請改用重試或改臨櫃現金。' },
-  SERVICE_ALREADY_USED: { title: '已使用服務，不可全額退費', hint: '請改選「未使用部分退費」。', tone: 'warning' },
+  SERVICE_ALREADY_USED: { title: '已使用服務，不可全額退費', hint: '請改選「契約第九條」未履約退費。', tone: 'warning' },
   ILLEGAL_FIELDS: { title: '請求含非法欄位', hint: '退費金額一律由後端計算，請重新整理頁面後再試。' },
   SIGNATURE_REQUIRED: { title: '簽名無效', hint: '簽名為空白或格式錯誤，請顧客於客顯重新簽名。', tone: 'warning' },
+  PAYLOAD_HASH_MISMATCH: {
+    title: '簽名與折讓內容不符',
+    hint: '顧客所簽版本與目前折讓單號或金額不一致，請重新推送客顯。',
+    tone: 'warning',
+  },
+  PAYLOAD_HASH_REQUIRED: { title: '缺少折讓簽署摘要', hint: '請重新推送客顯簽名。', tone: 'warning' },
   SIGNATURE_EXISTS: { title: '此退費單已有簽名', tone: 'warning' },
   IDEMPOTENCY_KEY_REUSED: {
     title: '送出識別碼已用於其他單據',
@@ -98,6 +129,31 @@ const CODE_GUIDE: Record<string, { title: string; hint?: string; tone?: 'error' 
     tone: 'warning',
   },
   QUOTE_EXPIRED: { title: '試算已逾時', hint: '已重新試算，請核對金額後再送出。', tone: 'warning' },
+  SHORTFALL_SETTLEMENT_REQUIRED: {
+    title: '學員尚須補繳差額',
+    hint: '請選擇「已於 POS 臨櫃收訖」或「主管核准立案追償」後再送出；未選擇前不會停止續扣或終止合約。',
+    tone: 'warning',
+  },
+  SHORTFALL_NOTE_REQUIRED: {
+    title: '請填寫收款憑證',
+    hint: '選擇「已於 POS 臨櫃收訖」時須填寫 POS 收款單號或收訖說明（至少 2 字）；尚未收款請改選「主管核准立案追償」。',
+    tone: 'warning',
+  },
+  SHORTFALL_RESOLUTION_INVALID: {
+    title: '補繳處置方式無效',
+    hint: '請重新選擇「已臨櫃收訖」或「立案追償」後再送出。',
+    tone: 'warning',
+  },
+  DUTY_APPROVAL_REQUIRED_FOR_SHORTFALL: {
+    title: '須值班主管確認',
+    hint: '應補繳差額之解約須由值班主管（DUTY+）確認收訖後送出。此為權限不足，不會登出。',
+    tone: 'warning',
+  },
+  DUTY_APPROVAL_REQUIRED_FOR_EXPIRED_COURSE: {
+    title: '逾效期課程須主管核准',
+    hint: '依紙本契約逾期原則不予退費；專案退費須由值班主管（DUTY+）登入送出。此為權限不足，不會登出。',
+    tone: 'warning',
+  },
   SUBSCRIPTION_CANCELLED_REFUND_INCOMPLETE: {
     title: '定期定額已終止，但退費尚未完成',
     hint: '續期扣款已停止（不會再扣款），退費則未建立、未動帳。已重新試算，請核對金額後再次送出；若仍失敗請洽總部（系統已留稽核紀錄）。',

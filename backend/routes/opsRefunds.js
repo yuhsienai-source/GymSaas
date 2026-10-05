@@ -1,6 +1,7 @@
 // routes/opsRefunds.js — 儲值原單取消、子單退費、退費單後續（乙禾回填／改現金／重試／核對發票結果／中止／簽名）、折讓單資料
 // 掛在 /api/ops（ops.js 之前）；不使用 router.use，避免攔截 ops.js 的公開金流回流路由
 // 金額一律由後端依子單／品項重算（lib/refundService.js）；前端只送 scope／items{orderItemId,qty}／reason
+// 例外：clause（第十四條免手續費）與 overrideFeeAmount（主管調降，0～契約上限）僅調整手續費，由後端驗上限
 import express from 'express';
 import multer from 'multer';
 import { verifyStaff, requireDutyOrAbove } from '../middleware/jwtAuth.js';
@@ -146,7 +147,7 @@ router.post(
 
 // ── B：子單退費（SAL／TYK／CRS／私教） ──────────────────────
 
-// GET /api/ops/sub-orders/:subOrderId/refund-preview?scope=&items=[{"orderItemId":1,"qty":1}]
+// GET /api/ops/sub-orders/:subOrderId/refund-preview?scope=&items=[{"orderItemId":1,"qty":1}]&clause=VOLUNTARY|EXEMPT&overrideFeeAmount=
 router.get(
   '/sub-orders/:subOrderId/refund-preview',
   ...dutyOnly,
@@ -159,18 +160,28 @@ router.get(
         return res.status(400).json({ status: 'error', code: 'ORDER_ITEM_INVALID', message: 'items 格式錯誤', data: null });
       }
     }
-    const data = await previewSubOrderRefund(req.user, req.params.subOrderId, { scope: req.query.scope, items });
+    const data = await previewSubOrderRefund(req.user, req.params.subOrderId, {
+      scope: req.query.scope,
+      items,
+      clause: req.query.clause,
+      overrideFeeAmount: req.query.overrideFeeAmount,
+    });
     res.json({ status: 'success', message: '試算完成', data });
   }),
 );
 
-// POST /api/ops/sub-orders/:subOrderId/refund  Header Idempotency-Key；{ quoteToken, scope, items?, reason, buyerEmail? }
+// POST /api/ops/sub-orders/:subOrderId/refund  Header Idempotency-Key
+// { quoteToken, scope, items?, reason, buyerEmail?, clause?, overrideFeeAmount?, shortfallResolution?, shortfallNote? }
+// （clause／手續費須與試算相同，否則 QUOTE_STALE；shortfallResolution＝PAID_AT_POS｜FLAG_ALERT_FOR_RECOVERY）
 router.post(
   '/sub-orders/:subOrderId/refund',
   ...dutyOnly,
   handle('子單退費失敗', async (req, res) => {
-    if (rejectIllegalFields(res, req.body, ['quoteToken', 'scope', 'items', 'reason', 'buyerEmail'])) return;
-    const { quoteToken, scope, items, reason, buyerEmail } = req.body || {};
+    const allowed = [
+      'quoteToken', 'scope', 'items', 'reason', 'buyerEmail', 'clause', 'overrideFeeAmount', 'shortfallResolution', 'shortfallNote',
+    ];
+    if (rejectIllegalFields(res, req.body, allowed)) return;
+    const { quoteToken, scope, items, reason, buyerEmail, clause, overrideFeeAmount, shortfallResolution, shortfallNote } = req.body || {};
     if (items != null) {
       const bad =
         !Array.isArray(items) ||
@@ -188,7 +199,7 @@ router.post(
     const data = await executeSubOrderRefund(
       req.user,
       req.params.subOrderId,
-      { scope, items, reason, buyerEmail, quoteToken, idempotencyKey },
+      { scope, items, reason, buyerEmail, quoteToken, idempotencyKey, clause, overrideFeeAmount, shortfallResolution, shortfallNote },
       req,
     );
     await sendRefund(res, data);
@@ -333,7 +344,7 @@ router.post(
 
 const signatureUpload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: MAX_SIGNATURE_BYTES, files: 1, fields: 4 },
+  limits: { fileSize: MAX_SIGNATURE_BYTES, files: 1, fields: 8 },
   fileFilter(_req, file, cb) {
     if (file.fieldname === 'signature' && file.mimetype === 'image/png') cb(null, true);
     else cb(Object.assign(new Error('簽名影像須為 PNG'), { statusCode: 400, code: 'SIGNATURE_REQUIRED' }));
@@ -359,11 +370,19 @@ router.post(
   ...dutyOnly,
   parseSignatureUpload,
   handle('簽名儲存失敗', async (req, res) => {
-    if (rejectIllegalFields(res, req.body, ['previewToken', 'requestId'])) return;
+    if (rejectIllegalFields(res, req.body, ['previewToken', 'requestId', 'payloadHash', 'pointCount', 'strokeCount', 'pathLength'])) return;
     const data = await attachRefundSignature(
       req.user,
       req.params.id,
-      { previewToken: req.body?.previewToken, requestId: req.body?.requestId, signature: req.file?.buffer },
+      {
+        previewToken: req.body?.previewToken,
+        requestId: req.body?.requestId,
+        payloadHash: req.body?.payloadHash,
+        pointCount: req.body?.pointCount,
+        strokeCount: req.body?.strokeCount,
+        pathLength: req.body?.pathLength,
+        signature: req.file?.buffer,
+      },
       req,
     );
     await sendRefund(res, data, '簽名已歸檔；');

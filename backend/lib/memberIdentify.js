@@ -5,6 +5,7 @@ import { identifyFace, getSimilarityThreshold } from './papago.js';
 import { memberHasSignedBiometricsConsent } from './memberContract.js';
 import { parseMemberIdentityQrPayload } from './memberIdentityQr.js';
 import { isValidMemberNo } from './memberNo.js';
+import { paymentDebtByMember } from './paymentDebt.js';
 
 export function normalizePhone(phone) {
   return String(phone || '')
@@ -62,7 +63,24 @@ export function toCounterMemberView(member) {
   };
 }
 
+/** 櫃檯辨認結果附欠款黑名單（paymentDebt），供 POS 醒目警示 */
+async function attachPaymentDebt(result) {
+  const list = [result?.data?.member, ...(result?.data?.candidates || [])].filter(Boolean);
+  if (!list.length) return result;
+  const debts = await paymentDebtByMember(prisma, list.map((m) => m.id));
+  for (const m of list) m.paymentDebt = debts.get(m.id) || null;
+  return result;
+}
+
 export async function lookupMemberByPhone(rawPhone) {
+  return attachPaymentDebt(await lookupMemberByPhoneRaw(rawPhone));
+}
+
+export async function identifyMember(input) {
+  return attachPaymentDebt(await identifyMemberRaw(input));
+}
+
+async function lookupMemberByPhoneRaw(rawPhone) {
   if (!rawPhone) {
     const err = new Error('請提供手機號碼 phone');
     err.statusCode = 400;
@@ -122,7 +140,7 @@ export async function lookupMemberByPhone(rawPhone) {
   };
 }
 
-export async function identifyMember({ method, phone, qrToken, faceImage }) {
+async function identifyMemberRaw({ method, phone, qrToken, faceImage }) {
   const mode = String(method || '').toUpperCase();
 
   if (!['PHONE', 'QR', 'FACE'].includes(mode)) {

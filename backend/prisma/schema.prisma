@@ -1828,6 +1828,8 @@ model RefundPayment {
   status          String
   /// 原交易序號（LINE Pay transactionId／PayUNi TradeNo）
   originalRef     String?
+  /// 退款所屬原付款訂單（課程分期跨期退款時為各期訂單；空＝退費單 refId）
+  refOrderId      String?
   /// 退款序號（LINE Pay refundTransactionId／PayUNi 回傳）
   providerRef     String?
   /// 乙禾端末退貨憑證
@@ -1903,7 +1905,7 @@ model WalletLedger {
 /// 交易異動稽核（append-only；前後狀態快照）
 model TransactionAuditLog {
   id        Int      @id @default(autoincrement())
-  /// TOPUP_CANCEL | SUB_ORDER_REFUND | REFUND_PAYMENT | REFUND_YIPAY_CONFIRM | REFUND_INVOICE | REFUND_INVOICE_RESOLVE | REFUND_GATEWAY_CONFIRM | REFUND_RETRY | REFUND_ABORT | REFUND_SIGNATURE_PREVIEW | REFUND_SIGNATURE | REFUND_COMPLETE | ALLOWANCE_PRINT | ALLOWANCE_EXPORT
+  /// TOPUP_CANCEL | SUB_ORDER_REFUND | REFUND_PAYMENT | REFUND_YIPAY_CONFIRM | REFUND_INVOICE | REFUND_INVOICE_RESOLVE | REFUND_GATEWAY_CONFIRM | REFUND_EXPIRED_COURSE_APPROVAL | REFUND_SHORTFALL_CONFIRM | REFUND_SHORTFALL_RECOVERY | REFUND_RETRY | REFUND_ABORT | REFUND_SIGNATURE_PREVIEW | REFUND_SIGNATURE | REFUND_COMPLETE | ALLOWANCE_PRINT | ALLOWANCE_EXPORT
   action    String
   refundId  String?
   refType   String?
@@ -2175,14 +2177,19 @@ model ClassLeave {
   reason         String?
   /// PENDING | APPROVED | REJECTED
   status         String       @default("PENDING")
-  /// 是否依規定請假（false → 扣課／扣點）
+  /// 是否依規定請假（私教：上課 8 小時前；false → 計臨時請假補償金，不扣堂）
   withinPolicy   Boolean      @default(true)
   deductedSessions Int        @default(0)
   deductedPoints   Int        @default(0)
+  /// 私教合約（臨時請假補償金歸屬；退費時自應退餘額扣除）
+  ptContractId   Int?
+  /// 契約第六條第五款：課程單價 20%（不足 100 以 100 計）
+  compensationFee Int         @default(0)
   staffId        Int?
   createdAt      DateTime     @default(now())
 
   @@index([memberId, status])
+  @@index([ptContractId])
 }
 
 model MakeupSlot {

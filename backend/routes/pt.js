@@ -3,6 +3,7 @@ import express from 'express';
 import prisma from '../lib/prisma.js';
 import { verifyStaff, requirePermission } from '../middleware/jwtAuth.js';
 import { identifyMember, lookupMemberByPhone } from '../lib/memberIdentify.js';
+import { assertNoPaymentDebt } from '../lib/paymentDebt.js';
 import {
   assertCoursePlanSellable,
 } from '../lib/coursePlan.js';
@@ -27,6 +28,7 @@ import {
 import { isManagerTrainer } from '../lib/orgStructure.js';
 import { isAdminUser } from '../lib/staffAccess.js';
 import { resolveEnrollDeadline } from '../lib/groupClassRules.js';
+import { ptContractExpiresAt } from '../lib/refundRules.js';
 import {
   listSeriesForAdmin,
   getSeriesRoster,
@@ -603,6 +605,7 @@ router.post('/buy-contract', async (req, res) => {
     const result = await prisma.$transaction(async (tx) => {
       const member = await tx.member.findUnique({ where: { id: parsedMemberId } });
       if (!member) httpError('找不到此會員', 404);
+      await assertNoPaymentDebt(tx, parsedMemberId);
 
       const trainer = await tx.trainer.findUnique({
         where: { id: parsedTrainerId },
@@ -662,6 +665,7 @@ router.post('/buy-contract', async (req, res) => {
             totalSessions: totalSessionsLine,
             usedSessions: 0,
             pricePaid: priceLine,
+            expiresAt: ptContractExpiresAt(totalSessionsLine),
             isActive: true,
             source: 'PURCHASE',
             coursePlanId: plan.id,
@@ -722,7 +726,9 @@ router.post('/buy-contract', async (req, res) => {
   } catch (error) {
     console.error(error);
     if (error.statusCode) {
-      return res.status(error.statusCode).json({ status: 'error', message: error.message });
+      return res
+        .status(error.statusCode)
+        .json({ status: 'error', ...(error.code ? { code: error.code } : {}), message: error.message });
     }
     res.status(500).json({ status: 'error', message: '合約建立失敗' });
   }

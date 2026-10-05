@@ -147,7 +147,7 @@ cd backend && npm test   # node:test；只連本機 <db>_test（自動重建）�
  * **非同步補開（防漏稅）**：一律於收款交易 commit 後才開票；任一腿失敗標記 `EInvoice.status=FAILED`，**禁止因開票失敗沖回已收款**（現金／乙禾／LinePay／PayUNi）；API 回 **`PARTIAL_INVOICE`**。佇列自動重試；櫃檯 `GET/POST /ops/invoice-jobs…/retry`（限可操作分店）、總部 `GET /hq/einvoices`＋`POST /hq/einvoices/:id/retry` 可手動補開。訂單取消時未開立之發票改 `CANCELLED`，不得再補開。
  * 部分退費折讓：**嚴禁直接作廢整筆合併發票**。必須針對特定子單據開立 ezPay 折讓單，嚴格維持發票對帳完整性；同單據全額作廢時其分張（如免稅品）一併作廢。
  * **作廢 vs 折讓判定**唯一經 `einvoiceRules.decideInvoiceActions`：全額退＋發票皆當期（同一雙月期）＋未曾折讓＋非舊制合併發票 → 作廢；否則逐張折讓（未稅＝`round(含稅/1.05)`、逐品項分攤，折讓用盡時取發票剩餘未稅／稅額精算；`allowanceTotal` 條件式預扣防超折）。開立中 409 `INVOICE_ISSUING`；未開立僅全額退可取消（`CANCELLED`），部分退 409 `INVOICE_NOT_ISSUED`。每張折讓寫 `InvoiceAllowance`＋`InvoiceAllowanceItem` 品項快照。
- * **折讓單資料**：後端**只回 JSON**（`GET /api/ops/allowances` 列表＋`columns`／`rows` 供前端匯出；`GET /api/ops/allowances/:id/print-payload` 回賣方／買方／原發票字軌日期／品項／稅額／簽名；僅 `?purpose=print` 遞增 `InvoiceAllowance.printCount`，第 2 次起印「補印」，客顯推送用 `purpose=display` 不計次；會計匯出 `POST /api/ops/allowances/export`〔必帶起訖日；`exportState=ALL|UNEXPORTED|EXPORTED`；`markExported: true` 才對首次匯出者寫 `exportedToAcctAt`〔不覆寫〕，省略或 false 只回檔可重複下載〕＋`ALLOWANCE_EXPORT` 稽核），**禁止**後端產 HTML／PDF 折讓單；A4 四聯／80mm 熱感由前端 `AllowancePrintView`（`@media print`＋`window.print()`）排版列印。**B2B 折讓須買受人簽名後退費單才結案**（主螢幕先取後端 `POST /api/ops/refunds/:id/signature-preview`〔金額／稅額由後端組、`previewToken` 10 分鐘綁退費單＋`requestId`＋內容摘要〕，經 `pos_display_bus` 之 `ALLOWANCE_SIGN_*` 事件推至客顯，顧客確認後 `SignaturePad` 親簽並於記憶體壓浮水印，以 `Blob` 傳回主機，再 `multipart/form-data` 上傳 `POST …/signature`〔`previewToken`＋`requestId`，摘要不符 409 `PREVIEW_STALE`，後端驗墨跡防空白〕；PNG 私有儲存＋SHA-256，列印時僅回短效 data URL），B2C 選簽。
+ * **折讓單資料**：後端**只回 JSON**（`GET /api/ops/allowances` 列表＋`columns`／`rows` 供前端匯出；`GET /api/ops/allowances/:id/print-payload` 回賣方／買方／原發票字軌日期／品項／稅額／簽名；僅 `?purpose=print` 遞增 `InvoiceAllowance.printCount`，第 2 次起印「補印」，客顯推送用 `purpose=display` 不計次；會計匯出 `POST /api/ops/allowances/export`〔必帶起訖日；`exportState=ALL|UNEXPORTED|EXPORTED`；`markExported: true` 才對首次匯出者寫 `exportedToAcctAt`〔不覆寫〕，省略或 false 只回檔可重複下載〕＋`ALLOWANCE_EXPORT` 稽核），**禁止**後端產 HTML／PDF 折讓單；A4 四聯／80mm 熱感由前端 `AllowancePrintView`（`@media print`＋`window.print()`）排版列印。**B2B 折讓須買受人簽名後退費單才結案**（主螢幕先取後端 `POST /api/ops/refunds/:id/signature-preview`〔金額／稅額由後端組、`previewToken` 10 分鐘綁退費單＋`requestId`＋內容摘要〕，經 `pos_display_bus` 之 `ALLOWANCE_SIGN_*` 事件推至客顯，顧客確認後 `SignaturePad` 親簽（點數 ≥25、至少 1 筆、路徑 ≥60px 且筆畫有跨度才可送出）並於記憶體鋪白底、壓斜向浮水印（僅供體育客折讓申報查驗｜他用無效｜原發票｜含稅額）與深青防偽底欄（折讓單號、原發票、含稅額、時間；後端以近黑像素計墨跡，深青底欄不計，空白仍拒；乙禾未回填 RRN／授權碼前禁止簽名、開折讓與結案；R2 上傳必須 AES256）後以原生 `Blob` 傳回。主機推送後須於 1.5 秒內收到客顯渲染完成之 `ALLOWANCE_VIEW_ACK`，逾時提示未開啟客顯並可重推（B2B 仍須客顯歸檔才結案）。再 `multipart/form-data` 上傳 `POST …/signature`〔`previewToken`＋`requestId`＋`payloadHash`＋`pointCount`＋`strokeCount`＋`pathLength`，摘要不符 409 `PREVIEW_STALE`、雜湊不符 409 `PAYLOAD_HASH_MISMATCH`〕；PNG 私有儲存＋SHA-256，列印時僅回短效 data URL，且須等簽名 `<img>` 解碼完成才 `window.print()`。客顯路由不得呼叫寫入 API、不得出現員工側欄或 ⌘K），B2C 選簽。
 
 ---
 
@@ -203,7 +203,7 @@ cd backend && npm test   # node:test；只連本機 <db>_test（自動重建）�
 
 1. **私教預約雙重防衝堂**：
    * 排課端點強制執行「教練排班衝堂」與「場地空間（`VenueStation`）衝堂」雙重交易鎖定，並須落在教練可預約時段內（`assertTrainerBookable`）。
-   * 支援線上請假規範（未依規定提前請假執行扣課）、釋出名額與候補補課機制。
+   * 支援線上請假規範（私教未於上課 8 小時前請假記臨時請假補償金、不扣堂，見消保退費章節）、釋出名額與候補補課機制。
 
 2. **教練業績獎金（工資之一部）**：
    * 底薪（薪資設定）＋私教業績階梯抽成＋授課獎金＋團課人頭獎金，併入月薪資批次；**已廢除**「固定鐘點制」與規則內底薪／扣除費率（舊 `CoachCommissionLedger` 僅留歷史，不再產生）。
@@ -214,7 +214,7 @@ cd backend && npm test   # node:test；只連本機 <db>_test（自動重建）�
    * **報名**：整期報名保留全部剩餘堂次；開課後插班金額＝整期價 × 剩餘堂數 ÷ 總堂數（後端計價）；單堂僅用整期報名剩餘空位。一報名＝一張 `GRP…` 訂單＝一張發票。管道：會員線上 `POST /api/member/group/enroll`（LINE Pay／PayUNi 刷卡，僅收 `seriesId`／`kind`／`classId`／`payMethod`／發票欄位）、臨櫃 POS 合併結帳 `groupItems`（獨立 `GROUP` 發票腿）；**禁止**錢包扣款（400 `GROUP_NO_WALLET`）、禁止自帶金額或堂數。待付款保留名額 30 分鐘，逾時由排程釋出；已付款但保留已逾時仍須入帳並補建預約（不得吞款）。
    * **額滿候補**：交易內 `FOR UPDATE` 鎖期班列；額滿 409 `SERIES_FULL` 可登記候補。有名額時依登記順序遞補、通知並限時 24 小時（不晚於下一堂開課）付款，逾時換下一位；遞補名額保留給被遞補者，後位與單堂不得插隊。
    * **請假補課**：整期學員開課前 ≥24 小時請假（`POST /api/member/group/reservations/:id/leave`，逾時 409 `LEAVE_TOO_LATE`）取得 1 次補課權，限同課程方案**其他**期班有空位之堂次，期班結束後 30 日失效；取消補課預約退回補課權。單堂不適用請假（409 `USE_DROP_IN_CANCEL`）；一般取消預約 API 擋團課（409 `USE_GROUP_LEAVE`）。
-   * **退費**（櫃檯 `DUTY+`，`POST /api/ops/group/enrollments/:id/refund` 只收 `reason`）：7 日內且未使用全額退；否則 實付 − 已使用堂數 × 單堂價 − `Math.min(未履約 × 20%, 5000)`；已使用＝已開課未取消之本報名＋已上補課＋過期補課權；單堂開課前 24 小時全額退、之後不退。退款依原付款比例拆分：零錢包退回、LINE Pay 線上退、其餘臨櫃人工退；發票作廢或折讓（**禁止**作廢合併發票），發票未開立不得部分退費（`INVOICE_NOT_ISSUED`）。
+   * **退費**（櫃檯 `DUTY+`，`POST /api/ops/group/enrollments/:id/refund` 只收 `reason`）：7 日內且未使用全額退；否則 實付 − 已使用堂數 × `floor(單堂價)` − `Math.min(未履約 × 20%, 9000)`（契約第九條第三款）；已使用＝已開課未取消之本報名＋已上補課＋過期補課權；單堂開課前 24 小時全額退、之後不退。退款依原付款比例拆分：零錢包退回、LINE Pay 線上退、其餘臨櫃人工退；發票作廢或折讓（**禁止**作廢合併發票），發票未開立不得部分退費（`INVOICE_NOT_ISSUED`）。
    * **最低開班**：報名截止仍未達最低人數，總部列表標記「待決定」；**取消期班限 ADMIN**（`POST /api/pt/group-series/:id/cancel`，必填原因）：刪除未上課堂次、取消候補、撤銷補課權，已報名者未履約部分全額退費（無手續費）。
    * 報名／遞補／取消通知經 LINE 推播，**禁止**含金額。
 
@@ -245,11 +245,19 @@ cd backend && npm test   # node:test；只連本機 <db>_test（自動重建）�
 
 ## ⚖️ 消保法定型化契約退費與贈品收回演算法
 
-1. **7 日無條件解約**：簽約 7 日內且未使用任何服務，經由 `/api/ops/contracts/:id/refund` 必須 100% 全額無息退還。
+以《體育客體適能運動中心暨健身教練服務定型化契約》（20260416 版）為準，常數與公式唯一定義於 `backend/lib/refundRules.js`（月卡 `subscriptionSettle.computeMonthlyCardRefundDetail`、團課 `groupClassRules.js`），**禁止**前端自算或回填金額。
 
-2. **法定退費計算公式**：
-   * 應退金額 = 實付總額 - (已使用服務依單堂原價計算之金額) - 法定違約手續費。
-   * 法定手續費上限嚴格鎖定為：`Math.min(未履約金額 * 0.2, 5000)`（依最新消保法規標準）。
+1. **第八條 未開始／7 日無條件解約**：契約未開始（月卡效期尚未起算），或簽約 7 日內（台灣日曆日，含第 7 日）且未使用任何服務（零進場／零上課／零臨時請假補償）→ 100% 全額無息退還、免手續費，後端自動改 `scope=FULL`。（第十八條預售 7 日目前無分店開幕日資料，未實作。）
+
+2. **第九條 自願終止公式**（所有單價、月平均一律含贈送堂數／月數為分母、**無條件捨去**）：
+   * **計時儲值**：實付 − 實際使用（已用本金＋已消耗運動金）− 手續費 **$100**（剩餘不足 $100 以剩餘為限），贈送運動金註銷。
+   * **月卡（TYK `UNLIMITED`／月卡訂閱取消）**：月平均＝`floor(實付 ÷ 總期數)`；當期已用 **<15 日以半個月、≥15 日以一個月**計；應退＝月平均 × 剩餘期數 − 手續費 **$500**（手續費上限 6000 且不超過剩餘可退）；核准請假（凍結）已延長效期，不計使用。退費前會員有任何未出場進場紀錄 409 `MEMBER_CHECKED_IN`；之後已有續購月卡者須先退最新一筆 409 `NOT_LATEST_MEMBERSHIP`。
+   * **課程（私教／團課）**：單價＝`floor(實付 ÷ 總堂數)`；應退餘額 R＝實付 − 已上堂數 × 單價 − 累計臨時請假補償；違約金＝`Math.min(round(R × 20%), 9000)`。
+   * **第六條第五款 私教臨時請假**：未於上課 **8 小時前**（`PT_LEAVE_NOTICE_HOURS`）請假，**不扣堂**；每張合約前 **2 次免收**（`PT_FREE_LATE_LEAVES`，交易內鎖合約列計次），第 3 次起記 `ClassLeave.compensationFee`＝`max(100, floor(單價 × 20%))`（綁 `ptContractId`），退費時自 R 扣除；綁合約之預約（預約即扣堂）請假一律還堂。合約效期＝堂數 × 10 日（`ptContractExpiresAt`）；**逾效期不封死退費**（消保仍依第九條退餘額）：試算回 `isContractExpired`／`contractExpiresAt` 並警示，執行限 **`DUTY+`**（403 `DUTY_APPROVAL_REQUIRED_FOR_EXPIRED_COURSE`），寫稽核 `REFUND_EXPIRED_COURSE_APPROVAL`。
+   * **課程分期解約（`COURSE_SUB`，客製化教練課服務契約）**：**只能以首期訂單**辦理子單退費（續扣單 409 `USE_COURSE_ORIGIN_ORDER`；訂閱取消與會員端不得只停扣）；應退＝R − `min(round(R × 20%), 9000)` −（契約總價 − 已繳），由**最新一期往前**分攤（各期依原付款比例拆退款腿，`RefundPayment.refOrderId`；各期發票各自經 `decideInvoiceActions` 作廢／折讓）。應退 < 0 時退 0、回 `shortfall`（應補繳）；**未確認收訖前禁止停扣與終止合約**（防呆帳）：建單必須帶 `shortfallResolution`（缺 409 `SHORTFALL_SETTLEMENT_REQUIRED`、值無效 400，於終止 PayUNi 之前檢查）且限 **`DUTY+`**（403 `DUTY_APPROVAL_REQUIRED_FOR_SHORTFALL`），寫稽核 `REFUND_SHORTFALL_CONFIRM`：`PAID_AT_POS`＝已臨櫃收訖，**必填** `shortfallNote`（POS 收款單號或收訖說明，≥2 字，缺 400 `SHORTFALL_NOTE_REQUIRED`）；`FLAG_ALERT_FOR_RECOVERY`＝未當場繳清、主管核准立案追償，**同一建單交易**只寫欠款黑名單 `PaymentBlacklist`（既有有效紀錄累加事由，稽核 `REFUND_SHORTFALL_RECOVERY`），清償後由門市 `DUTY+` 解除黑名單結案。欠款登錄（退費立案追償與手動 `POST /api/ops/payment-blacklist`）一律經 `addPaymentDebt`（有效紀錄累加事由、不覆寫），**皆不設 `isAlert`**。有效欠款黑名單**只限制新締約**：POS 合併結帳含課程（含課程分期）與 `POST /api/pt/buy-contract` 一律 409 `PAYMENT_DEBT_OUTSTANDING`（`lib/paymentDebt.js`，於收款／外部 I/O 之前檢查；已扣款之付款完成回呼不擋，避免吞款）；櫃檯會員查詢／辨認回 `paymentDebt` 供醒目警示。**禁止**因課程欠款設 `Member.isAlert`（消保不當聯結：不得以課程契約債權停止已收費之月卡／儲值入場；`isAlert` 專供總部安全封鎖）。前端必選處置方式才可送出。第八條未上課退已繳全額。PayUNi 續扣須先終止再建單（同月卡）。
+   * **私教退費**：合約有上課中之堂次 409 `COURSE_SESSION_IN_PROGRESS`；已預約未上之合約堂次於退費交易內**自動刪除並還堂**（不計已上，中止退費亦不復原），未綁合約之同教練預約僅警示。
+   * **第十四條 不可歸責**（受傷、懷孕、遷居、教練無法履約且不接受更換）：`clause=EXEMPT` 免手續費／違約金。**主管調降**：`overrideFeeAmount` 只能 0～契約上限（超過 400 `FEE_EXCEEDS_CONTRACT_LIMIT`）。兩者皆限 **`DUTY+`**（403 `DUTY_ROLE_REQUIRED_FOR_FEE_WAIVER`）；原單取消與商品退貨不得帶（400 `FEE_POLICY_NOT_APPLICABLE`）。條款與實收手續費寫入退費單 `calc` 與稽核。
+   * **折讓品名**：解約退費之折讓品項加註「解約:已用X期／已上X堂,扣手續費$Y」（ezPay 30 字截斷）。
 
 3. **運動金 (Bonus Wallet) 折抵防線**：
    * 購案附贈之運動金於退費時全數註銷。
@@ -258,8 +266,8 @@ cd backend && npm test   # node:test；只連本機 <db>_test（自動重建）�
 4. **交易取消／退費引擎（唯一出口 `backend/lib/refundService.js`，金額規則 `refundRules.js`）**：
    * 端點（`/api/ops`，員工 JWT＋**`DUTY+`**＋可操作分店，**必填 `reason`**）：
      * `POST /topups/:id/cancel`（計時儲值**原單取消**）：須 PAID 未退；會員有**計時進場未出場結算**（ACTIVE 且非月費通行之 `CheckInLog`）時禁止回收儲值（含子單 `UNUSED` 退費），409 `MEMBER_CHECKED_IN`（試算與交易內鎖會員後皆檢查）；錢包須仍完整留存入帳快照之本金＋贈送運動金，否則 409 `WALLET_INSUFFICIENT_FOR_VOID`；兩錢包一次扣回（`mutateMemberWallet` `EXACT_BUCKETS_DEDUCT`＋`WalletLedger`）→ 原路退款 → 發票作廢／折讓。缺入帳快照 409 `TOPUP_GRANT_UNKNOWN`。
-     * `POST /sub-orders/:subOrderId/refund`（`scope`＝`FULL`／`UNUSED`／`ITEMS`）：**軟拆隔離只動該子單**（SAL 銷貨退回並回補庫存、TYK／儲值依消保公式、私教依堂數）；前端只送 `quoteToken`、`scope`、`items[{orderItemId, qty}]`、`reason`，**禁止**帶金額、`payMethod` 或退款管道（400 `ILLEGAL_FIELDS`；管道一律由後端依原付款比例拆分）。團課走 `/ops/group`、月卡走訂閱取消。
-     * **報價鎖**：試算回傳 `quoteToken`（後端 HMAC、10 分鐘，綁子單＋作法＋經辦＋計畫摘要〔品項、應退／手續費／實退、錢包回收、退款管道、發票作法〕），建單**必須**帶回；後端於交易前與交易內**重算**並比對摘要，不符 409 `QUOTE_STALE`、逾時 409 `QUOTE_EXPIRED`、缺少／偽造 400 `QUOTE_TOKEN_REQUIRED`／`QUOTE_TOKEN_INVALID`。**禁止**以試算快照直接執行扣帳（狀態可能已變），一律以重算結果為準。
+     * `POST /sub-orders/:subOrderId/refund`（`scope`＝`FULL`／`UNUSED`／`ITEMS`）：**軟拆隔離只動該子單**（SAL 銷貨退回並回補庫存、TYK／儲值依消保公式、私教依堂數）；前端只送 `quoteToken`、`scope`、`items[{orderItemId, qty}]`、`reason`（DUTY+ 可加 `clause`、`overrideFeeAmount`，試算與建單須一致），**禁止**帶金額、`payMethod` 或退款管道（400 `ILLEGAL_FIELDS`；管道一律由後端依原付款比例拆分）。團課走 `/ops/group`、月卡走訂閱取消、課程分期以首期訂單走本端點。
+     * **報價鎖**：試算回傳 `quoteToken`（後端 HMAC、10 分鐘，綁子單＋作法＋經辦＋計畫摘要〔品項、應退／手續費／手續費上限／條款、錢包回收、退款管道、發票作法、將取消之預約〕），建單**必須**帶回；後端於交易前與交易內**重算**並比對摘要，不符 409 `QUOTE_STALE`、逾時 409 `QUOTE_EXPIRED`、缺少／偽造 400 `QUOTE_TOKEN_REQUIRED`／`QUOTE_TOKEN_INVALID`。**禁止**以試算快照直接執行扣帳（狀態可能已變），一律以重算結果為準。
      * 試算 `GET …/cancel-preview`、`GET …/refund-preview`；後續 `GET /refunds(/:id)`、`POST /refunds/:id/retry`、`…/payments/:paymentId/yipay-confirm`、`…/cash-fallback`、`POST /refunds/:id/invoice-resolve`、`POST /refunds/:id/abort`、`POST /refunds/:id/signature-preview`、`POST /refunds/:id/signature`（multipart）。
      * 舊端點 `POST /ops/refund`、`/ops/cancel-sale`、`/ops/cancel-pt-purchase`、`GET /ops/allowances/:allowanceNo` 回 **410**（`USE_TOPUP_CANCEL`／`USE_SUB_ORDER_REFUND`／`USE_PRINT_PAYLOAD`）。
    * **Saga（禁止在 DB 交易內打外部 API）**：交易一（`FOR UPDATE` 鎖目標＋會員、權益沖回、建 `RefundRequest`＋各 `RefundPayment`）→ 線上退款（LINE Pay／PayUNi）→ 乙禾端末退刷確認（`AWAITING_TERMINAL`，須 `rrn`＋`authCode`＋`cardLast4`）→ 發票作廢／折讓 → B2B 待簽名（`SIGNATURE_PENDING`）→ `COMPLETED`。同子單同時僅一張未結案退費單（DB partial unique）。建單端點（儲值取消、子單退費）**必須**帶 Header `Idempotency-Key`（前端每個子單選擇產生一鍵，逾時重按沿用；存 `RefundRequest.idempotencyKey` unique），同鍵重送回傳原退費單（`replayed`），鍵用於其他單據／經辦 409 `IDEMPOTENCY_KEY_REUSED`；缺鍵 400。結果不明且無 `providerRef` 之線上退款，重試與改現金必須帶 `confirmGatewayNotRefunded: true`（只在畫面上勾選無效；缺旗標 409 `RETRY_NEEDS_CHECK`，通過時寫 `REFUND_GATEWAY_CONFIRM`，含 `confirmedByStaffId` 與確認時間）。**ezPay 折讓結果不明**（逾時或 SUCCESS 但無法解析／缺折讓號）必須**保留折讓預占**，禁止直接重開；由 `DUTY+` 核對藍新後台後經 `invoice-resolve` 擇一：已開立 → `ezPayAllowanceNo` 非空才補登折讓號結案（不再呼叫 ezPay）、未開立 → 必須 `confirmEzPayNotIssued: true` 並寫稽核後才釋放預占並重開；作廢結果不明時重試前先查詢 ezPay（有 4 碼隨機碼走 `invoice_search` SearchType 0，否則 SearchType 1），遠端已作廢即只同步本地。重試（`POST /refunds/:id/retry` 與 `POST /refunds/:id/retry-gateway`）先在短交易內 `SELECT … FOR UPDATE NOWAIT` 將退費單改為 `GATEWAY_RETRYING` 再提交，外部 API 不得持鎖；第二個請求 409 `REFUND_RETRY_IN_PROGRESS`。已 `REFUNDED` 或已有 `providerRef` 之線上退款腿禁止再打金流。折讓結果不明仍禁止依 `invoice_search` 餘額自癒結案（該查詢不回折讓號）。中止（`ABORTED`，必填原因）僅限：無已完成之線上／乙禾退款、發票尚未作廢／折讓且無結果不明之 ezPay 呼叫（409 `INVOICE_RESULT_UNKNOWN`）、現金退款班次未交班、退回零錢包金額未被動用；中止時沖回退款腿並回補權益。月卡退費之 PayUNi 續期**必須先終止再建單**（失敗即中止、不動帳）；終止後建單失敗須寫稽核 `REFUND_SUBSCRIPTION_ORPHANED` 並回 409 `SUBSCRIPTION_CANCELLED_REFUND_INCOMPLETE` 要求重新試算。折讓簽名影像已上傳但未歸檔即失敗者，必須刪除該檔（不留無 DB 指向之個資）。

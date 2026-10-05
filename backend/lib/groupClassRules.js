@@ -9,8 +9,9 @@ export const LEAVE_MIN_HOURS = 24;
 export const DROP_IN_REFUND_HOURS = 24;
 /** 消保 7 日猶豫期（未使用任何服務全額退） */
 export const COOLING_OFF_DAYS = 7;
+/** 契約第九條第三款：違約金＝應退餘額 20%，上限 9,000 */
 export const REFUND_FEE_RATE = 0.2;
-export const REFUND_FEE_CAP = 5000;
+export const REFUND_FEE_CAP = 9000;
 /** 補課權有效期：原期班結束後 N 日 */
 export const MAKEUP_VALID_DAYS_AFTER_END = 30;
 /** 待付款保留名額（臨櫃／線上） */
@@ -131,7 +132,7 @@ export function resolveEnrollDeadline({ startDate, enrollDeadline }) {
 /**
  * 退費試算（消保法定型化契約）
  * - 期班遭取消：未履約部分全額退、無手續費
- * - 整期：7 日內且未使用 → 全額；否則 應退＝實付 − 已使用堂數×單堂價 − min(未履約×20%, 5000)
+ * - 整期：7 日內且未使用 → 全額；否則 應退＝實付 − 已使用堂數×floor(單堂價) − min(未履約×20%, 9000)
  * - 單堂：開課前 ≥24h 全額退；逾時或已開課不退
  */
 export function computeGroupRefund({
@@ -165,7 +166,7 @@ export function computeGroupRefund({
   }
 
   const consumed = Math.max(0, Number(consumedSessions) || 0);
-  const consumedValue = Math.min(paid, roundNtd(consumed * (Number(unitPrice) || 0)));
+  const consumedValue = Math.min(paid, consumed * Math.floor(Number(unitPrice) || 0));
   const unfulfilled = Math.max(0, paid - consumedValue);
 
   if (seriesCancelled) {

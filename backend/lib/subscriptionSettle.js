@@ -17,6 +17,7 @@ import {
   reevaluateCheckoutSessionStatus,
 } from './ezpayReverse.js';
 import { issuedInvoiceFor } from './einvoice.js';
+import { resolveAppliedFee } from './refundRules.js';
 
 /**
  * 效期政策：
@@ -26,12 +27,10 @@ import { issuedInvoiceFor } from './einvoice.js';
  */
 export const EXPIRE_POLICIES = ['KEEP', 'CUT_UNUSED', 'CUT_NO_ALLOWANCE'];
 
-/** 30 日月卡／訂閱終止退費手續費（新台幣） */
+/** 契約第九條第二款：月卡終止手續費（新台幣）；手續費加計違約金上限 6,000 */
 export const MONTHLY_CARD_REFUND_FEE = 500;
-/**
- * 本期已使用天數門檻：未滿十五日可退；滿／逾十五日以一期計、無法退費
- * （不以每 15 日為半期）
- */
+export const MONTHLY_CARD_FEE_CAP = 6000;
+/** 當期已使用未滿十五日以半個月計；滿十五日以一個月計 */
 export const MONTHLY_CARD_MID_PERIOD_DAYS = 15;
 
 function roundMoney(n) {
@@ -75,24 +74,15 @@ export async function findLatestPaidOrderForSubscription(sub) {
 }
 
 /**
- * 30 日月卡／訂閱制終止契約退費基準：
- * - 30 日為一期；不每 15 日以半期計，逾 15 日以一期計
- * - 未滿十五日：退費 =（已繳金額）×（契約存續比例）− 手續費 $500
- * - 逾／滿十五日：以一個月計，無法辦理退費
- * 契約存續比例 = min(剩餘天數, 契約總天數) / 契約總天數
+ * 月卡／訂閱終止退費（契約第九條第二款、第十條）：
+ * - 每期 periodDays（預設 30 日）；總期數＝契約總天數 ÷ 每期天數（契約總天數含贈送會籍期間）
+ * - 單月均價＝floor(已收金額 ÷ 總期數)
+ * - 已用期數＝已走完整期數＋當期（未滿 15 日計 0.5 期；滿 15 日計 1 期）
+ * - 應退餘額＝round(單月均價 × 剩餘期數)；手續費 $500（上限 6,000，且不超過應退餘額）
+ * 已用天數至少 1 日（已生效）；始期未屆至／7 日內未使用之全額退由呼叫端判定
  * （訂閱每期請款：契約總天數＝本期天數；一次付清多期：契約總天數＝durationDays）
  *
- * @returns {{
- *   amount: number,
- *   usedDays: number,
- *   unusedInPeriod: number,
- *   periodDays: number,
- *   contractDays: number,
- *   ratio: number,
- *   fee: number,
- *   eligible: boolean,
- *   note: string,
- * }}
+ * @param {{ feePolicy?: { clause?: string, overrideFeeAmount?: number|null } }} opts
  */
 export function computeMonthlyCardRefundDetail({
   orderAmount,
@@ -100,73 +90,56 @@ export function computeMonthlyCardRefundDetail({
   periodDays,
   contractDays,
   fee = MONTHLY_CARD_REFUND_FEE,
+  feePolicy,
 }) {
   const paid = roundMoney(orderAmount);
   const period = Math.max(1, Number(periodDays) || 30);
   const contract = Math.max(period, Number(contractDays) || period);
   const unused = Math.max(0, Number(unusedDays) || 0);
   const unusedCapped = Math.min(unused, contract);
-  const usedTotal = Math.max(0, contract - unusedCapped);
-  const usedDays = usedTotal % period; // 本期已使用天數（0～period-1；恰滿整期時為 0）
-  const refundFee = Math.max(0, Number(fee) || 0);
-
-  if (paid <= 0) {
-    return {
-      amount: 0,
-      usedDays,
-      unusedInPeriod: Math.min(unusedCapped, period),
-      periodDays: period,
-      contractDays: contract,
-      ratio: 0,
-      fee: refundFee,
-      eligible: false,
-      note: '訂單金額無效',
-    };
-  }
-  if (unusedCapped <= 0) {
-    return {
-      amount: 0,
-      usedDays: period,
-      unusedInPeriod: 0,
-      periodDays: period,
-      contractDays: contract,
-      ratio: 0,
-      fee: refundFee,
-      eligible: false,
-      note: '未使用天數為 0，無可退費',
-    };
-  }
-  // 滿／逾十五日：本期以一期計，無法辦理退費
-  if (usedDays >= MONTHLY_CARD_MID_PERIOD_DAYS) {
-    return {
-      amount: 0,
-      usedDays,
-      unusedInPeriod: period - usedDays,
-      periodDays: period,
-      contractDays: contract,
-      ratio: 0,
-      fee: refundFee,
-      eligible: false,
-      note: `本期已使用 ${usedDays} 日（≥${MONTHLY_CARD_MID_PERIOD_DAYS} 日），以一期計，無法辦理退費`,
-    };
-  }
-
-  const ratio = unusedCapped / contract;
-  const gross = roundMoney(paid * ratio);
-  const amount = Math.max(0, roundMoney(gross - refundFee));
-  return {
-    amount,
+  const usedTotal = Math.max(1, contract - unusedCapped);
+  const totalPeriods = Math.max(1, Math.round(contract / period));
+  const fullPeriods = Math.floor((usedTotal - 1) / period);
+  const usedDays = ((usedTotal - 1) % period) + 1; // 當期已使用天數 1～period
+  const consumedPeriods = Math.min(totalPeriods, fullPeriods + (usedDays < MONTHLY_CARD_MID_PERIOD_DAYS ? 0.5 : 1));
+  const remainingPeriods = Math.max(0, totalPeriods - consumedPeriods);
+  const monthlyAvg = Math.floor(paid / totalPeriods);
+  const base = Math.round(monthlyAvg * remainingPeriods);
+  const feeMax = Math.min(Math.max(0, Number(fee) || 0), MONTHLY_CARD_FEE_CAP, base);
+  const refundFee = resolveAppliedFee(feeMax, feePolicy);
+  const amount = Math.max(0, base - refundFee);
+  const common = {
     usedDays,
     unusedInPeriod: period - usedDays,
     periodDays: period,
     contractDays: contract,
-    ratio: Math.round(ratio * 10000) / 10000,
+    totalPeriods,
+    consumedPeriods,
+    remainingPeriods,
+    monthlyAvg,
+    base,
+    ratio: Math.round((remainingPeriods / totalPeriods) * 10000) / 10000,
+    feeMax,
     fee: refundFee,
+  };
+
+  if (paid <= 0) return { ...common, amount: 0, eligible: false, note: '訂單金額無效' };
+  if (remainingPeriods <= 0) {
+    return {
+      ...common,
+      amount: 0,
+      eligible: false,
+      note: `當期已使用 ${usedDays} 日（滿 ${MONTHLY_CARD_MID_PERIOD_DAYS} 日以一個月計），無剩餘期數可退`,
+    };
+  }
+  const cycle = usedDays < MONTHLY_CARD_MID_PERIOD_DAYS ? '未滿十五日以半個月計' : '滿十五日以一個月計';
+  return {
+    ...common,
+    amount,
     eligible: amount > 0,
     note:
-      amount > 0
-        ? `未滿十五日：$${paid} × ${(ratio * 100).toFixed(1)}% − 手續費$${refundFee} = $${amount}`
-        : `折讓計算後 ≤ 0（$${paid} × 存續比例 − 手續費$${refundFee}）`,
+      `當期已用 ${usedDays} 日（${cycle}）：月均$${monthlyAvg} × 剩餘 ${remainingPeriods}/${totalPeriods} 期` +
+      ` − 手續費$${refundFee} = $${amount}`,
   };
 }
 
@@ -205,6 +178,12 @@ export async function settleCancelSubscription(
     },
   });
   if (!sub) throw httpError('找不到訂閱', 404);
+  // 課程分期解約金額依私教契約（含未繳期數），月卡公式不適用；僅停扣（KEEP）可走此處
+  if (sub.coursePlanId && policy !== 'KEEP') {
+    const err = httpError(`課程分期解約請以首期訂單 ${sub.originOrderId || ''} 辦理子單退費`.trim(), 409);
+    err.code = 'USE_SUB_ORDER_REFUND';
+    throw err;
+  }
 
   // 訂閱已停（例如報表先按「取消沖回 KEEP」）但訂單仍 PAID：允許接續截斷效期／退費折讓
   if (sub.status === 'CANCELLED' || sub.status === 'COMPLETED') {

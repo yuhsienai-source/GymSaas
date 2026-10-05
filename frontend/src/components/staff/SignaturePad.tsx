@@ -1,10 +1,17 @@
 import { useEffect, useImperativeHandle, useRef, type Ref } from 'react';
 import { Button } from '../ui';
 
-/** 呼叫端取記憶體 Canvas（壓浮水印、toBlob）與筆跡點數（防空白送出） */
+export type SignatureInkSpan = { width: number; height: number };
+
+/** 呼叫端取記憶體 Canvas（壓浮水印、toBlob）、筆跡點數與外接框（防空白／單點送出） */
 export type SignaturePadHandle = {
   getCanvas: () => HTMLCanvasElement | null;
   pointCount: () => number;
+  strokeCount: () => number;
+  /** 筆跡路徑總長，CSS px */
+  pathLength: () => number;
+  /** 尚無筆跡時 null；寬高為 CSS px */
+  inkSpan: () => SignatureInkSpan | null;
   clear: () => void;
 };
 
@@ -25,6 +32,10 @@ export default function SignaturePad({ onChange, onStrokeChange, padRef, disable
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const drawing = useRef(false);
   const points = useRef(0);
+  const strokes = useRef(0);
+  const pathLen = useRef(0);
+  const lastPt = useRef<{ x: number; y: number } | null>(null);
+  const box = useRef<{ minX: number; minY: number; maxX: number; maxY: number } | null>(null);
   const onChangeRef = useRef(onChange);
   const onStrokeRef = useRef(onStrokeChange);
   const ready = useRef(false);
@@ -62,6 +73,19 @@ export default function SignaturePad({ onChange, onStrokeChange, padRef, disable
     return { x: e.clientX - rect.left, y: e.clientY - rect.top };
   }
 
+  function track(p: { x: number; y: number }) {
+    const b = box.current;
+    if (!b) box.current = { minX: p.x, minY: p.y, maxX: p.x, maxY: p.y };
+    else {
+      b.minX = Math.min(b.minX, p.x);
+      b.minY = Math.min(b.minY, p.y);
+      b.maxX = Math.max(b.maxX, p.x);
+      b.maxY = Math.max(b.maxY, p.y);
+    }
+    if (lastPt.current) pathLen.current += Math.hypot(p.x - lastPt.current.x, p.y - lastPt.current.y);
+    lastPt.current = p;
+  }
+
   function emit() {
     onStrokeRef.current?.(points.current);
     const canvas = canvasRef.current;
@@ -90,6 +114,10 @@ export default function SignaturePad({ onChange, onStrokeChange, padRef, disable
     ctx.fillStyle = '#fff';
     ctx.fillRect(0, 0, rect.width, height);
     points.current = 0;
+    strokes.current = 0;
+    pathLen.current = 0;
+    lastPt.current = null;
+    box.current = null;
     onStrokeRef.current?.(0);
     onChangeRef.current?.(null);
   }
@@ -99,6 +127,13 @@ export default function SignaturePad({ onChange, onStrokeChange, padRef, disable
     () => ({
       getCanvas: () => canvasRef.current,
       pointCount: () => points.current,
+      strokeCount: () => strokes.current,
+      pathLength: () => pathLen.current,
+      inkSpan: () => {
+        const b = box.current;
+        if (!b) return null;
+        return { width: b.maxX - b.minX, height: b.maxY - b.minY };
+      },
       clear: clearCanvas,
     }),
     // eslint-disable-next-line react-hooks/exhaustive-deps -- clearCanvas 只讀 ref 與 height
@@ -128,8 +163,11 @@ export default function SignaturePad({ onChange, onStrokeChange, padRef, disable
           const ctx = canvasRef.current?.getContext('2d');
           if (!ctx) return;
           const p = pos(e);
+          lastPt.current = null;
+          strokes.current += 1;
           ctx.beginPath();
           ctx.moveTo(p.x, p.y);
+          track(p);
           points.current += 1;
           (e.target as HTMLCanvasElement).setPointerCapture(e.pointerId);
         }}
@@ -141,6 +179,7 @@ export default function SignaturePad({ onChange, onStrokeChange, padRef, disable
           const p = pos(e);
           ctx.lineTo(p.x, p.y);
           ctx.stroke();
+          track(p);
           points.current += 1;
         }}
         onPointerUp={(e) => {

@@ -10,8 +10,10 @@ import {
   opsRefundLookup,
   previewSubOrderRefund,
   previewTopupCancel,
+  type ShortfallResolution,
   type SubOrderRefundItem,
 } from '../../lib/api';
+import { DISPLAY_PROBE_BLOCKED, probeCustomerDisplay } from '../../lib/customerDisplayProbe';
 import { describeRefundError, type RefundErrorInfo } from '../../lib/refundErrors';
 import {
   INVOICE_ACTION_LABEL,
@@ -27,7 +29,9 @@ import type {
   RefundPreview,
   RefundRecord,
   RefundScope,
+  RefundTerminationClause,
 } from '../../types/api';
+import { useStaffAuth } from '../../contexts/StaffAuthContext';
 
 function money(n: number) {
   return `$${Math.round(Number(n) || 0).toLocaleString('zh-TW')}`;
@@ -46,16 +50,102 @@ function scopeOptions(kind: RefundLookupSubOrder['kind']): { value: RefundScope;
   if (kind === 'SALE') return [{ value: 'FULL', label: '全部未退品項' }, { value: 'ITEMS', label: '勾選品項／退貨數量' }];
   if (kind === 'MEMBERSHIP')
     return [
-      { value: 'FULL', label: '7 日內未使用全額退（效期回扣）' },
-      { value: 'UNUSED', label: '未使用部分退費（消保公式，截斷效期）' },
+      { value: 'FULL', label: '契約第八條：未開始／7 日內未使用全額退' },
+      { value: 'UNUSED', label: '契約第九條：未履約退費（半月制、扣手續費，截斷效期）' },
     ];
   if (kind === 'PT')
     return [
-      { value: 'FULL', label: '未上課全額退' },
-      { value: 'UNUSED', label: '未上堂數退費（扣已上堂數與手續費）' },
+      { value: 'FULL', label: '契約第八條：未上課全額退' },
+      { value: 'UNUSED', label: '契約第九條：未上堂數退費（扣已上堂數、臨時請假補償與違約金）' },
     ];
-  if (kind === 'TOPUP') return [{ value: 'UNUSED', label: '未使用退費（消保公式）' }];
+  if (kind === 'COURSE_SUB')
+    return [
+      { value: 'UNUSED', label: '契約第九條：分期解約（扣已上堂數、違約金與未繳期數，終止續扣）' },
+      { value: 'FULL', label: '契約第八條：未上課，退已繳全額' },
+    ];
+  if (kind === 'TOPUP') return [{ value: 'UNUSED', label: '契約第九條：未使用退費（扣實際使用與手續費）' }];
   return [];
+}
+
+/** 可套用契約條款／手續費調降之子單類型（後端另擋 SALE／原單取消） */
+const FEE_POLICY_KINDS: RefundLookupSubOrder['kind'][] = ['MEMBERSHIP', 'PT', 'COURSE_SUB', 'TOPUP'];
+
+const CLAUSE_OPTIONS: { value: RefundTerminationClause; label: string }[] = [
+  { value: 'VOLUNTARY', label: '第九條 自願終止（依契約收手續費）' },
+  { value: 'EXEMPT', label: '第十四條 不可歸責（受傷／懷孕／遷居／教練無法履約）免手續費' },
+];
+
+/** 後端逾效期／應補繳提示已以紅色警示框呈現，一般提示列表略過 */
+const CONTRACT_ALERT_PREFIXES = ['本課程已逾契約效期', '學員上課進度超前'];
+
+const SHORTFALL_RESOLUTION_LABEL: Record<ShortfallResolution, string> = {
+  PAID_AT_POS: '已臨櫃收訖',
+  FLAG_ALERT_FOR_RECOVERY: '立案追償（列欠款黑名單）',
+};
+
+function twDate(iso: string | null): string {
+  if (!iso) return '—';
+  return new Date(iso).toLocaleDateString('sv-SE', { timeZone: 'Asia/Taipei' });
+}
+
+function num(v: unknown): number | null {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** 已使用量文字：只讀後端 calc，不在前端重算 */
+function usageLabel(preview: RefundPreview): string | null {
+  const c = preview.calc as Record<string, unknown>;
+  if (preview.orderKind === 'MEMBERSHIP') {
+    const d = (c.detail || null) as Record<string, unknown> | null;
+    if (!d) return null;
+    return `已用 ${d.consumedPeriods}/${d.totalPeriods} 期（本期第 ${d.usedDays} 日，未滿 15 日以半個月計）`;
+  }
+  if (preview.orderKind === 'PT') {
+    const released = num(c.releasedSessions) ?? 0;
+    return `已上 ${c.used}/${c.totalSessions} 堂${released > 0 ? `（另釋出未來預約 ${released} 堂）` : ''}`;
+  }
+  if (preview.orderKind === 'TOPUP') {
+    const used = num(c.usedAmount);
+    return used == null ? null : `實際使用 ${money(used)}`;
+  }
+  return null;
+}
+
+function BreakdownTable({ preview, contractTotal }: { preview: RefundPreview; contractTotal: number }) {
+  const c = preview.calc as Record<string, unknown>;
+  const lateFees = num(c.lateLeaveFees) ?? 0;
+  const lateCount = num(c.lateLeaveCount) ?? 0;
+  const usage = usageLabel(preview);
+  const rows: [string, string, boolean?][] = [
+    ['原合約總價', money(contractTotal)],
+    ...(usage ? ([['已使用', usage]] as [string, string][]) : []),
+    [
+      lateFees > 0 ? '已使用折算額（含臨時請假補償）' : '已使用折算額',
+      preview.consumedValue > 0 ? `− ${money(preview.consumedValue)}` : money(0),
+    ],
+    ...(lateFees > 0
+      ? ([[`臨時請假補償（${lateCount} 次，未於 8 小時前請假）`, `− ${money(lateFees)}`]] as [string, string][])
+      : []),
+    ['契約手續費上限', money(preview.feeMax)],
+    ['實收手續費', preview.feeAmount > 0 ? `− ${money(preview.feeAmount)}` : money(0)],
+    ['應退金額', money(preview.grossAmount)],
+    ['實退金額', money(preview.payoutAmount), true],
+  ];
+  return (
+    <div className="table-wrap">
+      <table className="data-table">
+        <tbody>
+          {rows.map(([k, v, strong]) => (
+            <tr key={k}>
+              <th style={{ textAlign: 'left', fontWeight: 500 }}>{k}</th>
+              <td style={{ textAlign: 'right', ...(strong ? { color: 'var(--brand, #083D4F)', fontWeight: 700 } : {}) }}>{v}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
 }
 
 function InvoiceChips({ invoices }: { invoices?: RefundLookupInvoice[] }) {
@@ -100,6 +190,10 @@ export default function RefundDialog({
   onDone?: (r: RefundRecord) => void;
 }) {
   const { toast } = useToast();
+  const { canAccessTx } = useStaffAuth();
+  const [clause, setClause] = useState<RefundTerminationClause>('VOLUNTARY');
+  /** 空字串＝依契約上限；調降值只送後端驗證，不在前端算實退 */
+  const [feeInput, setFeeInput] = useState('');
   const [lookup, setLookup] = useState<RefundLookupResult | null>(null);
   const [lookupError, setLookupError] = useState<RefundErrorInfo | null>(null);
   const [choice, setChoice] = useState<Choice | null>(null);
@@ -112,6 +206,9 @@ export default function RefundDialog({
   const [buyerEmail, setBuyerEmail] = useState('');
   const [record, setRecord] = useState<RefundRecord | null>(null);
   const [busy, setBusy] = useState(false);
+  /** 應補繳處置（綁定選擇當下金額；試算金額變動即失效） */
+  const [shortfallChoice, setShortfallChoice] = useState<{ amount: number; resolution: ShortfallResolution } | null>(null);
+  const [shortfallNote, setShortfallNote] = useState('');
   const refundInFlightRef = useRef(false);
   const idempotencyKeyRef = useRef(newRefundIdempotencyKey());
 
@@ -119,10 +216,14 @@ export default function RefundDialog({
     idempotencyKeyRef.current = newRefundIdempotencyKey();
     setChoice({ sub, action });
     setScope(action === 'TOPUP_CANCEL' ? 'FULL' : scopeOptions(sub.kind)[0]?.value || 'FULL');
+    setClause('VOLUNTARY');
+    setFeeInput('');
     setQty({});
     setPreview(null);
     setPreviewError(null);
     setExecError(null);
+    setShortfallChoice(null);
+    setShortfallNote('');
   }, []);
 
   useEffect(() => {
@@ -161,23 +262,41 @@ export default function RefundDialog({
     [qty],
   );
   const needItems = choice?.action === 'SUB_ORDER_REFUND' && scope === 'ITEMS' && !items.length;
-  const inputKey = choice ? JSON.stringify([choice.sub.id, choice.action, scope, scope === 'ITEMS' ? items : null]) : '';
+  const feePolicyEnabled =
+    canAccessTx && choice?.action === 'SUB_ORDER_REFUND' && FEE_POLICY_KINDS.includes(choice.sub.kind);
+  const policyClause: RefundTerminationClause = feePolicyEnabled ? clause : 'VOLUNTARY';
+  const feeTrim = feeInput.trim();
+  const feeInvalid = feePolicyEnabled && clause === 'VOLUNTARY' && feeTrim !== '' && !/^\d+$/.test(feeTrim);
+  const overrideFeeAmount =
+    feePolicyEnabled && clause === 'VOLUNTARY' && feeTrim !== '' && !feeInvalid ? Number(feeTrim) : null;
+  const inputKey = choice
+    ? JSON.stringify([choice.sub.id, choice.action, scope, scope === 'ITEMS' ? items : null, policyClause, overrideFeeAmount])
+    : '';
   const [previewKey, setPreviewKey] = useState('');
   const previewCurrent = Boolean(preview) && previewKey === inputKey;
+  const shortfall = preview?.shortfall ?? 0;
+  const shortfallResolution = shortfall > 0 && shortfallChoice?.amount === shortfall ? shortfallChoice.resolution : null;
+  const shortfallBlocked =
+    shortfall > 0 && (!shortfallResolution || (shortfallResolution === 'PAID_AT_POS' && shortfallNote.trim().length < 2));
 
   const runPreview = useCallback(async () => {
     if (!choice) return;
-    if (choice.action === 'SUB_ORDER_REFUND' && scope === 'ITEMS' && !items.length) {
+    if ((choice.action === 'SUB_ORDER_REFUND' && scope === 'ITEMS' && !items.length) || feeInvalid) {
       setPreview(null);
       setPreviewError(null);
       return;
     }
-    const key = JSON.stringify([choice.sub.id, choice.action, scope, scope === 'ITEMS' ? items : null]);
+    const key = JSON.stringify([choice.sub.id, choice.action, scope, scope === 'ITEMS' ? items : null, policyClause, overrideFeeAmount]);
     try {
       const res =
         choice.action === 'TOPUP_CANCEL'
           ? await previewTopupCancel(choice.sub.id)
-          : await previewSubOrderRefund(choice.sub.id, { scope, items: scope === 'ITEMS' ? items : undefined });
+          : await previewSubOrderRefund(choice.sub.id, {
+              scope,
+              items: scope === 'ITEMS' ? items : undefined,
+              clause: policyClause,
+              overrideFeeAmount,
+            });
       setPreview(res.data || null);
       setPreviewKey(key);
       setPreviewError(null);
@@ -185,7 +304,7 @@ export default function RefundDialog({
       setPreview(null);
       setPreviewError(describeRefundError(err, '試算失敗'));
     }
-  }, [choice, scope, items]);
+  }, [choice, scope, items, policyClause, overrideFeeAmount, feeInvalid]);
 
   useEffect(() => {
     if (!choice || record) return;
@@ -194,20 +313,37 @@ export default function RefundDialog({
   }, [choice, record, runPreview]);
 
   async function execute() {
-    if (!choice || !preview || !previewCurrent || refundInFlightRef.current) return;
+    if (!choice || !preview || !previewCurrent || refundInFlightRef.current || shortfallBlocked) return;
     if (!reason.trim()) {
       setExecError({ title: '請填寫退費原因', message: '', tone: 'warning' });
       return;
     }
-    const ok = window.confirm(
-      `確定對 ${choice.sub.id} ${choice.action === 'TOPUP_CANCEL' ? '原單取消' : '退費'}？\n實退 ${money(preview.payoutAmount)}（應退 ${money(preview.grossAmount)}）\n發票：${
-        INVOICE_ACTION_LABEL[preview.invoicePlan.action] || preview.invoicePlan.action
-      }`,
-    );
-    if (!ok) return;
     refundInFlightRef.current = true;
     setBusy(true);
     setExecError(null);
+    if (preview.signatureRequired) {
+      const displayReady = await probeCustomerDisplay();
+      if (!displayReady) {
+        refundInFlightRef.current = false;
+        setBusy(false);
+        setExecError(DISPLAY_PROBE_BLOCKED);
+        return;
+      }
+    }
+    const ok = window.confirm(
+      `確定對 ${choice.sub.id} ${choice.action === 'TOPUP_CANCEL' ? '原單取消' : '退費'}？\n實退 ${money(preview.payoutAmount)}（應退 ${money(preview.grossAmount)}${
+        preview.feeAmount > 0 ? `，手續費 ${money(preview.feeAmount)}` : ''
+      }${preview.clause === 'EXEMPT' ? '，第十四條免手續費' : ''}）\n發票：${
+        INVOICE_ACTION_LABEL[preview.invoicePlan.action] || preview.invoicePlan.action
+      }${preview.signatureRequired ? '\n開立折讓後須買受人當場於客顯親簽，且開立後不可中止。' : ''}${
+        shortfallResolution ? `\n應補繳 ${money(shortfall)}：${SHORTFALL_RESOLUTION_LABEL[shortfallResolution]}` : ''
+      }`,
+    );
+    if (!ok) {
+      refundInFlightRef.current = false;
+      setBusy(false);
+      return;
+    }
     try {
       const key = idempotencyKeyRef.current;
       const res =
@@ -221,6 +357,9 @@ export default function RefundDialog({
                 items: scope === 'ITEMS' ? items : undefined,
                 reason: reason.trim(),
                 buyerEmail,
+                clause: policyClause,
+                overrideFeeAmount,
+                ...(shortfallResolution ? { shortfallResolution, shortfallNote } : {}),
               },
               key,
             );
@@ -351,8 +490,44 @@ export default function RefundDialog({
               )}
               {choice.action === 'SUB_ORDER_REFUND' && choice.sub.kind !== 'SALE' && (
                 <p className="text-sm text-muted" style={{ margin: 0 }}>
-                  金額依合約退費規則由後端試算（已使用額度、手續費上限 $5,000、贈送運動金扣抵），櫃檯不可調整。
+                  金額依定型化契約第八～十條由後端試算（儲值手續費 $100；月卡半月制、手續費 $500；課程違約金 20% 上限 $9,000；贈送運動金扣抵），櫃檯只能選條款或調降手續費，不可改金額。
                 </p>
+              )}
+              {feePolicyEnabled && (
+                <div className="btn-row" style={{ alignItems: 'flex-end', gap: 12, flexWrap: 'wrap' }}>
+                  <Field label="終止條款">
+                    <Select
+                      value={clause}
+                      disabled={busy}
+                      onChange={(e) => setClause(e.target.value as RefundTerminationClause)}
+                    >
+                      {CLAUSE_OPTIONS.map((o) => (
+                        <option key={o.value} value={o.value}>{o.label}</option>
+                      ))}
+                    </Select>
+                  </Field>
+                  {clause === 'VOLUNTARY' && (
+                    <Field
+                      label="調降手續費（選填）"
+                      hint={preview && previewCurrent ? `0 ～ ${money(preview.feeMax)}；留空依契約上限` : '留空依契約上限'}
+                    >
+                      <Input
+                        type="number"
+                        inputMode="numeric"
+                        min={0}
+                        step={1}
+                        value={feeInput}
+                        disabled={busy}
+                        onChange={(e) => setFeeInput(e.target.value)}
+                        style={{ maxWidth: 140 }}
+                      />
+                    </Field>
+                  )}
+                </div>
+              )}
+              {feeInvalid && <Alert tone="warning">手續費須為 0 以上之整數。</Alert>}
+              {feePolicyEnabled && clause === 'EXEMPT' && (
+                <Alert tone="info">第十四條免手續費須於退費原因註明事由（受傷、懷孕、遷居或教練無法履約且不接受更換），並留存證明文件。</Alert>
               )}
               {choice.action === 'SUB_ORDER_REFUND' && scope === 'ITEMS' && choice.sub.items && (
                 <div className="table-wrap">
@@ -424,6 +599,9 @@ export default function RefundDialog({
                     </span>
                   </div>
                   {preview.calc?.note ? <p className="text-sm" style={{ margin: 0 }}>{String(preview.calc.note)}</p> : null}
+                  {preview.orderKind !== 'SALE' && preview.kind !== 'TOPUP_VOID' && (
+                    <BreakdownTable preview={preview} contractTotal={choice.sub.amount} />
+                  )}
                   <ul className="text-sm" style={{ margin: 0, paddingLeft: '1.2em' }}>
                     {preview.legs.map((l) => (
                       <li key={l.method}>
@@ -446,10 +624,50 @@ export default function RefundDialog({
                         </span>
                       ))}
                   </div>
-                  {preview.signatureRequired && <Alert tone="warning">B2B 折讓須買受人於客顯簽名後才會結案。</Alert>}
-                  {preview.warnings.map((w) => (
-                    <Alert key={w} tone="info">{w}</Alert>
-                  ))}
+                  {preview.signatureRequired && (
+                    <Alert tone="warning">
+                      此單據開立折讓後須由買受人當場於客顯親簽，且開立後不可中止。請先開啟副螢幕客顯並確認顧客在場。
+                    </Alert>
+                  )}
+                  {preview.isContractExpired && (
+                    <Alert tone="error">
+                      ⚠️ 本課程已逾契約效期（單堂 10 日，到期日 {twDate(preview.contractExpiresAt)}）。依紙本契約原則不予退費，若需專案退費須由值班主管（DUTY+）核准。
+                    </Alert>
+                  )}
+                  {shortfall > 0 && (
+                    <Alert tone="error">
+                      ⚠️ 學員上課進度超前，扣除已繳分期款後尚須臨櫃補繳差額 {money(shortfall)}。須選擇處置方式，否則不會停止續扣或終止合約。
+                      {(Object.keys(SHORTFALL_RESOLUTION_LABEL) as ShortfallResolution[]).map((r) => (
+                        <label key={r} className="text-sm" style={{ display: 'block', marginTop: 8 }}>
+                          <input
+                            type="radio"
+                            name="shortfallResolution"
+                            checked={shortfallResolution === r}
+                            disabled={busy}
+                            onChange={() => setShortfallChoice({ amount: shortfall, resolution: r })}
+                          />{' '}
+                          {r === 'PAID_AT_POS'
+                            ? `已於 POS 臨櫃收訖補繳差額 ${money(shortfall)}`
+                            : `學員未當場繳清，由主管核准立案追償（列入欠款黑名單，清償後由門市解除；不影響已付費之入場）`}
+                        </label>
+                      ))}
+                      {shortfallResolution && (
+                        <Field label={shortfallResolution === 'PAID_AT_POS' ? 'POS 收款單號或收訖說明（必填）' : '追償備註（選填）'}>
+                          <Input
+                            value={shortfallNote}
+                            maxLength={200}
+                            disabled={busy}
+                            onChange={(e) => setShortfallNote(e.target.value)}
+                          />
+                        </Field>
+                      )}
+                    </Alert>
+                  )}
+                  {preview.warnings
+                    .filter((w) => !CONTRACT_ALERT_PREFIXES.some((p) => w.startsWith(p)))
+                    .map((w) => (
+                      <Alert key={w} tone="info">{w}</Alert>
+                    ))}
                 </div>
               )}
 
@@ -464,7 +682,7 @@ export default function RefundDialog({
                 <Button
                   variant="danger"
                   loading={busy}
-                  disabled={busy || !previewCurrent || !reason.trim()}
+                  disabled={busy || !previewCurrent || !reason.trim() || shortfallBlocked}
                   onClick={() => void execute()}
                 >
                   {choice.action === 'TOPUP_CANCEL' ? '確認取消' : choice.sub.kind === 'SALE' && scope === 'ITEMS' ? '送出退貨／折讓' : '確認退費'}

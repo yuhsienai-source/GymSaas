@@ -105,7 +105,7 @@ describe('報價鎖 quoteToken', () => {
     const member = await createMember({ cash: 600, bonus: 100 });
     const order = await createTimedTopupOrder({ memberId: member.id, branchId: branch.id });
     const plan = await previewSubOrderRefund(user, order.id, { scope: 'UNUSED' });
-    assert.equal(plan.payoutAmount, 480);
+    assert.equal(plan.payoutAmount, 500); // 600 − 契約第九條第一款手續費 $100
 
     await prisma.$transaction((tx) =>
       mutateMemberWallet(tx, {

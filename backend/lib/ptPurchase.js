@@ -6,6 +6,7 @@ import {
 import { assertMemberSignedCoursePlanContracts } from './memberContract.js';
 import { staffBranchLabel } from './branchLabel.js';
 import { isManagerTrainer } from './orgStructure.js';
+import { ptContractExpiresAt } from './refundRules.js';
 
 function httpError(message, statusCode = 400) {
   const err = new Error(message);
@@ -127,8 +128,14 @@ export async function fulfillPtCheckoutLines(tx, {
   const payMethod = opts.payMethod || 'CASH';
   const created = [];
 
+  let linkOrder = opts.linkOrder || null;
   for (const line of lines) {
     let orderId = null;
+    // 課程定期定額：合約連結首期訂單（退費引擎據此反查分期訂閱與各期已繳）
+    if (opts.skipOrders && linkOrder && Number(line.coursePlanId) === Number(linkOrder.coursePlanId)) {
+      orderId = linkOrder.id;
+      linkOrder = null;
+    }
     if (!opts.skipOrders) {
       orderId = generateOrderId();
       await tx.order.create({
@@ -155,6 +162,7 @@ export async function fulfillPtCheckoutLines(tx, {
         totalSessions: line.totalSessions,
         usedSessions: 0,
         pricePaid: line.lineTotal,
+        expiresAt: ptContractExpiresAt(line.totalSessions),
         isActive: true,
         source: 'PURCHASE',
         orderId,

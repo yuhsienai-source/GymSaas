@@ -5,12 +5,15 @@ import { describeRefundError, type RefundErrorInfo } from '../../../lib/refundEr
 import type { RefundRecord } from '../../../types/api';
 import {
   ALLOWANCE_BUS_TYPES,
+  MIN_SIGNATURE_PATH_PX,
+  MIN_SIGNATURE_POINTS,
+  MIN_SIGNATURE_STROKES,
   type AllowanceSignCompleteMsg,
   type AllowanceSignPreview,
 } from '../../../types/posDisplayBus';
 
-/** 推送後等客顯 ALLOWANCE_VIEW_ACK；逾時視為客顯未開啟 */
-export const DISPLAY_ACK_TIMEOUT_MS = 3000;
+/** 推送後等客顯 ALLOWANCE_VIEW_ACK（渲染後才回）；逾時視為客顯未開啟 */
+export const DISPLAY_ACK_TIMEOUT_MS = 1500;
 const MAX_SIGNATURE_BYTES = 512 * 1024;
 /** 須重新取預覽才可再簽的後端錯誤 */
 const RESTART_CODES = new Set([
@@ -37,7 +40,7 @@ export type AllowanceBusPhase =
 type Active = { refundId: string; preview: AllowanceSignPreview; acked: boolean; finalized: boolean };
 
 /**
- * 主機端折讓客顯簽署：取後端預覽 → 推 ALLOWANCE_SIGN_REQUEST → 3 秒內等 ALLOWANCE_VIEW_ACK →
+ * 主機端折讓客顯簽署：取後端預覽 → 推 ALLOWANCE_SIGN_REQUEST → 1.5 秒內等 ALLOWANCE_VIEW_ACK →
  * 收 ALLOWANCE_SIGN_COMPLETE（signatureBlob）→ 以呼叫端 refundInFlightRef 同步鎖 multipart 上傳 → 回 ALLOWANCE_SIGN_FINALIZED。
  * refundInFlightRef 須與退費單其他寫入動作共用，確保簽名歸檔與重試／中止等不會同時送出。
  */
@@ -80,8 +83,16 @@ export function usePosAllowanceBus({
         finalize(msg.requestId, true);
         return;
       }
-      if (msg.previewToken !== a.preview.previewToken) {
+      if (msg.previewToken !== a.preview.previewToken || msg.payloadHash !== a.preview.payloadHash) {
         finalize(msg.requestId, false, { restartRequired: true, message: '簽署資料不符' });
+        return;
+      }
+      if (!Number.isInteger(msg.strokePoints) || msg.strokePoints < MIN_SIGNATURE_POINTS) {
+        finalize(msg.requestId, false, { message: '簽名筆跡不足，請清除後重簽' });
+        return;
+      }
+      if (!Number.isInteger(msg.strokeCount) || msg.strokeCount < MIN_SIGNATURE_STROKES || !(msg.pathLength >= MIN_SIGNATURE_PATH_PX)) {
+        finalize(msg.requestId, false, { message: '簽名筆跡過短，請清除後重簽' });
         return;
       }
       const blob = msg.signatureBlob;
@@ -100,6 +111,10 @@ export function usePosAllowanceBus({
         const res = await submitRefundSignature(a.refundId, {
           previewToken: a.preview.previewToken,
           requestId: a.preview.requestId,
+          payloadHash: a.preview.payloadHash,
+          pointCount: msg.strokePoints,
+          strokeCount: msg.strokeCount,
+          pathLength: msg.pathLength,
           signatureBlob: blob,
         });
         a.finalized = true;

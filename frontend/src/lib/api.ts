@@ -137,6 +137,7 @@ import type {
   RefundPreview,
   RefundRecord,
   RefundScope,
+  RefundTerminationClause,
 } from '../types/api';
 import type { AllowanceSignPreview } from '../types/posDisplayBus';
 import type { StaffInfo, StaffRole } from './storage';
@@ -1253,9 +1254,24 @@ export async function executeTopupCancel(
 
 export type SubOrderRefundItem = { orderItemId: number; qty: number };
 
+export type ShortfallResolution = 'PAID_AT_POS' | 'FLAG_ALERT_FOR_RECOVERY';
+
+/** 手續費政策：僅條款與「調降後手續費」，金額上限與實退一律由後端計算 */
+export interface RefundFeePolicyInput {
+  clause?: RefundTerminationClause;
+  overrideFeeAmount?: number | null;
+}
+
+function feePolicyFields(p: RefundFeePolicyInput) {
+  return {
+    ...(p.clause && p.clause !== 'VOLUNTARY' ? { clause: p.clause } : {}),
+    ...(p.overrideFeeAmount != null ? { overrideFeeAmount: p.overrideFeeAmount } : {}),
+  };
+}
+
 export async function previewSubOrderRefund(
   subOrderId: string,
-  params: { scope?: RefundScope; items?: SubOrderRefundItem[] },
+  params: { scope?: RefundScope; items?: SubOrderRefundItem[] } & RefundFeePolicyInput,
 ) {
   const { data } = await staffApi.get<ApiResponse<RefundPreview>>(
     `/ops/sub-orders/${refundRef(subOrderId)}/refund-preview`,
@@ -1263,6 +1279,7 @@ export async function previewSubOrderRefund(
       params: {
         ...(params.scope ? { scope: params.scope } : {}),
         ...(params.items?.length ? { items: JSON.stringify(params.items) } : {}),
+        ...feePolicyFields(params),
       },
     },
   );
@@ -1271,7 +1288,16 @@ export async function previewSubOrderRefund(
 
 export async function executeSubOrderRefund(
   subOrderId: string,
-  body: { quoteToken: string; scope: RefundScope; items?: SubOrderRefundItem[]; reason: string; buyerEmail?: string },
+  body: {
+    quoteToken: string;
+    scope: RefundScope;
+    items?: SubOrderRefundItem[];
+    reason: string;
+    buyerEmail?: string;
+    /** 課程分期應補繳之處置：已臨櫃收訖（須附收款憑證）／主管核准立案追償（後端列欠款黑名單） */
+    shortfallResolution?: ShortfallResolution;
+    shortfallNote?: string;
+  } & RefundFeePolicyInput,
   idempotencyKey: string,
 ) {
   const { data } = await staffApi.post<ApiResponse<RefundRecord>>(
@@ -1282,6 +1308,9 @@ export async function executeSubOrderRefund(
       ...(body.items?.length ? { items: body.items } : {}),
       reason: body.reason,
       ...(body.buyerEmail?.trim() ? { buyerEmail: body.buyerEmail.trim() } : {}),
+      ...feePolicyFields(body),
+      ...(body.shortfallResolution ? { shortfallResolution: body.shortfallResolution } : {}),
+      ...(body.shortfallResolution && body.shortfallNote?.trim() ? { shortfallNote: body.shortfallNote.trim() } : {}),
     },
     { headers: { 'Idempotency-Key': idempotencyKey } },
   );
@@ -1369,11 +1398,15 @@ export async function fetchAllowanceSignPreview(refundId: string) {
 /** 客顯親簽歸檔：multipart（previewToken、requestId、signature＝PNG Blob），簽名不轉 Base64 */
 export async function submitRefundSignature(
   refundId: string,
-  body: { previewToken: string; requestId: string; signatureBlob: Blob },
+  body: { previewToken: string; requestId: string; payloadHash: string; pointCount: number; strokeCount: number; pathLength: number; signatureBlob: Blob },
 ) {
   const form = new FormData();
   form.append('previewToken', body.previewToken);
   form.append('requestId', body.requestId);
+  form.append('payloadHash', body.payloadHash);
+  form.append('pointCount', String(body.pointCount));
+  form.append('strokeCount', String(body.strokeCount));
+  form.append('pathLength', String(body.pathLength));
   form.append('signature', body.signatureBlob, `${body.requestId}.png`);
   // 勿手設 Content-Type，讓瀏覽器帶 multipart boundary
   const { data } = await staffApi.post<ApiResponse<RefundRecord>>(`/ops/refunds/${refundRef(refundId)}/signature`, form);

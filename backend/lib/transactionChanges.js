@@ -78,12 +78,13 @@ export async function findOrderByInvoiceNumber(invoiceNumber, statuses, db = pri
 }
 
 /** 子單可用之退費端點（前端據此導向；實際可否退仍由後端試算判定） */
-function refundActionsOf(kind, status) {
+function refundActionsOf(kind, status, itemDesc = '') {
   if (status !== 'PAID') return [];
   if (kind === 'TOPUP') return ['TOPUP_CANCEL', 'SUB_ORDER_REFUND'];
   if (['SALE', 'MEMBERSHIP', 'PT'].includes(kind)) return ['SUB_ORDER_REFUND'];
   if (kind === 'GROUP') return ['GROUP_REFUND'];
-  if (kind === 'COURSE_SUB') return ['SUBSCRIPTION_CANCEL'];
+  // 課程分期：只能以首期訂單解約（各期已繳由後端合併），續扣單不可單獨退
+  if (kind === 'COURSE_SUB') return String(itemDesc).includes('續扣') ? [] : ['SUB_ORDER_REFUND'];
   return [];
 }
 
@@ -99,7 +100,7 @@ function summarizeOrder(o) {
     itemDesc: o.itemDesc,
     checkoutSessionId: o.checkoutSessionId || null,
     createdAt: o.createdAt,
-    actions: refundActionsOf(kind, o.status),
+    actions: refundActionsOf(kind, o.status, o.itemDesc),
   };
 }
 

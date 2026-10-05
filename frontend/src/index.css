@@ -6137,6 +6137,7 @@ html.member-root body {
   display: flex;
   flex-direction: column;
   font-family: 'Noto Sans TC', 'Segoe UI', system-ui, sans-serif;
+  overscroll-behavior: none;
 }
 .cd-header {
   display: flex;
@@ -6611,7 +6612,12 @@ html.member-root body {
 
 /* ── 折讓證明單列印（AllowancePrintView；螢幕隱藏，列印時只印本區塊） ── */
 .alw-print-root {
-  display: none;
+  /* 不用 display:none，否則簽名 <img> 可能不解碼，列印時簽名欄空白 */
+  position: fixed;
+  left: -10000px;
+  top: 0;
+  visibility: hidden;
+  pointer-events: none;
 }
 
 @media print {
@@ -6624,6 +6630,10 @@ html.member-root body {
   }
   body.alw-printing .alw-print-root {
     display: block;
+    position: static;
+    left: auto;
+    visibility: visible;
+    pointer-events: auto;
     color: #111;
     background: #fff;
     font-family: 'Noto Sans TC', 'PingFang TC', 'Microsoft JhengHei', sans-serif;
@@ -6745,6 +6755,26 @@ html.member-root body {
   max-height: 16mm;
   max-width: 60mm;
   object-fit: contain;
+  -webkit-print-color-adjust: exact;
+  print-color-adjust: exact;
+}
+.alw-print-block {
+  position: fixed;
+  left: 50%;
+  top: 20vh;
+  transform: translateX(-50%);
+  visibility: visible;
+  pointer-events: auto;
+  width: min(28rem, calc(100vw - 2rem));
+  background: #fff;
+  color: #0f172a;
+  border: 1px solid #083d4f;
+  padding: 1rem 1.1rem;
+  z-index: 80;
+}
+.alw-print-block button {
+  min-height: 44px;
+  margin-top: 0.6rem;
 }
 
 .alw-print-root--thermal {

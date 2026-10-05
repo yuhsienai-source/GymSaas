@@ -13,6 +13,7 @@ import {
   resolveRecurringPeriodDays,
 } from './promotion.js';
 import { assertMemberSignedPromotionContracts } from './memberContract.js';
+import { assertNoPaymentDebt } from './paymentDebt.js';
 import { assertBranchAccess } from './staffAccess.js';
 import {
   buildCardCheckoutRequest,
@@ -206,6 +207,7 @@ export async function resolveCheckoutCart(body, req) {
   if ((hasPromo || courseDraft.length > 0 || groupDraft.length > 0) && !parsedMemberId) {
     throw httpError('購案／課程／團課必須指定會員 memberId');
   }
+  if (courseDraft.length > 0) await assertNoPaymentDebt(prisma, parsedMemberId);
 
   if (hasPromo && promotion.requiresMemberContract) {
     await assertMemberSignedPromotionContracts(parsedMemberId, promotion.id);
@@ -1135,6 +1137,10 @@ export async function fulfillCheckoutSession(checkoutId, merchantNo, cardMeta = 
             payMethod: session.payMethod || 'CARD',
             status: 'PAID',
             skipOrders: skipPtOrders,
+            linkOrder:
+              skipPtOrders && session.orderId && coursePlanForSub
+                ? { id: session.orderId, coursePlanId: coursePlanForSub.id }
+                : null,
           },
         });
       }

@@ -3,6 +3,7 @@
  * 退費快照回填（prisma db push 之後、db:constraints 之後執行；可重跑）
  *  1. Order.grantedCash／grantedBonus：計時儲值訂單自 itemDesc 當下快照（現金+X / 運動金+Y）回填
  *  2. PTContract.orderId：私教購案訂單 ↔ 合約（同會員、同方案、同金額、建立時間 ±10 秒、唯一候選才連結）
+ *     課程定期定額：首期訂單 ↔ 合約（同會員、同方案、訂單建立後 3 日內、唯一候選才連結）
  *  3. EInvoiceItem.saleItemId：銷貨發票明細依稅別分張與行序對應 SaleItem（筆數不符者略過）
  * 用法：node --env-file=.env prisma/migrateRefundSnapshots.js [--dry-run]
  */
@@ -73,6 +74,37 @@ try {
     linked += 1;
   }
   console.log(`2. 私教合約：連結 ${linked} 筆，無唯一候選 ${ambiguous} 筆（退費將回 409 PT_CONTRACT_UNLINKED，須人工處理）`);
+
+  // ── 2b. 課程定期定額合約 ↔ 首期訂單（合約於首期入帳時建立：同會員、同方案、訂單建立後 3 日內、唯一候選）
+  const { rows: subOrders } = await client.query(
+    `SELECT o.id, o."memberId", o."itemDesc", o."createdAt"
+       FROM "Order" o
+      WHERE o."itemDesc" LIKE '課程定期定額首期%'
+        AND o.status IN ('PAID', 'REFUNDED')
+        AND NOT EXISTS (SELECT 1 FROM "PTContract" c WHERE c."orderId" = o.id)`,
+  );
+  let subLinked = 0;
+  let subAmbiguous = 0;
+  for (const o of subOrders) {
+    const planMatch = String(o.itemDesc).match(/課程方案#(\d+)/);
+    if (!planMatch) {
+      subAmbiguous += 1;
+      continue;
+    }
+    const { rows: cands } = await client.query(
+      `SELECT id FROM "PTContract"
+        WHERE "orderId" IS NULL AND source = 'PURCHASE' AND "memberId" = $1 AND "coursePlanId" = $2
+          AND "createdAt" BETWEEN $3::timestamptz - interval '10 seconds' AND $3::timestamptz + interval '3 days'`,
+      [o.memberId, parseInt(planMatch[1], 10), o.createdAt],
+    );
+    if (cands.length !== 1) {
+      subAmbiguous += 1;
+      continue;
+    }
+    await client.query(`UPDATE "PTContract" SET "orderId" = $2 WHERE id = $1`, [cands[0].id, o.id]);
+    subLinked += 1;
+  }
+  console.log(`2b. 課程分期合約：連結 ${subLinked} 筆，無唯一候選 ${subAmbiguous} 筆（退費將回 409 PT_CONTRACT_UNLINKED，須人工處理）`);
 
   // ── 3. 銷貨發票明細 ↔ SaleItem ───────────────────────────────
   const { rows: invoices } = await client.query(

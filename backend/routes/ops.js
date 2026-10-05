@@ -1,6 +1,7 @@
 // routes/ops.js
 import express from 'express';
 import prisma from '../lib/prisma.js';
+import { paymentDebtByMember } from '../lib/paymentDebt.js';
 import { verifyStaff, requirePermission, requireDutyOrAbove } from '../middleware/jwtAuth.js';
 import {
   assertBranchAccess,
@@ -4368,6 +4369,7 @@ router.get('/members', async (req, res) => {
     ]);
 
     const memberIds = members.map((m) => m.id);
+    const debtByMember = await paymentDebtByMember(prisma, memberIds);
     let boardByMember = new Map();
     let planNameByMember = new Map();
     /** @type {Set<number>} */
@@ -4415,6 +4417,7 @@ router.get('/members', async (req, res) => {
               planName: planNameByMember.get(m.id) || m.plan,
             }),
         papagoFaceId: m.papagoFaceId ? '(已綁定)' : null,
+            paymentDebt: debtByMember.get(m.id) || null,
           };
           if (!lite) {
             view.contracts = boardByMember.get(m.id) || [];

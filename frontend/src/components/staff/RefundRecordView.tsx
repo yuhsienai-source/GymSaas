@@ -15,6 +15,7 @@ import {
 import { usePosDisplayHost } from '../../lib/usePosDisplayHost';
 import { useAllowancePrint } from '../../lib/useAllowancePrint';
 import { DISPLAY_ACK_TIMEOUT_MS, usePosAllowanceBus } from '../../features/pos/hooks/usePosAllowanceBus';
+import { DISPLAY_PROBE_BLOCKED, probeCustomerDisplay } from '../../lib/customerDisplayProbe';
 import { describeRefundError, type RefundErrorInfo } from '../../lib/refundErrors';
 import {
   GATEWAY_INVOICE_STEP_LABEL,
@@ -351,7 +352,15 @@ export default function RefundRecordView({
   const locked = busy || allowanceBus.phase === 'uploading';
 
   const allowances = (refund.invoiceResults || []).filter((x) => x.action === 'ALLOWANCE' && x.done && x.allowanceNo);
-  const canSign = !refund.signed && refund.status !== 'ABORTED' && allowances.length > 0;
+  const yipayAwaiting = refund.payments.some(
+    (p) =>
+      p.method === 'YIPAY'
+      && p.status !== 'FORFEITED'
+      && p.status !== 'CANCELLED'
+      && p.status !== 'REVERSED'
+      && (p.status === 'AWAITING_TERMINAL' || !p.rrn || !p.authCode),
+  );
+  const canSign = !refund.signed && refund.status !== 'ABORTED' && allowances.length > 0 && !yipayAwaiting;
   const terminal = ['COMPLETED', 'ABORTED'].includes(refund.status);
   const yipayPayment = yipayFor ? refund.payments.find((p) => p.id === yipayFor) || null : null;
   const pendingResolve = terminal ? null : refund.invoiceResolve ?? null;
@@ -360,8 +369,29 @@ export default function RefundRecordView({
   const paymentConfirmRequired = paymentNeedsGatewayConfirm(refund);
   const retryLockedByPeer = actionError?.code === 'REFUND_RETRY_IN_PROGRESS';
 
+  async function ensureBuyerAtDisplay() {
+    if (!refund.signatureRequired || refund.signed) return true;
+    if (refundInFlightRef.current) return false;
+    refundInFlightRef.current = true;
+    setBusy(true);
+    try {
+      const alive = await probeCustomerDisplay();
+      if (!alive) {
+        setActionError(DISPLAY_PROBE_BLOCKED);
+        return false;
+      }
+      return true;
+    } finally {
+      refundInFlightRef.current = false;
+      setBusy(false);
+    }
+  }
+
   async function submitRetry() {
     if (refundInFlightRef.current || (paymentNeedsGatewayConfirm(refund) && !checked)) return;
+    if (refund.signatureRequired && !refund.signed && !['SIGNATURE_PENDING', 'COMPLETED', 'ABORTED', 'AWAITING_TERMINAL'].includes(refund.status)) {
+      if (!(await ensureBuyerAtDisplay())) return;
+    }
     refundInFlightRef.current = true;
     setBusy(true);
     setActionError(null);
@@ -534,9 +564,11 @@ export default function RefundRecordView({
           busy={locked}
           onCancel={() => setYipayFor(null)}
           onSubmit={(d) =>
-            void run(() => confirmYipayRefund(refund.id, yipayPayment.id, d), '乙禾退刷確認失敗').then((ok) => {
+            void (async () => {
+              if (!(await ensureBuyerAtDisplay())) return;
+              const ok = await run(() => confirmYipayRefund(refund.id, yipayPayment.id, d), '乙禾退刷確認失敗');
               if (ok) setYipayFor(null);
-            })
+            })()
           }
         />
       )}
@@ -579,11 +611,15 @@ export default function RefundRecordView({
       )}
       {canSign && allowanceBus.phase === 'no_display' && (
         <Alert tone="error">
-          <strong>{DISPLAY_ACK_TIMEOUT_MS / 1000} 秒內未收到客顯回應，客顯可能未開啟</strong>
-          <div className="text-sm">請於同一瀏覽器開啟客顯視窗（不同瀏覽器或設定檔收不到），開啟後按「重新推送」。</div>
+          <strong>未偵測到客顯視窗回應</strong>
+          <div className="text-sm">
+            {DISPLAY_ACK_TIMEOUT_MS / 1000} 秒內未收到客顯確認。請確認副螢幕已開啟客顯頁面（須同一瀏覽器、同一設定檔），然後重新推送。
+            B2B 折讓仍須客顯親簽歸檔後才結案；可先列印折讓單供顧客核對，紙本簽名不能代替歸檔。
+          </div>
           <div className="btn-row" style={{ marginTop: 6 }}>
             <Button size="sm" variant="secondary" onClick={posDisplay.openDisplayWindow}>開啟客顯</Button>
             <Button size="sm" onClick={allowanceBus.resend}>重新推送</Button>
+            <Button size="sm" variant="ghost" onClick={allowanceBus.cancel}>撤回</Button>
           </div>
         </Alert>
       )}
@@ -644,9 +680,10 @@ export default function RefundRecordView({
           confirmLabel="改現金退款"
           danger
           onClose={() => setCashFor(null)}
-          onSubmit={(reason) =>
-            run(() => fallbackRefundToCash(refund.id, cashFor.id, { reason, confirmGatewayNotRefunded: checked }), '改臨櫃現金失敗').then(Boolean)
-          }
+          onSubmit={async (reason) => {
+            if (!(await ensureBuyerAtDisplay())) return false;
+            return run(() => fallbackRefundToCash(refund.id, cashFor.id, { reason, confirmGatewayNotRefunded: checked }), '改臨櫃現金失敗').then(Boolean);
+          }}
         >
           <p className="text-sm">
             原 {REFUND_METHOD_LABEL[cashFor.method]} 退款將標記為已改其他方式，現金自本班錢櫃支出並列入交班。須有進行中班次。

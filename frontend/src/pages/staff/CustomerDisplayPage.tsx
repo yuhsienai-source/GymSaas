@@ -100,6 +100,39 @@ export default function CustomerDisplayPage() {
     return () => window.clearInterval(t);
   }, []);
 
+  // 客顯與主機同源，鎖返回與 ⌘K，避免顧客手勢退回員工後台。本頁不呼叫任何寫入 API。
+  useEffect(() => {
+    const url = window.location.href;
+    window.history.pushState({ customerDisplay: true }, '', url);
+    const onPop = () => {
+      window.history.pushState({ customerDisplay: true }, '', url);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      const key = e.key.toLowerCase();
+      if ((e.metaKey || e.ctrlKey) && key === 'k') {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+      if (e.altKey && key === 'arrowleft') {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+      const typing = e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement;
+      if (e.key === 'Backspace' && !typing) e.preventDefault();
+    };
+    const onMenu = (e: Event) => {
+      e.preventDefault();
+    };
+    window.addEventListener('popstate', onPop);
+    window.addEventListener('keydown', onKey, true);
+    window.addEventListener('contextmenu', onMenu, true);
+    return () => {
+      window.removeEventListener('popstate', onPop);
+      window.removeEventListener('keydown', onKey, true);
+      window.removeEventListener('contextmenu', onMenu, true);
+    };
+  }, []);
+
   // 客顯 bus：BC + storage 備援＋心跳逾時
   useEffect(() => {
     const bus = createPosDisplayBus('display');
@@ -111,7 +144,11 @@ export default function CustomerDisplayPage() {
       const type = String(msg.type || '').toUpperCase();
 
       if (type === POS_DISPLAY_TYPES.PING) {
-        bus.post(POS_DISPLAY_TYPES.PONG, { role: 'display' });
+        const payload = (msg.payload || {}) as { probeId?: string };
+        bus.post(POS_DISPLAY_TYPES.PONG, {
+          role: 'display',
+          ...(typeof payload.probeId === 'string' && payload.probeId ? { probeId: payload.probeId } : {}),
+        });
         touchHost();
         return;
       }
@@ -314,7 +351,7 @@ export default function CustomerDisplayPage() {
     signPhase === 'sending' || signPhase === 'awaiting_ack' || signPhase === 'acked';
 
   return (
-    <div className={`cd-app cd-app--${mode.toLowerCase()}`}>
+    <div className={`cd-app cd-app--${mode.toLowerCase()}`} onContextMenu={(e) => e.preventDefault()}>
       <header className="cd-header">
         <div className="cd-brand">
           <BrandMark />

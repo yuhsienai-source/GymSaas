@@ -16,6 +16,7 @@ import {
   markYipayCaptureOrphan,
 } from '../lib/yipayCapture.js';
 import { isCrossBranchUser, staffBranchIds } from '../lib/staffAccess.js';
+import { addPaymentDebt } from '../lib/paymentDebt.js';
 
 const router = express.Router();
 router.use(verifyStaff, requireDutyOrAbove);
@@ -196,23 +197,19 @@ router.post('/payment-blacklist', async (req, res) => {
     if (!memberId || !reason) {
       return res.status(400).json({ status: 'error', message: '缺少 memberId 或 reason' });
     }
-    const row = await prisma.paymentBlacklist.upsert({
-      where: { memberId },
-      create: {
+    // 欠款只限制新締約，不設 isAlert（不阻斷門禁入場／已付費合約）
+    const row = await prisma.$transaction(async (tx) => {
+      const locked = await tx.$queryRaw`SELECT id FROM "Member" WHERE id = ${memberId} FOR UPDATE`;
+      if (!locked.length) return null;
+      const out = await addPaymentDebt(tx, {
         memberId,
         reason,
-        note: req.body?.note?.trim() || null,
+        note: String(req.body?.note || '').trim() || null,
         staffId: req.user?.staffId ?? req.user?.id ?? null,
-        isActive: true,
-      },
-      update: {
-        reason,
-        note: req.body?.note?.trim() || null,
-        isActive: true,
-        clearedAt: null,
-      },
+      });
+      return out.row;
     });
-    await prisma.member.update({ where: { id: memberId }, data: { isAlert: true } });
+    if (!row) return res.status(404).json({ status: 'error', message: '找不到會員' });
     return res.json({ status: 'success', data: row });
   } catch (error) {
     console.error(error);

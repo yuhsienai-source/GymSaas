@@ -6,6 +6,7 @@ import { verifyMember, verifyMemberDevice } from '../middleware/jwtAuth.js';
 import { startMemberLeave } from '../lib/memberLeave.js';
 import { storeLeaveProof, inclusiveLeaveDays } from '../lib/leaveProof.js';
 import { settleCancelSubscription } from '../lib/subscriptionSettle.js';
+import { PT_FREE_LATE_LEAVES, PT_LEAVE_NOTICE_HOURS, lateLeaveChargeFor, ptUnitPrice } from '../lib/refundRules.js';
 import {
   buildSubscriptionRebindRequest,
   toRebindStatusView,
@@ -73,7 +74,7 @@ function sendErr(res, error, fallback = '操作失敗') {
   return res.status(500).json({ status: 'error', message: fallback });
 }
 
-/** 私教請假：開課前 24 小時內視為逾期（扣課）；團課請假走 /api/member/group */
+/** 諮詢課請假：開課前 24 小時內視為逾期；私教依契約第六條第五款（PT_LEAVE_NOTICE_HOURS）；團課請假走 /api/member/group */
 const CLASS_LEAVE_POLICY_HOURS = 24;
 
 // PATCH /api/member/profile-ext
@@ -354,24 +355,41 @@ router.post('/class-leave', verifyMemberDevice, async (req, res) => {
       throw httpError('此預約狀態不可請假');
     }
 
+    const isPrivate = reservation.class.type === 'PRIVATE';
     const hoursUntil =
       (new Date(reservation.class.startAt) - Date.now()) / (3600 * 1000);
-    const withinPolicy = hoursUntil >= CLASS_LEAVE_POLICY_HOURS;
-    let deductedSessions = 0;
-    const deductedPoints = 0;
+    const policyHours = isPrivate ? PT_LEAVE_NOTICE_HOURS : CLASS_LEAVE_POLICY_HOURS;
+    const withinPolicy = hoursUntil >= policyHours;
+    let compensationFee = 0;
 
     const row = await prisma.$transaction(async (tx) => {
-      if (!withinPolicy && reservation.class.type === 'PRIVATE') {
-        const pt = await tx.pTContract.findFirst({
-          where: { memberId, isActive: true, trainerId: reservation.class.trainerId },
-          orderBy: { createdAt: 'desc' },
-        });
-        if (pt && pt.usedSessions < pt.totalSessions) {
-          await tx.pTContract.update({
-            where: { id: pt.id },
-            data: { usedSessions: pt.usedSessions + 1 },
-          });
-          deductedSessions = 1;
+      let ptContractId = null;
+      compensationFee = 0;
+      if (isPrivate) {
+        const pt = reservation.class.ptContractId
+          ? await tx.pTContract.findUnique({ where: { id: reservation.class.ptContractId } })
+          : await tx.pTContract.findFirst({
+              where: { memberId, isActive: true, trainerId: reservation.class.trainerId },
+              orderBy: { createdAt: 'desc' },
+            });
+        if (pt && pt.memberId === memberId) {
+          ptContractId = pt.id;
+          if (!withinPolicy) {
+            // 鎖合約列後計次，防並發臨時請假同時落在免收額度內
+            await tx.$queryRaw`SELECT id FROM "PTContract" WHERE id = ${pt.id} FOR UPDATE`;
+            const prior = await tx.classLeave.count({ where: { ptContractId: pt.id, withinPolicy: false } });
+            compensationFee = lateLeaveChargeFor(prior, ptUnitPrice(pt.pricePaid, pt.totalSessions));
+          }
+          // 綁合約之課堂於預約時已扣堂；請假（含臨時請假）未上課，一律還堂
+          if (reservation.class.ptContractId && !pt.refundedAt) {
+            const restored = await tx.pTContract.updateMany({
+              where: { id: pt.id, refundedAt: null, usedSessions: { gt: 0 } },
+              data: { usedSessions: { decrement: 1 } },
+            });
+            if (restored.count && !pt.isActive && (!pt.expiresAt || pt.expiresAt > new Date())) {
+              await tx.pTContract.update({ where: { id: pt.id }, data: { isActive: true } });
+            }
+          }
         }
       }
       const leave = await tx.classLeave.create({
@@ -379,10 +397,12 @@ router.post('/class-leave', verifyMemberDevice, async (req, res) => {
           memberId,
           reservationId,
           reason: req.body?.reason ? String(req.body.reason).slice(0, 200) : null,
-          status: withinPolicy ? 'APPROVED' : 'APPROVED',
+          status: 'APPROVED',
           withinPolicy,
-          deductedSessions,
-          deductedPoints,
+          deductedSessions: 0,
+          deductedPoints: 0,
+          ptContractId,
+          compensationFee,
         },
       });
 
@@ -396,7 +416,11 @@ router.post('/class-leave', verifyMemberDevice, async (req, res) => {
 
     const msg = withinPolicy
       ? '請假已核准'
-      : `請假已核准（未依規定，${deductedSessions ? `扣 ${deductedSessions} 堂` : ''}${deductedPoints ? `扣 ${deductedPoints} 點` : ''}）`.trim();
+      : compensationFee > 0
+        ? `請假已核准（臨時請假已逾每期 ${PT_FREE_LATE_LEAVES} 次免收額度，依契約記補償 $${compensationFee}，不扣堂）`
+        : isPrivate
+          ? `請假已核准（臨時請假，本期前 ${PT_FREE_LATE_LEAVES} 次免收補償，第 ${PT_FREE_LATE_LEAVES + 1} 次起收課程單價 20%）`
+          : `請假已核准（未於開課 ${policyHours} 小時前請假）`;
     res.json({ status: 'success', message: msg, data: row });
   } catch (error) {
     sendErr(res, error, '課程請假失敗');
@@ -525,6 +549,14 @@ router.post('/subscription-cancel', verifyMemberDevice, async (req, res) => {
     });
     if (!sub || sub.memberId !== memberId) {
       return res.status(404).json({ status: 'error', message: '找不到訂閱' });
+    }
+    // 課程分期停扣須同時解約結算（契約未繳期數），不得自助只停扣而續用堂數
+    if (sub.coursePlanId) {
+      return res.status(409).json({
+        status: 'error',
+        code: 'COURSE_SUB_COUNTER_ONLY',
+        message: '課程分期付款之解約須臨櫃辦理（依契約結算已上堂數與未繳期數）',
+      });
     }
 
     const mode = String(req.body?.mode || 'KEEP').toUpperCase();

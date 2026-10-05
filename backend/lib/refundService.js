@@ -16,16 +16,23 @@ import { allowanceEInvoice, releaseHeldAllowance, settleHeldAllowance, voidEInvo
 import { allocateInteger, decideInvoiceActions, normalizeTaxType } from './einvoiceRules.js';
 import {
   OPEN_REFUND_STATUSES,
+  allocateInstallmentRefund,
   assertTopupVoidable,
   canAbortRefund,
+  computeCourseInstallmentRefund,
   computePtRefund,
   computeSaleReturnLines,
   computeTimedTopupRefund,
   normalizeBreakdown,
+  hasPendingYipayTerminal,
+  normalizeOverrideFee,
+  normalizeTerminationClause,
   paymentPhaseStatus,
+  ptContractExpiresAt,
   splitRefundLegs,
   withinCoolingOff,
 } from './refundRules.js';
+import { addPaymentDebt } from './paymentDebt.js';
 import { buildCutExpireNow, isUnlimitedTopupOrder, remainingExpireDays, shiftDateByDays } from './promotion.js';
 import {
   computeMonthlyCardRefundDetail,
@@ -39,6 +46,18 @@ import { readToken, sha256Hex, signToken } from './signedToken.js';
 
 const AMBIGUOUS_TAG = '[待確認]';
 const ONLINE_METHODS = ['LINEPAY', 'PAYUNI'];
+
+const YIPAY_TERMINAL_BLOCK = '乙禾端末尚未刷退回填 RRN／授權碼，不可開立折讓或結案';
+
+async function assertYipayTerminalSettled(db, refundId) {
+  const legs = await db.refundPayment.findMany({
+    where: { refundId },
+    select: { method: true, status: true, rrn: true, authCode: true },
+  });
+  if (hasPendingYipayTerminal(legs)) throw httpError(409, 'YIPAY_TERMINAL_VOUCHER_REQUIRED', YIPAY_TERMINAL_BLOCK);
+}
+
+const twDateLabel = (iso) => new Date(new Date(iso).getTime() + 8 * 3600 * 1000).toISOString().slice(0, 10);
 
 function httpError(statusCode, code, message) {
   const err = new Error(message);
@@ -131,8 +150,9 @@ async function writeAudit(db, { action, refund = null, refType = null, refId = n
 export function classifyOrder(order) {
   const desc = String(order.itemDesc || '');
   if (String(order.id).startsWith('GRP')) return 'GROUP';
-  if (order.ptContract || desc.startsWith('私教購案')) return 'PT';
+  // 課程分期首期訂單亦連結合約，須先於 PT 判定
   if (desc.includes('課程定期定額')) return 'COURSE_SUB';
+  if (order.ptContract || desc.startsWith('私教購案')) return 'PT';
   if (isUnlimitedTopupOrder(desc)) return 'MEMBERSHIP';
   if (desc.includes('| TIMED |')) return 'TOPUP';
   return 'OTHER';
@@ -293,8 +313,36 @@ async function findLinkedSubscription(db, orderId) {
   });
 }
 
-async function computeMembership(db, target, scope, now) {
+/** 會籍退費前會員須已出場（任何計費模式）：避免退掉會籍後出場無效或逃避計時扣款 */
+async function assertNotCheckedIn(db, memberId) {
+  const active = await db.checkInLog.findFirst({
+    where: { memberId, status: 'ACTIVE', checkOutAt: null },
+    select: { id: true },
+  });
+  if (active) {
+    throw httpError(409, 'MEMBER_CHECKED_IN', '會員目前在館內（尚未刷出閘機），請待出場後再辦理會籍退費');
+  }
+}
+
+/**
+ * 月卡退費（契約第八條、第九條第二款）
+ * - 始期未屆至（排在現有效期之後）或生效 7 日內未進場 → 全額退（UNUSED 自動升為 FULL）
+ * - 其餘依半月制：月均價 × 剩餘期數 − 手續費 $500；已核准請假已延長效期，剩餘天數即扣除暫停天數
+ */
+async function computeMembership(db, target, scope, now, feePolicy) {
   const order = target.row;
+  await assertNotCheckedIn(db, order.memberId);
+  const newer = await db.order.findFirst({
+    where: {
+      memberId: order.memberId,
+      status: 'PAID',
+      createdAt: { gt: order.createdAt },
+      itemDesc: { contains: '| UNLIMITED |' },
+    },
+    select: { id: true },
+  });
+  if (newer) throw httpError(409, 'NOT_LATEST_MEMBERSHIP', `會員另有較新之會籍購案 ${newer.id}，請先辦理較新之單據`);
+
   const member = await db.member.findUnique({
     where: { id: order.memberId },
     select: { id: true, expireDate: true, plan: true, leaveUntil: true },
@@ -302,6 +350,7 @@ async function computeMembership(db, target, scope, now) {
   const sub = await findLinkedSubscription(db, order.id);
   const { periodDays, contractDays } = await resolveUnlimitedOrderPeriodDays(order);
   const grantedDays = sub ? periodDays : contractDays;
+  const unusedDays = remainingExpireDays(member?.expireDate, now);
   const calc = {
     orderKind: 'MEMBERSHIP',
     subscriptionId: sub?.id ?? null,
@@ -314,26 +363,53 @@ async function computeMembership(db, target, scope, now) {
     periodDays,
     contractDays,
     grantedDays,
+    unusedDays,
   };
-  if (scope === 'FULL') {
-    if (!withinCoolingOff(order.createdAt, now)) {
-      throw httpError(409, 'COOLING_OFF_EXPIRED', '已逾 7 日無條件解約期，請改用未履約退費（UNUSED）');
-    }
+
+  const notStarted = unusedDays > grantedDays;
+  let unusedGrace = false;
+  if (!notStarted && withinCoolingOff(order.createdAt, now)) {
     const used = await db.checkInLog.count({
       where: { memberId: order.memberId, checkInAt: { gte: order.createdAt }, status: { not: 'CANCELLED' } },
     });
-    if (used > 0) throw httpError(409, 'SERVICE_ALREADY_USED', `購案後已進場 ${used} 次，不可全額退費，請改用未履約退費`);
-    return { gross: target.amount, fee: 0, consumedValue: 0, calc: { ...calc, note: `7 日內未使用，全額退 $${target.amount}` } };
+    unusedGrace = used === 0;
+    if (scope === 'FULL' && used > 0) {
+      throw httpError(409, 'SERVICE_ALREADY_USED', `購案後已進場 ${used} 次，不可全額退費，請改用未履約退費`);
+    }
   }
+  if (notStarted || unusedGrace) {
+    const note = notStarted
+      ? `契約第八條：始期尚未屆至，全額退 $${target.amount}`
+      : `契約第八條：生效 7 日內未進場，全額退 $${target.amount}`;
+    return { full: true, gross: target.amount, fee: 0, feeMax: 0, consumedValue: 0, calc: { ...calc, note, allowanceNote: '未使用全額退' } };
+  }
+  if (scope === 'FULL') {
+    throw httpError(409, 'COOLING_OFF_EXPIRED', '已逾 7 日無條件解約期，請改用未履約退費（UNUSED）');
+  }
+
   const detail = computeMonthlyCardRefundDetail({
     orderAmount: target.amount,
-    unusedDays: remainingExpireDays(member?.expireDate, now),
+    unusedDays,
     periodDays,
-    contractDays: sub ? periodDays : contractDays,
+    contractDays: grantedDays,
+    feePolicy,
   });
   if (!detail.eligible) throw httpError(409, 'REFUND_NOT_ELIGIBLE', detail.note);
   const gross = ntd(detail.amount);
-  return { gross, fee: ntd(detail.fee), consumedValue: Math.max(0, target.amount - gross - ntd(detail.fee)), calc: { ...calc, detail, note: detail.note } };
+  const fee = ntd(detail.fee);
+  return {
+    full: false,
+    gross,
+    fee,
+    feeMax: ntd(detail.feeMax),
+    consumedValue: Math.max(0, target.amount - ntd(detail.base)),
+    calc: {
+      ...calc,
+      detail,
+      note: detail.note,
+      allowanceNote: `解約:已用${detail.consumedPeriods}/${detail.totalPeriods}期,扣手續費$${fee}`,
+    },
+  };
 }
 
 /**
@@ -350,16 +426,198 @@ async function assertNoTimedCheckIn(db, memberId) {
   }
 }
 
-async function buildPlan(db, target, { scope: scopeRaw, items, mode, now = new Date() }) {
+/** 私教：上課中禁止退費；已預約（預約時已扣堂）之未來課堂於退費交易中刪除並還堂 */
+async function loadPtBookings(db, contract, now) {
+  const live = { status: { in: ['PENDING', 'CONFIRMED'] } };
+  const inProgress = await db.class.findFirst({
+    where: { ptContractId: contract.id, startAt: { lte: now }, endAt: { gt: now }, reservations: { some: live } },
+    select: { id: true },
+  });
+  if (inProgress) {
+    throw httpError(409, 'COURSE_SESSION_IN_PROGRESS', '此私教合約目前有課程進行中，請待下課後再辦理退費');
+  }
+  const future = await db.class.findMany({
+    where: { ptContractId: contract.id, startAt: { gt: now }, reservations: { some: live } },
+    select: { id: true, startAt: true, endAt: true, venueId: true, stationId: true, trainerId: true },
+    orderBy: { startAt: 'asc' },
+  });
+  const otherFuture = await db.reservation.count({
+    where: {
+      memberId: contract.memberId,
+      ...live,
+      class: { trainerId: contract.trainerId, type: 'PRIVATE', startAt: { gt: now }, ptContractId: null },
+    },
+  });
+  const lateLeave = await db.classLeave.aggregate({
+    where: { ptContractId: contract.id, withinPolicy: false },
+    _sum: { compensationFee: true },
+    _count: { _all: true },
+  });
+  return {
+    futureClasses: future.map((c) => ({ ...c, startAt: c.startAt.toISOString(), endAt: c.endAt.toISOString() })),
+    otherFuture,
+    lateLeaveFees: lateLeave._sum.compensationFee || 0,
+    lateLeaveCount: lateLeave._count._all,
+  };
+}
+
+/** 合約之可用性檢查（私教／課程分期共用）；回傳未來預約與實際已上堂數 */
+async function loadContractForRefund(db, contract, now) {
+  if (contract.refundedAt) throw httpError(409, 'ALREADY_REFUNDED', '此私教合約已退費停用');
+  const bookings = await loadPtBookings(db, contract, now);
+  const releasedSessions = bookings.futureClasses.length;
+  // 預約排滿時合約會被標為停用；還有未來預約可釋放者仍可退
+  if (!contract.isActive && !(releasedSessions > 0 && contract.usedSessions >= contract.totalSessions)) {
+    throw httpError(409, 'ALREADY_REFUNDED', '此私教合約已停用');
+  }
+  // 逾效期不封死退費（消保仍須依第九條退餘額），由 executePlan 要求 DUTY+ 專案核准
+  const expiresAt = contract.expiresAt ? new Date(contract.expiresAt) : ptContractExpiresAt(contract.totalSessions, contract.createdAt);
+  return {
+    bookings,
+    releasedSessions,
+    usedSessions: Math.max(0, contract.usedSessions - releasedSessions),
+    expiry: { isContractExpired: now > expiresAt, contractExpiresAt: expiresAt.toISOString() },
+  };
+}
+
+function orderAsTarget(order, session) {
+  return { refType: 'ORDER', id: order.id, row: order, session, amount: ntd(order.amount), refundedAmount: order.refundedAmount || 0 };
+}
+
+/**
+ * 課程分期解約：只能以首期訂單辦理；契約公式扣未繳期數，應退由最新一期往前分攤（各期各自退款管道與發票）
+ */
+async function computeCourseInstallment(db, target, scope, now, feePolicy) {
+  const asRenewal = await db.cardSubscriptionCharge.findFirst({
+    where: { orderId: target.id },
+    select: { subscription: { select: { originOrderId: true } } },
+  });
+  if (asRenewal) {
+    throw httpError(409, 'USE_COURSE_ORIGIN_ORDER', `課程分期續扣單不可單獨退費，請以首期訂單 ${asRenewal.subscription?.originOrderId || ''} 辦理解約`.trim());
+  }
+  const sub = await db.cardSubscription.findFirst({ where: { originOrderId: target.id } });
+  const contract = target.row.ptContract || (await db.pTContract.findFirst({ where: { orderId: target.id } }));
+  if (!sub || !contract) throw httpError(409, 'PT_CONTRACT_UNLINKED', '此課程分期訂單未連結訂閱或合約，請洽總部人工處理');
+  const { bookings, releasedSessions, usedSessions, expiry } = await loadContractForRefund(db, contract, now);
+
+  const charges = await db.cardSubscriptionCharge.findMany({
+    where: { subscriptionId: sub.id, status: 'PAID', orderId: { not: null } },
+    select: { orderId: true, periodIndex: true },
+  });
+  const renewals = charges.length
+    ? await db.order.findMany({ where: { id: { in: charges.map((c) => c.orderId) }, status: 'PAID' } })
+    : [];
+  const indexOf = new Map(charges.map((c) => [c.orderId, c.periodIndex]));
+  const periods = [{ order: target.row, periodIndex: 1 }, ...renewals.map((o) => ({ order: o, periodIndex: indexOf.get(o.id) }))]
+    .sort((a, b) => b.periodIndex - a.periodIndex)
+    .map((p) => ({ ...p, refundable: ntd(p.order.amount) - (p.order.refundedAmount || 0) }));
+  const paidAmount = periods.reduce((s, p) => s + p.refundable, 0);
+
+  const r = computeCourseInstallmentRefund({
+    contractPrice: contract.pricePaid,
+    paidAmount,
+    totalSessions: contract.totalSessions,
+    usedSessions,
+    lateLeaveFees: bookings.lateLeaveFees,
+    scope,
+    coolingOff: withinCoolingOff(target.row.createdAt, now),
+    feePolicy,
+  });
+  const allocations = allocateInstallmentRefund(
+    periods.map((p) => ({ orderId: p.order.id, refundable: p.refundable, amount: ntd(p.order.amount) })),
+    r.gross,
+  );
+  return {
+    r,
+    orders: new Map(periods.map((p) => [p.order.id, p.order])),
+    calc: {
+      orderKind: 'COURSE_SUB',
+      contractId: contract.id,
+      subscriptionId: sub.id,
+      subscriptionActive: !['CANCELLED', 'COMPLETED'].includes(sub.status),
+      ...r,
+      contractUsedSessions: contract.usedSessions,
+      totalSessions: contract.totalSessions,
+      releasedSessions,
+      futureClasses: bookings.futureClasses,
+      futureBookings: bookings.otherFuture,
+      lateLeaveCount: bookings.lateLeaveCount,
+      ...expiry,
+      allocations,
+      allowanceNote: r.unusedGrace ? '未上課全額退' : `解約:已上${usedSessions}/${contract.totalSessions}堂,扣違約金$${r.fee}`,
+    },
+  };
+}
+
+/** 課程分期：各期訂單之退款腿（依該期原付款比例拆分） */
+async function installmentLegs(db, allocations, orders) {
+  const legs = [];
+  const payuniPaidByOrder = {};
+  for (const a of allocations) {
+    const order = orders.get(a.orderId);
+    const session = order.checkoutSessionId ? await db.checkoutSession.findUnique({ where: { id: order.checkoutSessionId } }) : null;
+    const t = orderAsTarget(order, session);
+    const { breakdown, merchantNos } = paymentSource(t);
+    const prior = await priorRefundedByMethod(db, t);
+    const available = Object.fromEntries(Object.entries(breakdown).map(([m, v]) => [m, v - (prior[m] || 0)]));
+    const refs = await resolveProviderRefs(db, t, merchantNos);
+    payuniPaidByOrder[order.id] = breakdown.PAYUNI ?? null;
+    for (const leg of splitRefundLegs({ breakdown, refundAmount: a.amount, available })) {
+      legs.push({ ...leg, refOrderId: order.id, refs });
+    }
+  }
+  return { legs, payuniPaidByOrder };
+}
+
+/**
+ * 課程分期：各期訂單之發票作法（作廢／折讓判定仍經 decideInvoiceActions，全額＝該期整筆退回）
+ * @returns {Promise<Array<{ inv, orderId, gross, full, shared, action }>>}
+ */
+async function installmentInvoiceJobs(db, allocations, now = new Date()) {
+  const jobs = [];
+  for (const a of allocations || []) {
+    const order = await db.order.findUnique({ where: { id: a.orderId } });
+    if (!order) continue;
+    const session = order.checkoutSessionId ? await db.checkoutSession.findUnique({ where: { id: order.checkoutSessionId } }) : null;
+    const { invoices, shared } = await loadRefInvoices(db, orderAsTarget(order, session));
+    const decided = decideInvoiceActions({ invoices, fullRefund: a.full, sharedInvoice: shared, now });
+    const issued = invoices.filter((inv) => inv.status === 'ISSUED');
+    const split = issued.length ? allocateInteger(a.amount, issued.map((inv) => inv.totalAmount)) : [];
+    for (const inv of invoices) {
+      const action = decided.perInvoice.find((p) => p.id === inv.id)?.action;
+      if (!action) continue;
+      const i = issued.indexOf(inv);
+      jobs.push({ inv, orderId: a.orderId, gross: i >= 0 ? split[i] : 0, full: a.full, shared, action });
+    }
+  }
+  return jobs;
+}
+
+function aggregateInvoiceAction(jobs) {
+  const acts = new Set(jobs.map((j) => j.action));
+  if (acts.has('ALLOWANCE')) return 'ALLOWANCE';
+  if (acts.has('VOID')) return 'VOID';
+  if (acts.has('CANCEL')) return 'CANCEL_UNISSUED';
+  return 'NONE';
+}
+
+async function buildPlan(db, target, { scope: scopeRaw, items, mode, clause = 'VOLUNTARY', overrideFeeAmount = null, now = new Date() }) {
   assertPaid(target);
   let scope = String(scopeRaw || '').toUpperCase();
   let gross;
   let fee = 0;
+  let feeMax = 0;
   let consumedValue = 0;
   let lines = null;
   let calc;
-  let fullRefund = false;
+  let fullRefund;
   let kind = 'ORDER_REFUND';
+  let installment = null;
+  const feePolicy = { clause, overrideFeeAmount };
+  const customFee = clause !== 'VOLUNTARY' || overrideFeeAmount != null;
+  if (customFee && (mode === 'TOPUP_VOID' || target.refType === 'SALE')) {
+    throw httpError(400, 'FEE_POLICY_NOT_APPLICABLE', '原單取消與商品退貨不收手續費，不可指定終止條款或調整手續費');
+  }
 
   if (mode === 'TOPUP_VOID') {
     if (target.refType !== 'ORDER' || target.kind !== 'TOPUP') {
@@ -399,8 +657,19 @@ async function buildPlan(db, target, { scope: scopeRaw, items, mode, now = new D
     switch (target.kind) {
       case 'GROUP':
         throw httpError(409, 'USE_GROUP_REFUND', '團課報名請改用團課退費（/api/ops/group/enrollments/:id/refund）');
-      case 'COURSE_SUB':
-        throw httpError(409, 'USE_SUBSCRIPTION_CANCEL', '課程定期定額請改用月卡訂閱取消結算');
+      case 'COURSE_SUB': {
+        if (!['FULL', 'UNUSED'].includes(scope)) throw httpError(400, 'SCOPE_INVALID', '課程分期解約 scope 須為 FULL 或 UNUSED');
+        installment = await computeCourseInstallment(db, target, scope, now, feePolicy);
+        const { r } = installment;
+        gross = r.gross;
+        fee = r.fee;
+        feeMax = r.feeMax;
+        consumedValue = r.consumedValue + r.lateLeaveFees;
+        if (r.unusedGrace) scope = 'FULL';
+        calc = installment.calc;
+        fullRefund = scope === 'FULL';
+        break;
+      }
       case 'OTHER':
         throw httpError(409, 'REFUND_KIND_UNSUPPORTED', '此訂單類型不支援自動退費，請洽總部人工處理');
       case 'TOPUP': {
@@ -417,6 +686,8 @@ async function buildPlan(db, target, { scope: scopeRaw, items, mode, now = new D
           bonusWallet: member?.bonusWallet,
           originalPrice: target.row.grantedCash,
           originalBonus: target.row.grantedBonus,
+          coolingOff: withinCoolingOff(target.row.createdAt, now),
+          feePolicy,
         });
         if (r.beforeFee < 0 || r.refundCash < 0) {
           throw httpError(409, 'REFUND_BLOCKED', `運動金已消耗且本金殘值不足：實付 $${r.paidAmount} − 實際使用 $${r.usedAmount} − 手續費 $${r.refundFee}`);
@@ -424,23 +695,30 @@ async function buildPlan(db, target, { scope: scopeRaw, items, mode, now = new D
         gross = ntd(r.refundCash);
         if (!(gross > 0)) throw httpError(409, 'REFUND_AMOUNT_ZERO', '依公式應退金額為 0，無可退費');
         fee = ntd(r.refundFee);
+        feeMax = ntd(r.feeMax);
         consumedValue = ntd(r.usedAmount);
+        fullRefund = r.unusedGrace && gross === target.amount;
         calc = {
           orderKind: 'TOPUP',
           ...r,
           deductCash: r.remainingPrincipal,
           deductBonus: r.recoveredBonus,
-          note: `實付$${r.paidAmount} − 實際使用$${r.usedAmount} − 手續費$${r.refundFee} = $${r.refundCash}`,
+          note: r.unusedGrace
+            ? `契約第八條：7 日內未使用，全額退 $${r.refundCash}（贈送運動金 $${r.recoveredBonus} 註銷）`
+            : `實付$${r.paidAmount} − 實際使用$${r.usedAmount} − 手續費$${r.refundFee} = $${r.refundCash}`,
+          allowanceNote: r.unusedGrace ? '未使用全額退' : `解約:已用$${ntd(r.usedAmount)},扣手續費$${fee}`,
         };
         break;
       }
       case 'MEMBERSHIP': {
         if (!['FULL', 'UNUSED'].includes(scope)) throw httpError(400, 'SCOPE_INVALID', '月卡退費 scope 須為 FULL 或 UNUSED');
-        const m = await computeMembership(db, target, scope, now);
+        const m = await computeMembership(db, target, scope, now, feePolicy);
         gross = m.gross;
         fee = m.fee;
+        feeMax = m.feeMax;
         consumedValue = m.consumedValue;
         calc = m.calc;
+        if (m.full) scope = 'FULL';
         fullRefund = scope === 'FULL';
         break;
       }
@@ -448,26 +726,37 @@ async function buildPlan(db, target, { scope: scopeRaw, items, mode, now = new D
         if (!['FULL', 'UNUSED'].includes(scope)) throw httpError(400, 'SCOPE_INVALID', '私教退費 scope 須為 FULL 或 UNUSED');
         const contract = target.row.ptContract;
         if (!contract) throw httpError(409, 'PT_CONTRACT_UNLINKED', '此私教訂單未連結合約，請洽總部人工處理');
-        if (!contract.isActive) throw httpError(409, 'ALREADY_REFUNDED', '此私教合約已停用');
+        const { bookings, releasedSessions, usedSessions, expiry } = await loadContractForRefund(db, contract, now);
         const r = computePtRefund({
           pricePaid: target.amount,
           totalSessions: contract.totalSessions,
-          usedSessions: contract.usedSessions,
+          usedSessions,
+          lateLeaveFees: bookings.lateLeaveFees,
           scope,
           coolingOff: withinCoolingOff(target.row.createdAt, now),
+          feePolicy,
         });
         if (!(r.gross > 0)) throw httpError(409, 'REFUND_AMOUNT_ZERO', `依公式應退金額為 0（${r.note}）`);
         gross = r.gross;
         fee = r.fee;
-        consumedValue = r.consumedValue;
-        const futureBookings = await db.reservation.count({
-          where: {
-            memberId: target.memberId,
-            status: { notIn: ['CANCELLED', 'CANCELED'] },
-            class: { trainerId: contract.trainerId, type: 'PRIVATE', startAt: { gt: now } },
-          },
-        });
-        calc = { orderKind: 'PT', contractId: contract.id, ...r, futureBookings };
+        feeMax = r.feeMax;
+        consumedValue = r.consumedValue + r.lateLeaveFees;
+        if (r.unusedGrace) scope = 'FULL';
+        calc = {
+          orderKind: 'PT',
+          contractId: contract.id,
+          ...r,
+          contractUsedSessions: contract.usedSessions,
+          totalSessions: contract.totalSessions,
+          releasedSessions,
+          futureClasses: bookings.futureClasses,
+          futureBookings: bookings.otherFuture,
+          lateLeaveCount: bookings.lateLeaveCount,
+          ...expiry,
+          allowanceNote: r.unusedGrace
+            ? '未上課全額退'
+            : `解約:已上${usedSessions}/${contract.totalSessions}堂,扣違約金$${r.fee}`,
+        };
         fullRefund = scope === 'FULL';
         break;
       }
@@ -476,23 +765,40 @@ async function buildPlan(db, target, { scope: scopeRaw, items, mode, now = new D
     }
   }
 
-  if (!(gross > 0)) throw httpError(409, 'REFUND_AMOUNT_ZERO', '應退金額為 0');
-  if (gross > target.amount - target.refundedAmount) {
-    throw httpError(409, 'REFUND_EXCEEDS_PAID', `應退 $${gross} 超過單據可退餘額 $${target.amount - target.refundedAmount}`);
+  let legs;
+  let refs;
+  let relevant;
+  let shared;
+  let invoicePlan;
+  if (installment) {
+    // 未繳期數大於契約可退時應退為 0：仍須解約（終止合約與續扣），差額列應補繳
+    const out = await installmentLegs(db, calc.allocations, installment.orders);
+    legs = out.legs;
+    refs = {};
+    calc = { ...calc, payuniPaidByOrder: out.payuniPaidByOrder };
+    const jobs = await installmentInvoiceJobs(db, calc.allocations, now);
+    relevant = jobs.map((j) => ({ ...j.inv, orderId: j.orderId, gross: j.gross }));
+    shared = jobs.some((j) => j.shared);
+    invoicePlan = { action: aggregateInvoiceAction(jobs), perInvoice: jobs.map((j) => ({ id: j.inv.id, action: j.action })) };
+  } else {
+    if (!(gross > 0)) throw httpError(409, 'REFUND_AMOUNT_ZERO', '應退金額為 0');
+    if (gross > target.amount - target.refundedAmount) {
+      throw httpError(409, 'REFUND_EXCEEDS_PAID', `應退 $${gross} 超過單據可退餘額 $${target.amount - target.refundedAmount}`);
+    }
+    const { breakdown, merchantNos } = paymentSource(target);
+    const prior = await priorRefundedByMethod(db, target);
+    const available = Object.fromEntries(Object.entries(breakdown).map(([m, v]) => [m, v - (prior[m] || 0)]));
+    legs = splitRefundLegs({ breakdown, refundAmount: gross, available });
+    refs = await resolveProviderRefs(db, target, merchantNos);
+    calc = { ...calc, payuniPaid: breakdown.PAYUNI ?? null };
+    const loaded = await loadRefInvoices(db, target);
+    shared = loaded.shared;
+    relevant = relevantInvoices(target, loaded.invoices, lines, shared);
+    invoicePlan = decideInvoiceActions({ invoices: relevant, fullRefund, sharedInvoice: shared, now });
   }
-
-  const { breakdown, merchantNos } = paymentSource(target);
-  const prior = await priorRefundedByMethod(db, target);
-  const available = Object.fromEntries(Object.entries(breakdown).map(([m, v]) => [m, v - (prior[m] || 0)]));
-  const legs = splitRefundLegs({ breakdown, refundAmount: gross, available });
   if (legs.some((l) => l.method === 'WALLET_CASH') && !target.memberId) {
     throw httpError(409, 'MEMBER_REQUIRED', '原單含零錢包付款但無會員，無法退回零錢包');
   }
-  const refs = await resolveProviderRefs(db, target, merchantNos);
-
-  const { invoices, shared } = await loadRefInvoices(db, target);
-  const relevant = relevantInvoices(target, invoices, lines, shared);
-  const invoicePlan = decideInvoiceActions({ invoices: relevant, fullRefund, sharedInvoice: shared, now });
   const signatureLikely =
     invoicePlan.action === 'ALLOWANCE' && relevant.some((inv) => inv.category === 'B2B' && inv.status === 'ISSUED');
 
@@ -506,9 +812,12 @@ async function buildPlan(db, target, { scope: scopeRaw, items, mode, now = new D
     memberName: target.memberName,
     scope,
     lines,
-    calc: { ...calc, payuniPaid: breakdown.PAYUNI ?? null },
+    calc,
+    clause,
+    overrideFeeAmount,
     grossAmount: gross,
     feeAmount: fee,
+    feeMax,
     consumedValue,
     fullRefund,
     legs,
@@ -527,6 +836,7 @@ async function buildPlan(db, target, { scope: scopeRaw, items, mode, now = new D
         totalAmount: inv.totalAmount,
         allowanceTotal: inv.allowanceTotal,
         action: invoicePlan.perInvoice.find((p) => p.id === inv.id)?.action || null,
+        ...(inv.orderId ? { orderId: inv.orderId, gross: inv.gross } : {}),
       })),
     },
     signatureLikely,
@@ -551,12 +861,17 @@ function planDigest(plan) {
       l: (plan.lines || []).map((l) => [l.orderItemId, l.qty, l.gross]),
       g: plan.grossAmount,
       f: plan.feeAmount,
+      fm: plan.feeMax,
+      cl: plan.clause,
       c: plan.consumedValue,
+      rel: (plan.calc.futureClasses || []).map((x) => x.id),
       p: plan.payoutAmount,
       full: plan.fullRefund,
       w: [plan.calc.deductCash ?? null, plan.calc.deductBonus ?? null],
-      legs: plan.legs.map((l) => [l.method, l.amount, Boolean(l.forfeited)]),
-      inv: [plan.invoicePlan.action, plan.invoicePlan.invoices.map((i) => [i.id, i.action])],
+      legs: plan.legs.map((l) => [l.method, l.amount, Boolean(l.forfeited), l.refOrderId ?? null]),
+      inv: [plan.invoicePlan.action, plan.invoicePlan.invoices.map((i) => [i.id, i.action, i.gross ?? null])],
+      due: plan.calc.shortfall ?? null,
+      exp: plan.calc.isContractExpired ?? null,
       sub: Boolean(plan.calc.subscriptionActive),
     }),
   );
@@ -607,22 +922,38 @@ function publicPlan(plan, target, user, mode) {
     scope: plan.scope,
     lines: plan.lines,
     calc: plan.calc,
+    clause: plan.clause,
     grossAmount: plan.grossAmount,
     feeAmount: plan.feeAmount,
+    feeMax: plan.feeMax,
     consumedValue: plan.consumedValue,
     payoutAmount: plan.payoutAmount,
     fullRefund: plan.fullRefund,
-    legs: plan.legs.map((l) => ({
-      ...l,
-      ready:
-        l.method === 'LINEPAY' ? Boolean(plan.refs.linePayTxId) : l.method === 'PAYUNI' ? Boolean(plan.refs.payuniTradeNo) : true,
-      needsTerminal: l.method === 'YIPAY',
-    })),
+    legs: plan.legs.map(({ refs: legRefs, ...l }) => {
+      const refs = legRefs || plan.refs;
+      return {
+        ...l,
+        ready: l.method === 'LINEPAY' ? Boolean(refs.linePayTxId) : l.method === 'PAYUNI' ? Boolean(refs.payuniTradeNo) : true,
+        needsTerminal: l.method === 'YIPAY',
+      };
+    }),
     invoicePlan: plan.invoicePlan,
     signatureRequired: plan.signatureLikely,
+    isContractExpired: Boolean(plan.calc.isContractExpired),
+    contractExpiresAt: plan.calc.contractExpiresAt ?? null,
+    shortfall: plan.calc.shortfall ?? 0,
     warnings: [
+      ...(plan.calc.isContractExpired
+        ? [`本課程已逾契約效期（單堂 10 日，到期日 ${twDateLabel(plan.calc.contractExpiresAt)}）。依紙本契約原則不予退費，若需專案退費須由值班主管（DUTY+）核准`]
+        : []),
+      ...(plan.calc.shortfall > 0
+        ? [`學員上課進度超前，扣除已繳分期款後尚須臨櫃補繳差額 $${plan.calc.shortfall}；須確認收訖（或經主管核准立案追償）後才可終止合約與續扣`]
+        : []),
       ...(plan.calc.subscriptionActive ? ['將同步終止定期定額（PayUNi 續期）；中止退費不會恢復訂閱'] : []),
-      ...(plan.calc.futureBookings > 0 ? [`會員尚有 ${plan.calc.futureBookings} 堂未來私教預約，請另行取消`] : []),
+      ...(plan.calc.releasedSessions > 0
+        ? [`將一併取消此合約 ${plan.calc.releasedSessions} 堂未來預約並釋放教練時段／場地（中止退費不會恢復預約）`]
+        : []),
+      ...(plan.calc.futureBookings > 0 ? [`會員另有 ${plan.calc.futureBookings} 堂未綁合約之未來私教預約，請確認是否另行取消`] : []),
       ...(plan.legs.some((l) => l.method === 'VOUCHER') ? ['抵用券份額不退現（註銷）'] : []),
       ...(plan.legs.some((l) => l.method === 'YIPAY') ? ['乙禾刷卡須於端末機執行退貨後，回填 RRN／授權碼／卡號末四碼'] : []),
     ],
@@ -640,10 +971,20 @@ export async function previewTopupCancel(user, orderId) {
   return publicPlan(plan, target, user, 'TOPUP_VOID');
 }
 
-export async function previewSubOrderRefund(user, subOrderId, { scope, items } = {}) {
+/** 第十四條免手續費或調降手續費：限 DUTY+（路由亦限 DUTY+，此為服務層防線） */
+function normalizeFeePolicy(user, { clause, overrideFeeAmount }) {
+  const policy = { clause: normalizeTerminationClause(clause), overrideFeeAmount: normalizeOverrideFee(overrideFeeAmount) };
+  if ((policy.clause !== 'VOLUNTARY' || policy.overrideFeeAmount != null) && !hasDutyRankOrAbove(user)) {
+    throw httpError(403, 'DUTY_ROLE_REQUIRED_FOR_FEE_WAIVER', '免收或調降契約手續費／違約金，須由值班主管（DUTY+）執行');
+  }
+  return policy;
+}
+
+export async function previewSubOrderRefund(user, subOrderId, { scope, items, clause, overrideFeeAmount } = {}) {
+  const policy = normalizeFeePolicy(user, { clause, overrideFeeAmount });
   const target = await loadTarget(prisma, subOrderId);
   assertTargetAccess(user, target);
-  const plan = await buildPlan(prisma, target, { scope, items });
+  const plan = await buildPlan(prisma, target, { scope, items, ...policy });
   return publicPlan(plan, target, user);
 }
 
@@ -752,16 +1093,43 @@ async function applyEntitlementRollback(tx, plan, target, { refundId, user, now 
     after.member = data;
     after.endedLeaveIds = leaves.map((l) => l.id);
     await closeOrder();
-  } else if (plan.calc.orderKind === 'PT') {
+  } else if (plan.calc.orderKind === 'PT' || plan.calc.orderKind === 'COURSE_SUB') {
     await tx.$queryRaw`SELECT id FROM "PTContract" WHERE id = ${plan.calc.contractId} FOR UPDATE`;
     const contract = await tx.pTContract.findUnique({ where: { id: plan.calc.contractId } });
-    if (!contract?.isActive || contract.usedSessions !== plan.calc.used) {
+    if (!contract || contract.refundedAt || contract.usedSessions !== plan.calc.contractUsedSessions) {
       throw httpError(409, 'STATE_CHANGED', '私教合約已異動（堂數或狀態），請重新試算');
     }
-    await tx.pTContract.update({ where: { id: contract.id }, data: { isActive: false, refundedAt: now } });
-    before.contract = { id: contract.id, isActive: true, usedSessions: contract.usedSessions };
-    after.contract = { id: contract.id, isActive: false };
-    await closeOrder();
+    // 未來預約（預約時已扣堂）：刪除課堂以釋放教練時段與場地，並還堂
+    const classIds = (plan.calc.futureClasses || []).map((c) => c.id);
+    if (classIds.length) {
+      const removed = await tx.class.deleteMany({ where: { id: { in: classIds }, ptContractId: contract.id, startAt: { gt: now } } });
+      if (removed.count !== classIds.length) throw httpError(409, 'STATE_CHANGED', '私教預約已異動，請重新試算');
+    }
+    await tx.pTContract.update({
+      where: { id: contract.id },
+      data: { isActive: false, refundedAt: now, usedSessions: plan.calc.used },
+    });
+    before.contract = { id: contract.id, isActive: contract.isActive, usedSessions: contract.usedSessions };
+    before.cancelledClasses = plan.calc.futureClasses || [];
+    after.contract = { id: contract.id, isActive: false, usedSessions: plan.calc.used };
+    if (plan.calc.orderKind === 'PT') {
+      await closeOrder();
+    } else {
+      // 各期訂單依分攤累加已退；整期退回者改 REFUNDED，首期未分攤者維持 PAID（合約已停用即不可再退）
+      after.periods = [];
+      for (const a of plan.calc.allocations) {
+        await tx.$queryRaw`SELECT id FROM "Order" WHERE id = ${a.orderId} FOR UPDATE`;
+        const o = await tx.order.findUnique({ where: { id: a.orderId }, select: { status: true, amount: true, refundedAmount: true } });
+        if (!o || o.status !== 'PAID' || ntd(o.amount) - (o.refundedAmount || 0) < a.amount) {
+          throw httpError(409, 'STATE_CHANGED', `分期訂單 ${a.orderId} 已異動，請重新試算`);
+        }
+        await tx.order.update({
+          where: { id: a.orderId },
+          data: { refundedAmount: { increment: a.amount }, ...(a.full ? { status: 'REFUNDED' } : {}) },
+        });
+        after.periods.push({ orderId: a.orderId, amount: a.amount, status: a.full ? 'REFUNDED' : 'PAID' });
+      }
+    }
   }
   return { before, after, walletCashReversed, walletBonusReversed };
 }
@@ -818,6 +1186,67 @@ async function subscriptionOrphanError(user, target, subscriptionCancelled, reas
   return err;
 }
 
+/**
+ * 合約例外之執行前核准（試算只提示，不擋）：
+ * - 課程逾效期：專案退費限 DUTY+
+ * - 課程分期應補繳（shortfall）：須擇定已臨櫃收訖或立案追償＋DUTY+，否則不得停扣與終止合約（防呆帳）
+ */
+export const SHORTFALL_RESOLUTIONS = ['PAID_AT_POS', 'FLAG_ALERT_FOR_RECOVERY'];
+const SHORTFALL_NOTE_MAX = 200;
+const SHORTFALL_NOTE_MIN = 2;
+
+function assertContractApprovals(user, plan, { shortfallResolution, shortfallNote } = {}, now = new Date()) {
+  const approvals = {};
+  if (plan.calc.isContractExpired) {
+    if (!hasDutyRankOrAbove(user)) {
+      throw httpError(403, 'DUTY_APPROVAL_REQUIRED_FOR_EXPIRED_COURSE', '課程已逾契約效期，專案退費須由值班主管（DUTY+）核准');
+    }
+    approvals.expiredCourse = { contractExpiresAt: plan.calc.contractExpiresAt, approvedByStaffId: user.id, approvedAt: now.toISOString() };
+  }
+  if (plan.calc.shortfall > 0) {
+    const resolution = typeof shortfallResolution === 'string' ? shortfallResolution.trim().toUpperCase() : '';
+    if (!resolution) {
+      throw httpError(
+        409,
+        'SHORTFALL_SETTLEMENT_REQUIRED',
+        `學員上課進度超前，尚須臨櫃補繳差額 $${plan.calc.shortfall}；請選擇「已臨櫃收訖」或「主管核准立案追償」後再送出`,
+      );
+    }
+    if (!SHORTFALL_RESOLUTIONS.includes(resolution)) {
+      throw httpError(400, 'SHORTFALL_RESOLUTION_INVALID', 'shortfallResolution 須為 PAID_AT_POS 或 FLAG_ALERT_FOR_RECOVERY');
+    }
+    if (!hasDutyRankOrAbove(user)) {
+      throw httpError(403, 'DUTY_APPROVAL_REQUIRED_FOR_SHORTFALL', '應補繳差額之解約須由值班主管（DUTY+）確認');
+    }
+    const note = shortfallNote == null ? '' : String(shortfallNote).trim();
+    if (resolution === 'PAID_AT_POS' && note.length < SHORTFALL_NOTE_MIN) {
+      throw httpError(400, 'SHORTFALL_NOTE_REQUIRED', '已臨櫃收訖須填寫 POS 收款單號或收訖說明');
+    }
+    if (note.length > SHORTFALL_NOTE_MAX) {
+      throw httpError(400, 'SHORTFALL_NOTE_TOO_LONG', `補繳備註最多 ${SHORTFALL_NOTE_MAX} 字`);
+    }
+    approvals.shortfall = {
+      amount: plan.calc.shortfall,
+      resolution,
+      note: note || null,
+      confirmedByStaffId: user.id,
+      confirmedAt: now.toISOString(),
+    };
+  }
+  return approvals;
+}
+
+/**
+ * 欠繳立案追償：同交易寫欠款黑名單（同會員既有有效紀錄則累加事由）。
+ * 不設 isAlert：欠款屬課程契約之債權，不得據以停止已收費之入場服務；清償後門市以黑名單解除結案。
+ */
+async function recordShortfallRecovery(tx, { memberId, refundId, contractId, amount, note, staffId }) {
+  await tx.$queryRaw`SELECT id FROM "Member" WHERE id = ${memberId} FOR UPDATE`;
+  const line = `課程分期解約欠繳 $${amount}（退費單 ${refundId}${contractId ? `、合約 #${contractId}` : ''}）`;
+  const { row, before } = await addPaymentDebt(tx, { memberId, reason: line, note, staffId });
+  return { before, after: { blacklistActive: true, blacklistReason: row.reason, amount } };
+}
+
 async function executePlan(user, target, opts, req) {
   const idempotencyKey = normalizeIdempotencyKey(opts.idempotencyKey);
   const replay = await findIdempotentReplay(user, idempotencyKey, target, opts.mode);
@@ -826,22 +1255,26 @@ async function executePlan(user, target, opts, req) {
   const quoteDigest = verifyQuote(user, opts.quoteToken, target, opts.mode);
   const reason = normalizeRefundReason(opts.reason);
   const buyerEmail = normalizeBuyerEmail(opts.buyerEmail);
+  const policy = normalizeFeePolicy(user, opts);
   const now = new Date();
+  const planInput = { scope: opts.scope, items: opts.items, mode: opts.mode, ...policy, now };
 
   // 預先檢核（含發票作法）；有 ERROR 或與試算不符即不動任何資料（含終止訂閱）
-  const pre = await buildPlan(prisma, target, { scope: opts.scope, items: opts.items, mode: opts.mode, now });
+  const pre = await buildPlan(prisma, target, planInput);
   assertQuoteMatches(pre, quoteDigest);
+  // 須在終止 PayUNi 續扣之前：未確認應補繳不得停扣
+  const approvals = assertContractApprovals(user, pre, opts, now);
 
   if (pre.legs.some((l) => l.method === 'CASH') && !(pre.branchId && (await getOpenShift(pre.branchId)))) {
     throw httpError(409, 'SHIFT_NOT_OPEN', SHIFT_NOT_OPEN_MESSAGE);
   }
 
-  // 月卡定期定額：先終止 PayUNi 續期（失敗即中止，不動帳）
+  // 月卡／課程分期定期定額：先終止 PayUNi 續期（失敗即中止，不動帳）
   let subscriptionCancelled = null;
   if (pre.calc.subscriptionActive && pre.calc.subscriptionId) {
     const sub = await prisma.cardSubscription.findUnique({ where: { id: pre.calc.subscriptionId } });
-    const latest = await findLatestPaidOrderForSubscription(sub);
-    if (latest.order && latest.order.id !== target.id) {
+    const latest = pre.calc.orderKind === 'COURSE_SUB' ? null : await findLatestPaidOrderForSubscription(sub);
+    if (latest?.order && latest.order.id !== target.id) {
       throw httpError(409, 'NOT_LATEST_PERIOD', `僅可退訂閱最近一期（${latest.order.id}）`);
     }
     const out = await cancelCardSubscription(sub.id, { reason: `退費 ${target.id}：${reason}`.slice(0, 160), stopPayuni: true });
@@ -861,7 +1294,7 @@ async function executePlan(user, target, opts, req) {
         });
         if (open) throw httpError(409, 'REFUND_IN_PROGRESS', `此子單已有處理中之退費單 ${open.id}`);
 
-        const plan = await buildPlan(tx, fresh, { scope: opts.scope, items: opts.items, mode: opts.mode, now });
+        const plan = await buildPlan(tx, fresh, planInput);
         assertQuoteMatches(plan, quoteDigest);
         const rollback = await applyEntitlementRollback(tx, plan, fresh, { refundId, user, now });
 
@@ -869,7 +1302,8 @@ async function executePlan(user, target, opts, req) {
         let walletCashCredited = 0;
         const payments = [];
         for (const leg of plan.legs) {
-          const base = { id: genId('RFP'), method: leg.method, amount: leg.amount, staffId: user?.id ?? null };
+          const refs = leg.refs || plan.refs;
+          const base = { id: genId('RFP'), method: leg.method, amount: leg.amount, staffId: user?.id ?? null, refOrderId: leg.refOrderId ?? null };
           if (leg.method === 'CASH') {
             shiftId = shiftId || (await lockOpenShiftForSale(tx, plan.branchId));
             payments.push({ ...base, status: 'REFUNDED', refundedAt: now, shiftHandoverId: shiftId });
@@ -892,13 +1326,13 @@ async function executePlan(user, target, opts, req) {
           } else if (leg.method === 'VOUCHER') {
             payments.push({ ...base, status: 'FORFEITED', lastError: '抵用券份額不退現' });
           } else if (leg.method === 'LINEPAY') {
-            const ref = plan.refs.linePayTxId;
+            const ref = refs.linePayTxId;
             payments.push({ ...base, status: ref ? 'PENDING' : 'FAILED', originalRef: ref, lastError: ref ? null : '缺少 LINE Pay 交易序號，請改臨櫃現金退款' });
           } else if (leg.method === 'PAYUNI') {
-            const ref = plan.refs.payuniTradeNo;
+            const ref = refs.payuniTradeNo;
             payments.push({ ...base, status: ref ? 'PENDING' : 'FAILED', originalRef: ref, lastError: ref ? null : '缺少 PayUNi 交易序號，請改臨櫃現金退款' });
           } else if (leg.method === 'YIPAY') {
-            payments.push({ ...base, status: 'AWAITING_TERMINAL', origCaptureId: plan.refs.yipayCapture?.id ?? null });
+            payments.push({ ...base, status: 'AWAITING_TERMINAL', origCaptureId: refs.yipayCapture?.id ?? null });
           }
         }
 
@@ -913,7 +1347,16 @@ async function executePlan(user, target, opts, req) {
             memberId: plan.memberId,
             scope: plan.scope,
             lines: plan.lines ?? undefined,
-            calc: { ...plan.calc, invoicePlan: plan.invoicePlan.action, subscriptionCancelled, rollback: rollback.after },
+            calc: {
+              ...plan.calc,
+              clause: plan.clause,
+              feeMax: plan.feeMax,
+              overrideFeeAmount: plan.overrideFeeAmount,
+              invoicePlan: plan.invoicePlan.action,
+              subscriptionCancelled,
+              rollback: rollback.after,
+              ...(Object.keys(approvals).length ? { approvals } : {}),
+            },
             grossAmount: plan.grossAmount,
             feeAmount: plan.feeAmount,
             consumedValue: plan.consumedValue,
@@ -939,8 +1382,33 @@ async function executePlan(user, target, opts, req) {
           req,
           reason,
           before: rollback.before,
-          after: { ...rollback.after, grossAmount: plan.grossAmount, legs: plan.legs, status: refund.status },
+          after: {
+            ...rollback.after,
+            grossAmount: plan.grossAmount,
+            feeAmount: plan.feeAmount,
+            feeMax: plan.feeMax,
+            clause: plan.clause,
+            legs: plan.legs.map(({ refs: _refs, ...l }) => l),
+            status: refund.status,
+          },
         });
+        if (approvals.expiredCourse) {
+          await writeAudit(tx, { action: 'REFUND_EXPIRED_COURSE_APPROVAL', refund, user, req, reason, after: approvals.expiredCourse });
+        }
+        if (approvals.shortfall) {
+          await writeAudit(tx, { action: 'REFUND_SHORTFALL_CONFIRM', refund, user, req, reason, after: approvals.shortfall });
+          if (approvals.shortfall.resolution === 'FLAG_ALERT_FOR_RECOVERY') {
+            const recovery = await recordShortfallRecovery(tx, {
+              memberId: plan.memberId,
+              refundId,
+              contractId: plan.calc.contractId,
+              amount: approvals.shortfall.amount,
+              note: approvals.shortfall.note,
+              staffId: user.id,
+            });
+            await writeAudit(tx, { action: 'REFUND_SHORTFALL_RECOVERY', refund, user, req, reason, ...recovery });
+          }
+        }
         return refund;
       },
       { timeout: 20000 },
@@ -955,6 +1423,8 @@ async function executePlan(user, target, opts, req) {
     throw mapped;
   }
 
+  // 乙禾腿待端末退貨：建單即回傳，由櫃檯於退費單回填 RRN／授權碼後再推進
+  if (created.status === 'AWAITING_TERMINAL') return serializeRefund(created);
   return withRefundLock(created.id, () => advance(created.id, { user, req }));
 }
 
@@ -966,10 +1436,20 @@ export async function executeTopupCancel(user, orderId, { reason, buyerEmail, qu
 }
 
 /** B：子單退費（SAL 退貨／TYK 未履約／CRS 月卡／私教） */
-export async function executeSubOrderRefund(user, subOrderId, { scope, items, reason, buyerEmail, quoteToken, idempotencyKey } = {}, req = null) {
+export async function executeSubOrderRefund(
+  user,
+  subOrderId,
+  { scope, items, reason, buyerEmail, quoteToken, idempotencyKey, clause, overrideFeeAmount, shortfallResolution, shortfallNote } = {},
+  req = null,
+) {
   const target = await loadTarget(prisma, subOrderId);
   assertTargetAccess(user, target);
-  return executePlan(user, target, { scope, items, reason, buyerEmail, quoteToken, idempotencyKey }, req);
+  return executePlan(
+    user,
+    target,
+    { scope, items, reason, buyerEmail, quoteToken, idempotencyKey, clause, overrideFeeAmount, shortfallResolution, shortfallNote },
+    req,
+  );
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1014,7 +1494,8 @@ async function runProviderLegs(refund, { user, req, checked = false, steps = nul
         const res = await refundLinePayPayment({ transactionId: leg.originalRef, refundAmount: leg.amount });
         data = { status: 'REFUNDED', refundedAt: new Date(), providerRef: res?.info?.refundTransactionId ? String(res.info.refundTransactionId) : null };
       } else {
-        const res = await refundPayuniTrade({ tradeNo: leg.originalRef, amount: leg.amount, fullAmount: refund.calc?.payuniPaid ?? null });
+        const fullAmount = leg.refOrderId ? refund.calc?.payuniPaidByOrder?.[leg.refOrderId] : refund.calc?.payuniPaid;
+        const res = await refundPayuniTrade({ tradeNo: leg.originalRef, amount: leg.amount, fullAmount: fullAmount ?? null });
         data = res.ok
           ? { status: 'REFUNDED', refundedAt: new Date(), providerRef: res.data?.TradeNo ? String(res.data.TradeNo) : null }
           : { status: 'FAILED', lastError: `${res.ambiguous ? `${AMBIGUOUS_TAG}請先至 PayUNi 後台確認是否已退款｜` : ''}${res.message || 'PayUNi 退款失敗'}`.slice(0, 300) };
@@ -1051,10 +1532,19 @@ async function syncPaymentStatus(id) {
   return loadRefund(id);
 }
 
-function allowanceItemsFor(refund, inv, shared, target) {
+/** ezPay 品名上限 30 字：截短原品名、保留退費依據標註（已用期數／堂數、手續費） */
+function annotateItemName(name, note) {
+  if (!note) return name;
+  const tag = `(${note})`;
+  const room = Math.max(4, 30 - [...tag].length);
+  return `${[...String(name)].slice(0, room).join('')}${tag}`;
+}
+
+function allowanceItemsFor(refund, inv, shared, target, gross = refund.grossAmount) {
   if (shared || refund.refType === 'ORDER') {
-    const name = shared ? `子單${refund.refId}退費` : inv.items[0]?.name || target.row.itemDesc || refund.refId;
-    return [{ name, qty: 1, unit: '式', gross: refund.grossAmount }];
+    const base = shared ? `子單${refund.refId}退費` : inv.items[0]?.name || target.row.itemDesc || refund.refId;
+    const name = annotateItemName(base, refund.calc?.allowanceNote);
+    return gross > 0 ? [{ name, qty: 1, unit: '式', gross }] : [];
   }
   const free = inv.taxType === '3';
   return (refund.lines || [])
@@ -1100,6 +1590,7 @@ function gatewayRecallUnsafe(payments) {
 }
 
 async function runInvoicePhase(refund, { user, req, checked = false, steps = null }) {
+  await assertYipayTerminalSettled(prisma, refund.id);
   const prevResults = Array.isArray(refund.invoiceResults) ? refund.invoiceResults : [];
   const lastFailure = invoiceFailureOf(refund);
   if (lastFailure?.held) {
@@ -1116,9 +1607,27 @@ async function runInvoicePhase(refund, { user, req, checked = false, steps = nul
     throw httpError(409, 'RETRY_NEEDS_CHECK', '上次 ezPay 呼叫結果不明，請先至 ezPay 後台確認是否已開立折讓，再勾選「已確認」重試');
   }
   const target = await loadTarget(prisma, refund.refId);
-  const { invoices, shared } = await loadRefInvoices(prisma, target);
+  let invoices;
+  let shared;
+  /** 課程分期：einvoiceId → 該期 { orderId, gross, full, action } */
+  let jobMeta = null;
+  if (refund.calc?.orderKind === 'COURSE_SUB') {
+    let jobs;
+    try {
+      jobs = await installmentInvoiceJobs(prisma, refund.calc.allocations);
+    } catch (err) {
+      await prisma.refundRequest.update({ where: { id: refund.id }, data: { status: 'INVOICE_FAILED', lastError: String(err.message).slice(0, 500) } });
+      await writeAudit(prisma, { action: 'REFUND_INVOICE', refund, user, req, after: { status: 'INVOICE_FAILED', error: err.message } });
+      return loadRefund(refund.id);
+    }
+    invoices = jobs.map((j) => j.inv);
+    shared = false;
+    jobMeta = new Map(jobs.map((j) => [j.inv.id, j]));
+  } else {
+    ({ invoices, shared } = await loadRefInvoices(prisma, target));
+  }
   const done = new Map(prevResults.filter((x) => x.done).map((x) => [x.einvoiceId, x]));
-  const pending = relevantInvoices(target, invoices, refund.lines, shared).filter((inv) => !done.has(inv.id));
+  const pending = (jobMeta ? invoices : relevantInvoices(target, invoices, refund.lines, shared)).filter((inv) => !done.has(inv.id));
 
   // 不明結果之折讓：若 ezPay 實已開立且已寫入紀錄，直接視為完成
   for (const inv of [...pending]) {
@@ -1138,13 +1647,16 @@ async function runInvoicePhase(refund, { user, req, checked = false, steps = nul
   let failure = null;
   try {
     if (!action) {
-      action = decideInvoiceActions({ invoices: pending, fullRefund: refund.fullRefund, sharedInvoice: shared }).action;
+      action = jobMeta
+        ? aggregateInvoiceAction([...jobMeta.values()])
+        : decideInvoiceActions({ invoices: pending, fullRefund: refund.fullRefund, sharedInvoice: shared }).action;
     }
     const allowanceCtx = allowanceContextOf(refund);
     for (const inv of pending) {
+      const job = jobMeta?.get(inv.id) ?? null;
       if (inv.status === 'ISSUING') throw httpError(409, 'INVOICE_ISSUING', `發票 ${inv.id} 開立中，請稍候重試`);
       if (inv.status === 'PENDING' || inv.status === 'FAILED') {
-        if (!refund.fullRefund) throw httpError(409, 'INVOICE_NOT_ISSUED', '發票尚未開立，不得部分退費（請先補開發票）');
+        if (!(job ? job.full : refund.fullRefund)) throw httpError(409, 'INVOICE_NOT_ISSUED', '發票尚未開立，不得部分退費（請先補開發票）');
         const c = await prisma.eInvoice.updateMany({
           where: { id: inv.id, status: { in: ['PENDING', 'FAILED'] } },
           data: { status: 'CANCELLED', voidReason: `退費 ${refund.id}`.slice(0, 100), voidedAt: new Date(), nextRetryAt: null },
@@ -1153,7 +1665,7 @@ async function runInvoicePhase(refund, { user, req, checked = false, steps = nul
         results.push({ einvoiceId: inv.id, invoiceNumber: null, action: 'CANCEL', category: inv.category, done: true });
         continue;
       }
-      let doAllowance = action !== 'VOID';
+      let doAllowance = (job ? job.action : action) !== 'VOID';
       if (!doAllowance) {
         try {
           const v = await voidEInvoice(inv.invoiceNumber, {
@@ -1181,7 +1693,7 @@ async function runInvoicePhase(refund, { user, req, checked = false, steps = nul
         }
       }
       if (doAllowance) {
-        const items = allowanceItemsFor(refund, inv, shared, target);
+        const items = allowanceItemsFor(refund, inv, shared, target, job ? job.gross : refund.grossAmount);
         if (!items.length) {
           results.push({ einvoiceId: inv.id, invoiceNumber: inv.invoiceNumber, action: 'NONE', category: inv.category, done: true });
           continue;
@@ -1189,11 +1701,11 @@ async function runInvoicePhase(refund, { user, req, checked = false, steps = nul
         try {
           const a = await allowanceEInvoice(inv.invoiceNumber, {
             items,
-            itemDesc: `${refund.refId} 退費`,
+            itemDesc: `${job?.orderId ?? refund.refId} 退費`,
             buyerEmail: refund.buyerEmail,
             staffId: user?.id ?? null,
             holdOnAmbiguous: true,
-            context: allowanceCtx,
+            context: job ? { ...allowanceCtx, orderId: job.orderId } : allowanceCtx,
           });
           results.push({
             einvoiceId: inv.id,
@@ -1262,6 +1774,7 @@ async function runInvoicePhase(refund, { user, req, checked = false, steps = nul
 
 async function finalizeRefund(refund, { user, req }) {
   await prisma.$transaction(async (tx) => {
+    await assertYipayTerminalSettled(tx, refund.id);
     const done = await tx.refundRequest.updateMany({
       where: { id: refund.id, status: { in: ['INVOICE_PENDING', 'SIGNATURE_PENDING'] } },
       data: { status: 'COMPLETED', completedAt: new Date(), lastError: null },
@@ -1744,13 +2257,19 @@ export async function abortRefund(user, id, { reason } = {}, req = null) {
             await tx.memberLeave.updateMany({ where: { id: { in: leaveIds }, status: 'ENDED' }, data: { status: 'ACTIVE', endedAt: null } });
           }
         }
-        if (calc.orderKind === 'PT' && calc.contractId) {
+        if ((calc.orderKind === 'PT' || calc.orderKind === 'COURSE_SUB') && calc.contractId) {
           await tx.pTContract.update({ where: { id: calc.contractId }, data: { isActive: true, refundedAt: null } });
         }
-        await tx.order.update({
-          where: { id: target.row.id },
-          data: { status: 'PAID', refundedAmount: { decrement: fresh.grossAmount } },
-        });
+        if (calc.orderKind === 'COURSE_SUB') {
+          for (const a of calc.allocations || []) {
+            await tx.order.update({ where: { id: a.orderId }, data: { status: 'PAID', refundedAmount: { decrement: a.amount } } });
+          }
+        } else {
+          await tx.order.update({
+            where: { id: target.row.id },
+            data: { status: 'PAID', refundedAmount: { decrement: fresh.grossAmount } },
+          });
+        }
       }
 
       await tx.refundRequest.update({
@@ -1764,7 +2283,11 @@ export async function abortRefund(user, id, { reason } = {}, req = null) {
         req,
         reason: why,
         before: { status: fresh.status },
-        after: { status: 'ABORTED', subscriptionNotRestored: Boolean(calc.subscriptionCancelled) },
+        after: {
+          status: 'ABORTED',
+          subscriptionNotRestored: Boolean(calc.subscriptionCancelled),
+          bookingsNotRestored: (calc.futureClasses || []).map((c) => c.id),
+        },
       });
     }, { timeout: 20000 });
     return serializeRefund(await loadRefund(r.id));

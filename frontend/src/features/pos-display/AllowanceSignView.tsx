@@ -1,11 +1,19 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import SignaturePad, { type SignaturePadHandle } from '../../components/staff/SignaturePad';
 import { openAllowanceSignChannel, type AllowanceSignChannel } from '../../lib/allowanceSignChannel';
-import { ALLOWANCE_BUS_TYPES, type AllowanceSignRequestMsg } from '../../types/posDisplayBus';
-import { allowanceWatermarkText, watermarkSignature } from './signatureWatermark';
+import {
+  ALLOWANCE_BUS_TYPES,
+  MIN_SIGNATURE_PATH_PX,
+  MIN_SIGNATURE_POINTS,
+  MIN_SIGNATURE_SPAN,
+  MIN_SIGNATURE_STROKES,
+  type AllowanceSignPreview,
+  type AllowanceSignRequestMsg,
+} from '../../types/posDisplayBus';
+import { watermarkSignature, type SignatureStampMeta } from './signatureWatermark';
 
-/** 筆跡點數下限（防空白／誤觸送出；後端另以筆跡像素把關） */
-const MIN_STROKE_POINTS = 20;
+/** 筆跡點數下限（防空白／誤觸送出；後端另以近黑像素把關，不採信此數字） */
+const MIN_STROKE_POINTS = MIN_SIGNATURE_POINTS;
 /** 送出後等主機歸檔結果；逾時可重送同一張已壓印簽名 */
 const FINALIZE_TIMEOUT_MS = 20000;
 const DONE_DISMISS_MS = 2500;
@@ -20,6 +28,23 @@ const SUB_ORDER_LABEL: Record<string, string> = {
 
 function money(n: number) {
   return `$${Math.round(Number(n) || 0).toLocaleString('zh-TW')}`;
+}
+
+function stampMeta(preview: AllowanceSignPreview): SignatureStampMeta {
+  return {
+    allowanceNo: preview.docs.map((d) => d.allowanceNo).join('、') || '—',
+    invoiceNumber: preview.docs.map((d) => d.invoiceNumber).join('、') || '—',
+    totalAmt: preview.totals.total,
+    branchName: preview.branch.name || preview.branch.code || '',
+  };
+}
+
+function spanOk(span: { width: number; height: number } | null) {
+  return !!span && span.width >= MIN_SIGNATURE_SPAN.width && span.height >= MIN_SIGNATURE_SPAN.height;
+}
+
+function pathOk(strokeCount: number, pathLength: number) {
+  return strokeCount >= MIN_SIGNATURE_STROKES && pathLength >= MIN_SIGNATURE_PATH_PX;
 }
 
 function twDate(iso?: string | null) {
@@ -40,6 +65,9 @@ export default function AllowanceSignView() {
   const [phase, setPhase] = useState<Phase>('review');
   const [confirmed, setConfirmed] = useState(false);
   const [points, setPoints] = useState(0);
+  const [strokeCount, setStrokeCount] = useState(0);
+  const [pathLength, setPathLength] = useState(0);
+  const [span, setSpan] = useState<{ width: number; height: number } | null>(null);
   const [hint, setHint] = useState<string | null>(null);
   const [failMessage, setFailMessage] = useState<string | null>(null);
   const [restartRequired, setRestartRequired] = useState(false);
@@ -48,7 +76,7 @@ export default function AllowanceSignView() {
   const [now, setNow] = useState(() => Date.now());
   const padRef = useRef<SignaturePadHandle>(null);
   const submitLockRef = useRef(false);
-  const lastSignedRef = useRef<{ blob: Blob; signedAt: string; points: number } | null>(null);
+  const lastSignedRef = useRef<{ blob: Blob; signedAt: string; points: number; strokeCount: number; pathLength: number } | null>(null);
   const finalizeTimerRef = useRef<number | null>(null);
   const dismissTimerRef = useRef<number | null>(null);
 
@@ -65,6 +93,9 @@ export default function AllowanceSignView() {
       setPhase('review');
       setConfirmed(false);
       setPoints(0);
+      setStrokeCount(0);
+      setPathLength(0);
+      setSpan(null);
       setHint(null);
       setFailMessage(null);
       setRestartRequired(false);
@@ -86,7 +117,6 @@ export default function AllowanceSignView() {
         requestRef.current = msg;
         setRequest(msg);
         setNow(Date.now());
-        ch.post({ type: ALLOWANCE_BUS_TYPES.VIEW_ACK, from: 'display', requestId: msg.requestId });
         return;
       }
       if (msg.requestId !== requestRef.current?.requestId) return;
@@ -126,6 +156,14 @@ export default function AllowanceSignView() {
     return () => window.clearInterval(t);
   }, [request]);
 
+  // 明細已提交至 DOM 後才回 ACK。不用 requestAnimationFrame：背景分頁會被節流，1.5 秒握手會誤判客顯未開。
+  useLayoutEffect(() => {
+    if (!request) return;
+    const requestId = request.requestId;
+    if (requestRef.current?.requestId !== requestId) return;
+    channelRef.current?.post({ type: ALLOWANCE_BUS_TYPES.VIEW_ACK, from: 'display', requestId });
+  }, [request]);
+
   if (!request) return null;
   const preview = request.preview;
   const expired = Date.parse(preview.expiresAt) <= now;
@@ -146,9 +184,12 @@ export default function AllowanceSignView() {
       from: 'display',
       requestId: req.requestId,
       previewToken: req.preview.previewToken,
+      payloadHash: req.preview.payloadHash,
       signatureBlob: signed.blob,
       signedAt: signed.signedAt,
       strokePoints: signed.points,
+      strokeCount: signed.strokeCount,
+      pathLength: signed.pathLength,
     });
     if (!sent) {
       submitLockRef.current = false;
@@ -169,8 +210,11 @@ export default function AllowanceSignView() {
     if (submitLockRef.current || !canSign) return;
     const canvas = padRef.current?.getCanvas();
     const pts = padRef.current?.pointCount() ?? 0;
-    if (!canvas || pts < MIN_STROKE_POINTS) {
-      setHint('簽名過短或空白，請以正楷或慣用簽名完整簽署');
+    const strokes = padRef.current?.strokeCount() ?? 0;
+    const path = padRef.current?.pathLength() ?? 0;
+    const ink = padRef.current?.inkSpan() ?? null;
+    if (!canvas || pts < MIN_STROKE_POINTS || !pathOk(strokes, path) || !spanOk(ink)) {
+      setHint('簽名過短、空白或範圍太小，請以正楷或慣用簽名完整簽署');
       return;
     }
     submitLockRef.current = true;
@@ -179,8 +223,8 @@ export default function AllowanceSignView() {
     setPhase('sending');
     try {
       const signedAt = new Date();
-      const blob = await watermarkSignature(canvas, allowanceWatermarkText(branchLabel, signedAt));
-      lastSignedRef.current = { blob, signedAt: signedAt.toISOString(), points: pts };
+      const blob = await watermarkSignature(canvas, stampMeta(requestRef.current?.preview ?? preview), signedAt);
+      lastSignedRef.current = { blob, signedAt: signedAt.toISOString(), points: pts, strokeCount: strokes, pathLength: path };
       setHasSigned(true);
       sendComplete();
     } catch {
@@ -205,6 +249,9 @@ export default function AllowanceSignView() {
     padRef.current?.clear();
     setPadKey((k) => k + 1);
     setPoints(0);
+    setStrokeCount(0);
+    setPathLength(0);
+    setSpan(null);
     setHint(null);
     setFailMessage(null);
     setPhase('review');
@@ -331,7 +378,12 @@ export default function AllowanceSignView() {
               hideClear
               height={240}
               disabled={!canSign}
-              onStrokeChange={setPoints}
+              onStrokeChange={(n) => {
+                setPoints(n);
+                setStrokeCount(padRef.current?.strokeCount() ?? 0);
+                setPathLength(padRef.current?.pathLength() ?? 0);
+                setSpan(padRef.current?.inkSpan() ?? null);
+              }}
             />
           </div>
           {expired ? (
@@ -365,7 +417,7 @@ export default function AllowanceSignView() {
                 type="button"
                 className="asv-btn asv-btn--primary"
                 onClick={() => void submit()}
-                disabled={!canSign || points < MIN_STROKE_POINTS}
+                disabled={!canSign || points < MIN_STROKE_POINTS || !pathOk(strokeCount, pathLength) || !spanOk(span)}
               >
                 {phase === 'sending' || phase === 'awaiting' ? '送出中…' : '確認簽署並送回櫃檯'}
               </button>

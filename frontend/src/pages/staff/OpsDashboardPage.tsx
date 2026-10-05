@@ -1236,6 +1236,9 @@ export default function OpsDashboardPage() {
     if (cartPromoLine && !selectedMember) reasons.push('購物車含購案，請先選擇會員');
     if (cartCourseLines.length > 0 && !selectedMember) reasons.push('購物車含課程，請先選擇會員');
     if (cartCourseLines.length > 0 && !trainerId) reasons.push('購買課程請選擇負責教練');
+    if (cartCourseLines.length > 0 && selectedMember?.paymentDebt) {
+      reasons.push('會員有未清償欠款，清償並解除欠款黑名單前不可購買課程');
+    }
     if (cartGroupLines.length > 0 && !selectedMember) reasons.push('購物車含團課，請先選擇會員');
     return reasons;
   }, [
@@ -2336,6 +2339,7 @@ export default function OpsDashboardPage() {
               <span className="text-muted text-sm">
                 零錢包 ${selectedMember.cashWallet} · 運動金 ${selectedMember.bonusWallet}
               </span>
+              {selectedMember.paymentDebt ? <Badge tone="danger" dot>欠款未清</Badge> : null}
             </div>
             <Button size="sm" variant="ghost" onClick={() => setSelectedMember(null)}>
               清除
@@ -2343,6 +2347,14 @@ export default function OpsDashboardPage() {
           </div>
         ) : null}
       </div>
+
+      {showMemberPicker && selectedMember?.paymentDebt ? (
+        <Alert tone="error">
+          ⚠️ 此會員有未清償欠款：{selectedMember.paymentDebt.reason}
+          {selectedMember.paymentDebt.note ? `（${selectedMember.paymentDebt.note}）` : ''}。
+          清償前不可購買課程／課程分期；收訖後由值班主管於「欠款黑名單」解除。入場與已購課程不受影響。
+        </Alert>
+      ) : null}
 
       <OpsInvoiceFailBanner />
 
