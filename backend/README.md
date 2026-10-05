@@ -198,7 +198,13 @@ DB 約束：`npm run db:constraints` 同時套用 `sql/inventory_invoice.sql`（
 
 **容留顯示開關**：`Branch.showOccupancy`（CMS／HQ 場館內容可改）；公開 `GET /api/board/occupancy-settings?branchId=` 回 `isDisplay`；關閉時 `GET /occupancy` 回 `data: null`，前端不得硬顯示 0。
 
-**會籍自助請假**：`POST /api/member/leave-application`（`startDate`／`endDate`／可選證明圖 multipart 欄位 `proof` 或 JSON `proofImage`）；身分只從 JWT。相容舊路徑 `POST /subscription-leave`（`days`）。證明寫入 `MemberLeave.proofStorageKey`（同證件 local／R2 管線）。
+**會員權暫停（契約第十二條）**：規則 `lib/memberLeaveRules.js`、服務 `lib/memberLeave.js`。
+- 會員：`POST /api/member/leave-application`（`category`＋`startDate`／`endDate`〔台灣日 YYYY-MM-DD〕＋證明 multipart `proof` 或 JSON `proofImage`）一律建 `PENDING`；`GET /api/member/leave-applications`；`POST /api/member/leave-applications/:id/proof` 補證明。身分只從 JWT。舊 `POST /subscription-leave` 回 410 `USE_LEAVE_APPLICATION`。
+- 櫃檯（DUTY+）：`GET /api/ops/member-leaves?status=PENDING,APPROVED,ACTIVE`；`POST /api/ops/member-leaves`（multipart，同上欄位＋`memberNo`、`approveNow=true` 當場核准）；`POST …/:id/approve`、`…/:id/reject {reason}`、`…/:id/proof`（補件）、`…/:id/end`、`…/:id/complete`。審核期限＝送件起 7 工作日（排除週末＋`PublicHoliday`）。
+- 證明調閱（特種個資，DUTY+）：`POST /api/ops/member-leaves/:id/proof-access { reason }`（≥4 字）→ `{ url, expiresAt, expiresIn, mode, fileName }`；R2 為 Presigned GET，local 為 `GET /api/ops/leave-proof-access/:token`（免 Bearer、`no-store`）。簽發／兌換各寫一筆 `LeaveProofAccessLog`（ISSUE／REDEEM），append-only trigger 由 `npm run db:constraints` 套用。
+- 月卡終止（TYK 退費、月卡訂閱取消）時傷病暫停累計 ≥180 日 → 手續費與上限自動為 0（`calc.medicalSuspension`、`medicalFeeWaived`）。
+- 排程 `startMemberLeaveScheduler`（`app.js` 啟動）：起日到期之核准生效、逾期未補證明自動退回、期滿結案。`MEMBER_LEAVE_SCHEDULER=false` 停用（本機省 Neon，見 `.env.example`），`MEMBER_LEAVE_SCHEDULER_MS` 調間隔（預設 10 分）。
+- Schema 新增 `MemberLeave.category`／`source`／`proof*`／`review*`／`frozenDays` 與 `LeaveProofAccessLog`，更新後須 `npm run db:push` 再 `npm run db:constraints`。
 
 **報表延伸**：`GET /hq/reports/analytics/yoy`、`.../members`、`GET /hq/reports/card-subscriptions/batch`。
 

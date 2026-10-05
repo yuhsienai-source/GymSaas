@@ -350,20 +350,22 @@ export function promotionSellablePrismaWhere(base = {}) {
   };
 }
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+const TW_OFFSET_MS = 8 * 60 * 60 * 1000;
+const twDayIndex = (d) => Math.floor((new Date(d).getTime() + TW_OFFSET_MS) / DAY_MS);
+/** 台灣日 idx 之 23:59:59.999 */
+const twDayEnd = (idx) => new Date((idx + 1) * DAY_MS - TW_OFFSET_MS - 1);
+
+/**
+ * 會籍效期（台灣日曆日，與伺服器時區無關）：
+ * - 已過期／無效期：購買當日算第 1 天，第 days 天 23:59:59.999 截止（9/7 買 30 天 → 10/6）
+ * - 效期中續購／補償：自現有到期日次日接續整整 days 天（10/6 到期再買 30 天 → 11/5）
+ */
 export function computeMemberExpireDate(currentExpireDate, durationDays, now = new Date()) {
   const days = parsePositiveInt(durationDays, 'durationDays');
-  const base =
-    currentExpireDate && new Date(currentExpireDate) > now
-      ? new Date(currentExpireDate)
-      : new Date(now);
-  // 起始日算第 1 天：以 base 當日 00:00 起算，第 days 天 23:59:59.999 截止
-  // 例：9/7 買 30 天 → 效期至 10/6 結束（含購日共 30 個日曆日）
-  const start = new Date(base);
-  start.setHours(0, 0, 0, 0);
-  const expire = new Date(start);
-  expire.setDate(expire.getDate() + days - 1);
-  expire.setHours(23, 59, 59, 999);
-  return expire;
+  const active = currentExpireDate && new Date(currentExpireDate) > now;
+  const lastDay = active ? twDayIndex(currentExpireDate) + days : twDayIndex(now) + days - 1;
+  return twDayEnd(lastDay);
 }
 
 /** 自某日起算，效期還剩幾整天（已過期回 0） */

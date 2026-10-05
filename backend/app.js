@@ -34,6 +34,7 @@ import memberExtRoutes from './routes/memberExt.js';
 import memberGroupRoutes from './routes/memberGroup.js';
 import groupOpsRoutes from './routes/groupOps.js';
 import { startGroupClassScheduler } from './lib/groupClassService.js';
+import { startMemberLeaveScheduler } from './lib/memberLeave.js';
 import opsExtensionsRoutes from './routes/opsExtensions.js';
 import { attachOccupancyWebSocket } from './lib/occupancy.js';
 import { attachGateAlertWebSocket } from './lib/gateAlert.js';
@@ -240,6 +241,7 @@ server.listen(PORT, () => {
   startRosterAckScheduler();
   startStaffNotificationScheduler();
   startGroupClassScheduler();
+  startMemberLeaveScheduler();
   bootEInvoiceQueue().catch((err) => console.warn('[einvoice] boot:', err.message));
   // 證件：歷史版 1 年／保存期 3 年到期硬刪（每 6 小時）
   const runIdPhotoPurge = () => {

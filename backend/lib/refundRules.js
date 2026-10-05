@@ -105,6 +105,14 @@ export function normalizeOverrideFee(raw) {
 }
 
 /**
+ * 契約第十二條末款：傷病暫停累計滿六個月（`medicalSuspensionSummary.exemptEligible`）後依第九條終止，
+ * 不得收取手續費或任何名目之扣費 → 月卡手續費上限強制為 0（不依賴經辦選 EXEMPT）
+ */
+export function isMedicalSuspensionFeeWaived(medicalSuspension) {
+  return Boolean(medicalSuspension?.exemptEligible);
+}
+
+/**
  * 實收手續費：EXEMPT 一律 0；主管調降須介於 0～契約上限
  * @param {number} feeMax 依契約第九條算出之上限
  * @param {{ clause?: string, overrideFeeAmount?: number|null }} policy

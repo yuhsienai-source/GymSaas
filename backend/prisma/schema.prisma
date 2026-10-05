@@ -1144,18 +1144,59 @@ model MemberLeave {
   expireDateBefore   DateTime?
   /// 請假開始前的下次扣款時間快照
   nextChargeAtBefore DateTime?
-  /// ACTIVE=請假中 | ENDED=已結束（含提早銷假）| CANCELLED=作廢
+  /// PENDING=待審 | APPROVED=已核准未開始 | ACTIVE=暫停中 | ENDED=已結束（含提早銷假）| REJECTED=退回 | CANCELLED=作廢
   status             String    @default("ACTIVE")
+  /// 契約第十二條事由：OVERSEAS | MEDICAL | FAMILY_CARE | MILITARY | RELOCATION | OTHER | EPIDEMIC（舊資料為空）
+  category           String?
+  /// MEMBER＝會員自助 | STAFF＝櫃檯代建
+  source             String?
   reason             String?
   /// 請假證明物件 storageKey（local／R2，非公開 URL）
   proofStorageKey    String?
   proofFileName      String?
+  proofUploadedAt    DateTime?
+  /// 傷病／疫情先送件未附證明：補件期限，逾期未補自動退回
+  proofDueAt         DateTime?
+  /// 七工作日審核期限（自備齊證明起算）
+  reviewDueAt        DateTime?
+  reviewedByStaffId  Int?
+  reviewedAt         DateTime?
+  reviewNote         String?
+  /// 實際凍結天數（期滿＝days；提早銷假扣除未休）
+  frozenDays         Int?
   staffId            Int?
   createdAt          DateTime  @default(now())
   endedAt            DateTime?
 
   @@index([memberId, status])
   @@index([status, endAt])
+  @@index([status, startAt])
+  @@index([status, proofDueAt])
+}
+
+/// 會籍暫停證明（診斷證明、孕婦手冊、兵單等，個資法第 6 條特種個資）調閱稽核
+/// append-only：DB trigger 禁改刪（npm run db:constraints）；不設關聯以免連帶刪除
+model LeaveProofAccessLog {
+  id         Int       @id @default(autoincrement())
+  leaveId    Int
+  memberId   Int
+  /// ISSUE（簽發短效 URL）| REDEEM（local token 兌換）
+  action     String
+  staffId    Int?
+  staffRole  String?
+  /// 經辦所屬分店（JWT）
+  branchId   Int?
+  reason     String?
+  /// r2_presign | local_token
+  accessMode String?
+  expiresAt  DateTime?
+  ipAddress  String?
+  userAgent  String?   @db.Text
+  createdAt  DateTime  @default(now())
+
+  @@index([leaveId, createdAt])
+  @@index([memberId, createdAt])
+  @@index([staffId, createdAt])
 }
 
 model CardSubscriptionCharge {

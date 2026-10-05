@@ -1,7 +1,8 @@
 // lib/leaveProof.js — 會籍請假證明圖（沿用證件物件儲存）
 import crypto from 'crypto';
+import multer from 'multer';
 import sharp from 'sharp';
-import { putIdPhotoObject } from './idPhotoStorage.js';
+import { deleteIdPhotoObject, putIdPhotoObject } from './idPhotoStorage.js';
 
 const MAX_BYTES = 5 * 1024 * 1024;
 
@@ -56,15 +57,54 @@ export async function storeLeaveProof(memberId, imageOrBuf, originalName) {
   return { storageKey, fileName, bytes: jpeg.length };
 }
 
-/**
- * 由起迄日計算含頭尾天數
- */
-export function inclusiveLeaveDays(startDate, endDate) {
-  const start = new Date(`${String(startDate).trim()}T00:00:00`);
-  const end = new Date(`${String(endDate).trim()}T00:00:00`);
-  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
-    throw httpError('請假起迄日無效');
+const leaveProofUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_BYTES },
+  fileFilter(_req, file, cb) {
+    if (/^image\/(jpeg|png|webp)$/i.test(file.mimetype || '')) {
+      cb(null, true);
+      return;
+    }
+    cb(Object.assign(new Error('請假證明須為 JPG／PNG／WebP'), { statusCode: 400 }));
+  },
+});
+
+/** multipart 時解析欄位 proof；JSON 直接放行 */
+export function maybeLeaveProofUpload(req, res, next) {
+  if (!String(req.headers['content-type'] || '').includes('multipart/form-data')) {
+    next();
+    return;
   }
-  if (end < start) throw httpError('結束日不可早於起始日');
-  return Math.round((end.getTime() - start.getTime()) / (24 * 60 * 60 * 1000)) + 1;
+  leaveProofUpload.single('proof')(req, res, (err) => {
+    if (err) {
+      res.status(err.statusCode || 400).json({ status: 'error', message: err.message || '上傳請假證明失敗' });
+      return;
+    }
+    next();
+  });
+}
+
+/** 請求是否帶證明（multipart 欄位 proof，或 JSON proofImage／proofDataUrl） */
+export function requestHasLeaveProof(req) {
+  return Boolean(req.file?.buffer || req.body?.proofImage || req.body?.proofDataUrl);
+}
+
+/** 存證明後執行 fn；fn 失敗即刪檔，不留無 DB 指向之個資 */
+export async function withStoredLeaveProof(memberId, req, fn) {
+  let proof = null;
+  if (req.file?.buffer) {
+    proof = await storeLeaveProof(memberId, req.file.buffer, req.file.originalname);
+  } else if (req.body?.proofImage || req.body?.proofDataUrl) {
+    proof = await storeLeaveProof(memberId, req.body.proofImage || req.body.proofDataUrl, req.body.proofFileName);
+  }
+  try {
+    return await fn(proof);
+  } catch (e) {
+    if (proof?.storageKey) {
+      await deleteIdPhotoObject(proof.storageKey).catch((err) =>
+        console.warn('[請假證明] 刪除未歸檔檔案失敗', err.message),
+      );
+    }
+    throw e;
+  }
 }

@@ -17,7 +17,8 @@ import {
   reevaluateCheckoutSessionStatus,
 } from './ezpayReverse.js';
 import { issuedInvoiceFor } from './einvoice.js';
-import { resolveAppliedFee } from './refundRules.js';
+import { isMedicalSuspensionFeeWaived, resolveAppliedFee } from './refundRules.js';
+import { medicalSuspensionForMember } from './memberLeave.js';
 
 /**
  * 效期政策：
@@ -82,16 +83,21 @@ export async function findLatestPaidOrderForSubscription(sub) {
  * 已用天數至少 1 日（已生效）；始期未屆至／7 日內未使用之全額退由呼叫端判定
  * （訂閱每期請款：契約總天數＝本期天數；一次付清多期：契約總天數＝durationDays）
  *
- * @param {{ feePolicy?: { clause?: string, overrideFeeAmount?: number|null } }} opts
+ * 第十二條末款：傷病暫停累計滿六個月者手續費上限強制 0（`medicalSuspension.exemptEligible`）
+ *
+ * @param {{ feePolicy?: { clause?: string, overrideFeeAmount?: number|null }, medicalSuspension?: { days: number, exemptEligible: boolean } | null }} opts
  */
 export function computeMonthlyCardRefundDetail({
   orderAmount,
   unusedDays,
   periodDays,
   contractDays,
-  fee = MONTHLY_CARD_REFUND_FEE,
+  fee: feeRaw = MONTHLY_CARD_REFUND_FEE,
   feePolicy,
+  medicalSuspension = null,
 }) {
+  const medicalWaived = isMedicalSuspensionFeeWaived(medicalSuspension);
+  const fee = medicalWaived ? 0 : feeRaw;
   const paid = roundMoney(orderAmount);
   const period = Math.max(1, Number(periodDays) || 30);
   const contract = Math.max(period, Number(contractDays) || period);
@@ -121,7 +127,11 @@ export function computeMonthlyCardRefundDetail({
     ratio: Math.round((remainingPeriods / totalPeriods) * 10000) / 10000,
     feeMax,
     fee: refundFee,
+    medicalFeeWaived: medicalWaived,
   };
+  const waiverNote = medicalWaived
+    ? `（第十二條：傷病暫停累計 ${medicalSuspension.days} 日已滿六個月，免手續費）`
+    : '';
 
   if (paid <= 0) return { ...common, amount: 0, eligible: false, note: '訂單金額無效' };
   if (remainingPeriods <= 0) {
@@ -139,7 +149,7 @@ export function computeMonthlyCardRefundDetail({
     eligible: amount > 0,
     note:
       `當期已用 ${usedDays} 日（${cycle}）：月均$${monthlyAvg} × 剩餘 ${remainingPeriods}/${totalPeriods} 期` +
-      ` − 手續費$${refundFee} = $${amount}`,
+      ` − 手續費$${refundFee} = $${amount}${waiverNote}`,
   };
 }
 
@@ -243,6 +253,7 @@ export async function settleCancelSubscription(
       orderAmount: latest.order.amount,
       unusedDays,
       periodDays,
+      medicalSuspension: await medicalSuspensionForMember(prisma, sub.memberId, now),
     });
     const allowanceAmt = refundDetail.amount;
     allowanceMeta = {
@@ -434,6 +445,7 @@ export async function previewCancelUnlimitedOrder(orderId, { now = new Date() } 
     unusedDays,
     periodDays,
     contractDays,
+    medicalSuspension: await medicalSuspensionForMember(prisma, order.memberId, now),
   });
 
   return {
@@ -548,6 +560,7 @@ export async function settleCancelUnlimitedOrder(
       unusedDays,
       periodDays,
       contractDays,
+      medicalSuspension: await medicalSuspensionForMember(prisma, order.memberId, now),
     });
     const allowanceAmt = refundDetail.amount;
     allowanceMeta = {

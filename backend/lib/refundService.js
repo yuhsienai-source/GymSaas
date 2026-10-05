@@ -40,6 +40,7 @@ import {
   resolveUnlimitedOrderPeriodDays,
 } from './subscriptionSettle.js';
 import { cancelCardSubscription } from './cardSubscription.js';
+import { medicalSuspensionForMember } from './memberLeave.js';
 import { normalizeBuyerEmail } from './invoiceAllowance.js';
 import { clientIp } from './memberDeviceAudit.js';
 import { readToken, sha256Hex, signToken } from './signedToken.js';
@@ -364,6 +365,8 @@ async function computeMembership(db, target, scope, now, feePolicy) {
     contractDays,
     grantedDays,
     unusedDays,
+    // 第十二條末款：傷病暫停累計滿 180 日 → 手續費上限強制 0
+    medicalSuspension: await medicalSuspensionForMember(db, order.memberId, now),
   };
 
   const notStarted = unusedDays > grantedDays;
@@ -393,6 +396,7 @@ async function computeMembership(db, target, scope, now, feePolicy) {
     periodDays,
     contractDays: grantedDays,
     feePolicy,
+    medicalSuspension: calc.medicalSuspension,
   });
   if (!detail.eligible) throw httpError(409, 'REFUND_NOT_ELIGIBLE', detail.note);
   const gross = ntd(detail.amount);

@@ -79,6 +79,29 @@ export async function deleteHoliday(id) {
   }
 }
 
+/**
+ * 區間內國定假日 'YYYY-MM-DD' 集合：以 HQ 假日曆（PublicHoliday）為準；
+ * 某年度尚未建立任何假日時回退 laborLaw 內建預設，避免未維護年度全當工作日
+ */
+export async function holidayKeySet(fromKey, toKey, db = prisma) {
+  const rows = await db.publicHoliday.findMany({
+    where: { date: { gte: dateOf(fromKey), lte: dateOf(toKey) } },
+    select: { date: true },
+  });
+  const keys = new Set(rows.map((r) => dbDateKey(r.date)));
+  const years = new Set([fromKey.slice(0, 4), toKey.slice(0, 4)]);
+  for (const year of years) {
+    const configured = await db.publicHoliday.count({
+      where: { date: { gte: dateOf(`${year}-01-01`), lte: dateOf(`${year}-12-31`) } },
+    });
+    if (configured) continue;
+    for (const [date] of defaultsFor(year)) {
+      if (date >= fromKey && date <= toKey) keys.add(date);
+    }
+  }
+  return keys;
+}
+
 /** 補入內建預設（僅指定年度；已存在日期略過） */
 export async function seedDefaultHolidays(year) {
   const defaults = defaultsFor(year);

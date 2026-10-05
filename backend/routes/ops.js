@@ -84,12 +84,20 @@ import {
   computeMonthlyCardRefundDetail,
 } from '../lib/subscriptionSettle.js';
 import {
-  startMemberLeave,
+  approveMemberLeave,
+  attachLeaveProof,
   endMemberLeaveEarly,
   completeMemberLeaveOnSchedule,
   listMemberLeaves,
+  medicalSuspensionForMember,
+  rejectMemberLeave,
   settleExpiredLeave,
+  submitLeaveApplication,
+  toLeaveView,
 } from '../lib/memberLeave.js';
+import { maybeLeaveProofUpload, requestHasLeaveProof, withStoredLeaveProof } from '../lib/leaveProof.js';
+import { issueLeaveProofAccess, redeemLeaveProofAccessToken } from '../lib/leaveProofAccess.js';
+import { validateLeaveApplication } from '../lib/memberLeaveRules.js';
 import {
   buildShiftSummary,
   getOpenShift,
@@ -795,6 +803,27 @@ router.get('/id-photo-access/:token', async (req, res) => {
   }
 });
 
+/**
+ * 暫停證明短效調閱兌換（無 Staff JWT；token 即憑證，每次兌換寫稽核）
+ * GET /api/ops/leave-proof-access/:token
+ */
+router.get('/leave-proof-access/:token', async (req, res) => {
+  try {
+    const file = await redeemLeaveProofAccessToken(req.params.token, req);
+    res.setHeader('Content-Type', file.contentType || 'image/jpeg');
+    res.setHeader('Content-Disposition', 'inline');
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    return res.send(file.buf);
+  } catch (error) {
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({ status: 'error', code: error.code, message: error.message });
+    }
+    console.error(error);
+    return res.status(500).json({ status: 'error', message: '調閱失敗' });
+  }
+});
+
 // 所有 ops.js 內的路由，強制通過員工海關驗證
 // 訂閱／請假限 DUTY 以上；其餘限櫃檯模組（退費／取消／折讓單在 routes/opsTransactions.js）
 router.use(verifyStaff);
@@ -1318,6 +1347,7 @@ router.get('/card-subscriptions/:id/cancel-preview', async (req, res) => {
           orderAmount: latest.order.amount,
           unusedDays,
           periodDays,
+          medicalSuspension: await medicalSuspensionForMember(prisma, sub.memberId, now),
         })
       : null;
 
@@ -1633,19 +1663,11 @@ router.get('/member-leaves', async (req, res) => {
     // 分店過濾：有訂閱則看方案分店；無則放行 ADMIN，DUTY 需 memberId
     const filtered = [];
     for (const row of rows) {
-      if (row.subscriptionId) {
-        const sub = await prisma.cardSubscription.findUnique({
-          where: { id: row.subscriptionId },
-          include: { promotion: { select: { branchId: true } }, coursePlan: { select: { branchId: true } } },
-        });
-        try {
-          if (sub) assertSubscriptionBranchAccess(req, sub);
-          filtered.push(row);
-        } catch {
-          /* skip */
-        }
-      } else {
-        filtered.push(row);
+      try {
+        await assertLeaveBranchAccess(req, row);
+        filtered.push(toLeaveView(row));
+      } catch {
+        /* skip */
       }
     }
     res.json({ status: 'success', data: filtered });
@@ -1658,7 +1680,61 @@ router.get('/member-leaves', async (req, res) => {
   }
 });
 
-router.post('/member-leaves', async (req, res) => {
+async function assertLeaveBranchAccess(req, leave) {
+  if (!leave?.subscriptionId) return;
+  const sub = await prisma.cardSubscription.findUnique({
+    where: { id: leave.subscriptionId },
+    include: { promotion: { select: { branchId: true } }, coursePlan: { select: { branchId: true } } },
+  });
+  if (sub) assertSubscriptionBranchAccess(req, sub);
+}
+
+async function loadLeaveForStaff(req) {
+  const leave = await prisma.memberLeave.findUnique({ where: { id: Number(req.params.id) } });
+  if (!leave) {
+    const err = new Error('找不到暫停申請');
+    err.statusCode = 404;
+    err.code = 'LEAVE_NOT_FOUND';
+    throw err;
+  }
+  await assertLeaveBranchAccess(req, leave);
+  return leave;
+}
+
+function sendLeaveError(res, error, fallback) {
+  if (error.statusCode) {
+    return res.status(error.statusCode).json({
+      status: 'error',
+      code: error.code,
+      message: error.message,
+      data: error.payuniStop ? { payuniStop: error.payuniStop } : undefined,
+    });
+  }
+  console.error(error);
+  return res.status(500).json({ status: 'error', message: fallback });
+}
+
+function payuniStopNote(payuniStop) {
+  if (!payuniStop || payuniStop.skipped) return '';
+  return payuniStop.ok
+    ? '；PayUNi 續期已暫停'
+    : `；⚠ PayUNi 續期可能未停（${payuniStop.message || '請至統一金流後台手動暫停'}）`;
+}
+
+function approvalMessage(result) {
+  if (result.scheduled) {
+    return `已核准，將於 ${new Date(result.leave.startAt).toLocaleDateString('zh-TW')} 起生效`;
+  }
+  const until = new Date(result.leave.endAt).toLocaleDateString('zh-TW');
+  return result.leave.status === 'ENDED'
+    ? `已核准事後補辦，效期已順延 ${result.leave.days} 天`
+    : `已核准並生效（至 ${until}）；效期已順延，定期定額已暫停${payuniStopNote(result.payuniStop)}`;
+}
+
+/**
+ * 櫃檯代建暫停申請（契約第十二條）：multipart 欄位 proof；approveNow=true 時由 DUTY+ 當場核准
+ */
+router.post('/member-leaves', maybeLeaveProofUpload, async (req, res) => {
   try {
     const memberId = await resolveOpsMemberIdParam({
       memberNo: req.body?.memberNo,
@@ -1677,35 +1753,86 @@ router.post('/member-leaves', async (req, res) => {
       assertSubscriptionBranchAccess(req, sub);
     }
 
-    const result = await startMemberLeave({
-      memberId,
-      days: req.body?.days,
-      reason: req.body?.reason,
-      staffId: req.user?.id ?? null,
-      subscriptionId: subId,
+    const input = { category: req.body?.category, startDate: req.body?.startDate, endDate: req.body?.endDate };
+    validateLeaveApplication({ ...input, hasProof: requestHasLeaveProof(req) });
+    const leave = await withStoredLeaveProof(memberId, req, (proof) =>
+      submitLeaveApplication({
+        ...input,
+        memberId,
+        reason: req.body?.reason,
+        subscriptionId: subId,
+        proof,
+        source: 'STAFF',
+        staffId: req.user?.id ?? null,
+      }),
+    );
+
+    const approveNow = req.body?.approveNow === true || req.body?.approveNow === 'true';
+    if (!approveNow) {
+      return res.json({ status: 'success', message: '已建立暫停申請（待審）', data: toLeaveView(leave) });
+    }
+    const result = await approveMemberLeave({
+      leaveId: leave.id,
+      user: req.user,
+      forceLocalOnly: req.body?.forceLocalOnly === true || req.body?.forceLocalOnly === 'true',
+    });
+    res.json({ status: 'success', message: approvalMessage(result), data: { ...result, leave: toLeaveView(result.leave) } });
+  } catch (error) {
+    sendLeaveError(res, error, '建立暫停申請失敗');
+  }
+});
+
+/** 核准（DUTY+）：須已附證明；起日已到即生效 */
+router.post('/member-leaves/:id/approve', async (req, res) => {
+  try {
+    const leave = await loadLeaveForStaff(req);
+    const result = await approveMemberLeave({
+      leaveId: leave.id,
+      user: req.user,
+      note: req.body?.note,
       forceLocalOnly: Boolean(req.body?.forceLocalOnly),
     });
-    const payuniMsg =
-      result.payuniStop && !result.payuniStop.skipped
-        ? result.payuniStop.ok
-          ? '；PayUNi 續期已暫停'
-          : `；⚠ PayUNi 續期可能未停（${result.payuniStop.message || '請至統一金流後台手動暫停'}）`
-        : '';
-    res.json({
-      status: 'success',
-      message: `已請假 ${result.leave.days} 天（至 ${new Date(result.leave.endAt).toLocaleDateString('zh-TW')}）；效期已順延，定期定額已暫停${payuniMsg}`,
-      data: result,
-    });
+    res.json({ status: 'success', message: approvalMessage(result), data: { ...result, leave: toLeaveView(result.leave) } });
   } catch (error) {
-    if (error.statusCode) {
-      return res.status(error.statusCode).json({
-        status: 'error',
-        message: error.message,
-        data: error.payuniStop ? { payuniStop: error.payuniStop } : undefined,
-      });
+    sendLeaveError(res, error, '核准暫停失敗');
+  }
+});
+
+/** 退回（DUTY+，必填原因） */
+router.post('/member-leaves/:id/reject', async (req, res) => {
+  try {
+    const leave = await loadLeaveForStaff(req);
+    const row = await rejectMemberLeave({ leaveId: leave.id, user: req.user, reason: req.body?.reason });
+    res.json({ status: 'success', message: '已退回暫停申請', data: toLeaveView(row) });
+  } catch (error) {
+    sendLeaveError(res, error, '退回暫停失敗');
+  }
+});
+
+/** 櫃檯代為補附證明 */
+router.post('/member-leaves/:id/proof', maybeLeaveProofUpload, async (req, res) => {
+  try {
+    const leave = await loadLeaveForStaff(req);
+    if (!requestHasLeaveProof(req)) {
+      return res.status(400).json({ status: 'error', code: 'LEAVE_PROOF_REQUIRED', message: '請上傳證明檔案' });
     }
-    console.error(error);
-    res.status(500).json({ status: 'error', message: '請假失敗' });
+    const row = await withStoredLeaveProof(leave.memberId, req, (proof) =>
+      attachLeaveProof({ leaveId: leave.id, proof }),
+    );
+    res.json({ status: 'success', message: '已補附證明', data: toLeaveView(row) });
+  } catch (error) {
+    sendLeaveError(res, error, '補附證明失敗');
+  }
+});
+
+/** 調閱證明（特種個資）：DUTY+、必填原因、簽發 3～5 分短效 URL 並寫 LeaveProofAccessLog */
+router.post('/member-leaves/:id/proof-access', async (req, res) => {
+  try {
+    const leave = await loadLeaveForStaff(req);
+    const access = await issueLeaveProofAccess({ leaveId: leave.id, user: req.user, reason: req.body?.reason, req });
+    res.json({ status: 'success', message: '已簽發短效調閱連結', data: access });
+  } catch (error) {
+    sendLeaveError(res, error, '簽發調閱失敗');
   }
 });
 

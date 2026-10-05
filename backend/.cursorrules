@@ -82,7 +82,14 @@
 - 排程 `startGroupClassScheduler`（預設 60 秒，`GROUP_CLASS_TICK_MS`）：逾時保留 EXPIRED、遞補逾時換人、補課權過期；推播只可經 `processWaitlist` 等服務函式，文案**禁止**含金額。
 - 舊路徑：`/member/book-class` GROUP 409 `GROUP_ENROLL_REQUIRED`、一般取消／`class-leave` 擋團課 409 `USE_GROUP_LEAVE`、`/trainer/schedule-class` 僅 PRIVATE／CONSULT（400 `USE_GROUP_SERIES`）、`/member/makeup-slots`／`makeup-register` 410 `USE_GROUP_MAKEUP`（`MakeupSlot` 僅留歷史）；團課**禁止**扣點，簽到須 CONFIRMED 預約。
 
+## 會員權暫停（契約第十二條；`lib/memberLeaveRules.js` 純函式＋`lib/memberLeave.js`）
+- 事由、天數、回溯、證明期限、七工作日、凍結天數只可呼叫 `memberLeaveRules`，**禁止**路由另算。狀態機 PENDING →（DUTY+）APPROVED → ACTIVE → ENDED；PENDING／APPROVED → REJECTED（必填原因）。**禁止**繞過審核直接生效（舊 `startMemberLeave` 已移除、`/member/subscription-leave` 410）。
+- 核准與生效前必須經 `assertLeaveStillApplicable`（方案、效期、期間無月費進場）且在 PayUNi 暫停之前；生效交易內條件式搶占狀態並重驗進場。排程遇方案／效期／進場不符自動退回，不得無限重試。
+- 效期順延一律 `shiftDateByDays(expireDate, days)`；結束時必須寫 `frozenDays`（提早銷假＝days − 未休）；傷病累計只由已生效紀錄推導（`medicalSuspensionForMember`）；月卡終止之所有計算入口（`refundService.computeMembership`、`subscriptionSettle` 三路、ops 月卡取消試算）**必須**把 `medicalSuspension` 傳入 `computeMonthlyCardRefundDetail`，滿 180 日由其強制手續費／上限 0（`isMedicalSuspensionFeeWaived`），**禁止**另寫分支或交給前端。
+- 審核期限 `reviewDueAt` 經 `computeReviewDueAt`（`addWorkingDays`＋`publicHolidayService.holidayKeySet`，假日曆該年無資料回退 `laborLaw` 預設），於交易外先算好再寫入。
+- 證明走私有儲存（`withStoredLeaveProof`，失敗刪檔、換檔刪舊檔）；對外只經 `toLeaveView`（禁回 `proofStorageKey`）。調閱唯一出口 `lib/leaveProofAccess.js`：`DUTY+`（403 `DUTY_ROLE_REQUIRED_FOR_LEAVE_PROOF`）＋原因 ≥4 字（400 `REASON_REQUIRED`）→ 先寫 `LeaveProofAccessLog`（ISSUE）再回短效 URL（R2 presign／`GET /api/ops/leave-proof-access/:token`，token 綁 leaveId＋檔案指紋＋經辦、HMAC、TTL 同證件 180～300 秒），兌換再寫 REDEEM；表為 append-only（`refund_constraints.sql` trigger），**禁止**回 data URL 或任何不留痕之讀檔端點。
+
 ## 其他現況契約
-- 請假／取消 409／換卡／`occupancy-settings`／`YIPAY`；證件儲存 local｜r2。
+- 取消 409／換卡／`occupancy-settings`／`YIPAY`；證件儲存 local｜r2。
 - **交班盲盤**／**消保退費**見 Master；進銷存與電子發票見上節。新增任何臨櫃收款建單路徑，必須在建單交易第一步呼叫 `lib/shiftHandover.js` `lockOpenShiftForSale(tx, branchId)`（409 `SHIFT_NOT_OPEN`／`SHIFT_BRANCH_REQUIRED`，錯誤回應須帶 `code`）；`closeShift` 須維持交易內先 `FOR UPDATE` 鎖班次、取得鎖後才定交班時間再彙整。交班彙整（`buildShiftSummary`）＝本店合併結帳 CHK＋單獨 POS 銷貨＋單獨臨櫃儲值（`itemDesc` 以「臨櫃」開頭、無 CHK）；`carryFrom`＝上一班交班時間，上一班建立、交班後才付款者併入下一班。合併結帳 CHK 分店＝購物車分店，無則為收款班次分店（不得為 null）。
 - 行為／API／env 變更同步本檔與 `backend/README.md`。

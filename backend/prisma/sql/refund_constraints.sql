@@ -98,3 +98,8 @@ CREATE TRIGGER wallet_ledger_append_only BEFORE UPDATE OR DELETE ON "WalletLedge
 DROP TRIGGER IF EXISTS tx_audit_append_only ON "TransactionAuditLog";
 CREATE TRIGGER tx_audit_append_only BEFORE UPDATE OR DELETE ON "TransactionAuditLog"
   FOR EACH ROW EXECUTE FUNCTION forbid_update_delete();
+
+-- 會籍暫停證明（診斷證明等特種個資）調閱稽核
+DROP TRIGGER IF EXISTS leave_proof_access_append_only ON "LeaveProofAccessLog";
+CREATE TRIGGER leave_proof_access_append_only BEFORE UPDATE OR DELETE ON "LeaveProofAccessLog"
+  FOR EACH ROW EXECUTE FUNCTION forbid_update_delete();

@@ -1,10 +1,10 @@
 // routes/memberExt.js — 會員自助延伸（profile、課程請假、訂閱、紀錄）
 import express from 'express';
-import multer from 'multer';
 import prisma from '../lib/prisma.js';
 import { verifyMember, verifyMemberDevice } from '../middleware/jwtAuth.js';
-import { startMemberLeave } from '../lib/memberLeave.js';
-import { storeLeaveProof, inclusiveLeaveDays } from '../lib/leaveProof.js';
+import { attachLeaveProof, listMemberLeaves, submitLeaveApplication, toLeaveView } from '../lib/memberLeave.js';
+import { maybeLeaveProofUpload, requestHasLeaveProof, withStoredLeaveProof } from '../lib/leaveProof.js';
+import { validateLeaveApplication } from '../lib/memberLeaveRules.js';
 import { settleCancelSubscription } from '../lib/subscriptionSettle.js';
 import { PT_FREE_LATE_LEAVES, PT_LEAVE_NOTICE_HOURS, lateLeaveChargeFor, ptUnitPrice } from '../lib/refundRules.js';
 import {
@@ -27,33 +27,6 @@ const router = express.Router();
 
 router.use(verifyMember);
 
-const leaveProofUpload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 5 * 1024 * 1024 },
-  fileFilter(_req, file, cb) {
-    if (/^image\/(jpeg|png|webp)$/i.test(file.mimetype || '')) {
-      cb(null, true);
-      return;
-    }
-    cb(Object.assign(new Error('請假證明須為 JPG／PNG／WebP'), { statusCode: 400 }));
-  },
-});
-
-function maybeLeaveProofUpload(req, res, next) {
-  const ct = String(req.headers['content-type'] || '');
-  if (!ct.includes('multipart/form-data')) {
-    next();
-    return;
-  }
-  leaveProofUpload.single('proof')(req, res, (err) => {
-    if (err) {
-      sendErr(res, err, '上傳請假證明失敗');
-      return;
-    }
-    next();
-  });
-}
-
 function httpError(message, statusCode = 400) {
   const err = new Error(message);
   err.statusCode = statusCode;
@@ -68,7 +41,7 @@ function parseDate(value, fieldName) {
 
 function sendErr(res, error, fallback = '操作失敗') {
   if (error.statusCode) {
-    return res.status(error.statusCode).json({ status: 'error', message: error.message });
+    return res.status(error.statusCode).json({ status: 'error', code: error.code, message: error.message });
   }
   console.error(error);
   return res.status(500).json({ status: 'error', message: fallback });
@@ -438,38 +411,18 @@ function makeupRetired(req, res) {
 router.get('/makeup-slots', makeupRetired);
 router.post('/makeup-register', makeupRetired);
 
-router.post('/subscription-leave', verifyMemberDevice, async (req, res) => {
-  try {
-    const memberId = req.user.memberId;
-    const result = await startMemberLeave({
-      memberId,
-      days: req.body?.days,
-      reason: req.body?.reason,
-      staffId: null,
-      subscriptionId: req.body?.subscriptionId
-        ? String(req.body.subscriptionId).trim()
-        : undefined,
-    });
-    const payuniMsg =
-      result.payuniStop && !result.payuniStop.skipped
-        ? result.payuniStop.ok
-          ? '；PayUNi 續期已暫停'
-          : `；⚠ PayUNi 可能未停（${result.payuniStop.message || '請洽櫃檯'}）`
-        : '';
-    res.json({
-      status: 'success',
-      message: `已請假 ${result.leave.days} 天；效期已順延，定期定額已暫停${payuniMsg}`,
-      data: result,
-    });
-  } catch (error) {
-    sendErr(res, error, '會籍請假失敗');
-  }
+router.post('/subscription-leave', verifyMemberDevice, (_req, res) => {
+  res.status(410).json({
+    status: 'error',
+    code: 'USE_LEAVE_APPLICATION',
+    message: '會籍暫停須選擇事由並檢附證明，請改用 POST /api/member/leave-application 送審',
+  });
 });
 
 /**
- * POST /api/member/leave-application
- * JSON：{ startDate, endDate, reason?, subscriptionId?, proofImage?, proofFileName? }
- * multipart/form-data：startDate, endDate, reason?, subscriptionId?, proof=<file>
+ * POST /api/member/leave-application（契約第十二條，送審後由門市 DUTY+ 於七工作日內審核）
+ * JSON：{ category, startDate, endDate, reason?, subscriptionId?, proofImage?, proofFileName? }
+ * multipart/form-data：同上欄位，proof=<file>
  * 身分只從 JWT；不收 memberId。
  */
 router.post(
@@ -479,64 +432,58 @@ router.post(
   async (req, res) => {
     try {
       const memberId = req.user.memberId;
-      const startDate = String(req.body?.startDate || '').trim();
-      const endDate = String(req.body?.endDate || '').trim();
-      if (!startDate || !endDate) throw httpError('請提供請假起始日與結束日');
-
-      const days = inclusiveLeaveDays(startDate, endDate);
-      let proofStorageKey = null;
-      let proofFileName = null;
-
-      if (req.file?.buffer) {
-        const stored = await storeLeaveProof(
+      const input = {
+        category: req.body?.category,
+        startDate: req.body?.startDate,
+        endDate: req.body?.endDate,
+      };
+      validateLeaveApplication({ ...input, hasProof: requestHasLeaveProof(req) });
+      const leave = await withStoredLeaveProof(memberId, req, (proof) =>
+        submitLeaveApplication({
+          ...input,
           memberId,
-          req.file.buffer,
-          req.file.originalname,
-        );
-        proofStorageKey = stored.storageKey;
-        proofFileName = stored.fileName;
-      } else if (req.body?.proofImage || req.body?.proofDataUrl) {
-        const stored = await storeLeaveProof(
-          memberId,
-          req.body.proofImage || req.body.proofDataUrl,
-          req.body.proofFileName,
-        );
-        proofStorageKey = stored.storageKey;
-        proofFileName = stored.fileName;
-      }
-
-      const result = await startMemberLeave({
-        memberId,
-        days,
-        reason: req.body?.reason,
-        staffId: null,
-        subscriptionId: req.body?.subscriptionId
-          ? String(req.body.subscriptionId).trim()
-          : undefined,
-        proofStorageKey,
-        proofFileName,
-      });
-
-      const payuniMsg =
-        result.payuniStop && !result.payuniStop.skipped
-          ? result.payuniStop.ok
-            ? '；PayUNi 續期已暫停'
-            : `；⚠ PayUNi 可能未停（${result.payuniStop.message || '請洽櫃檯'}）`
-          : '';
-
+          reason: req.body?.reason,
+          subscriptionId: req.body?.subscriptionId ? String(req.body.subscriptionId).trim() : undefined,
+          proof,
+          source: 'MEMBER',
+        }),
+      );
       res.json({
         status: 'success',
-        message: `已請假 ${result.leave.days} 天；效期已順延，定期定額已暫停${payuniMsg}`,
-        data: {
-          ...result,
-          hasProof: Boolean(proofStorageKey),
-        },
+        message: leave.proofStorageKey
+          ? '已送出暫停申請，門市將於 7 個工作日內審核；核准後效期才順延'
+          : '已送出暫停申請；請於 30 日內補附證明，補齊後門市於 7 個工作日內審核',
+        data: toLeaveView(leave),
       });
     } catch (error) {
-      sendErr(res, error, '會籍請假失敗');
+      sendErr(res, error, '會籍暫停申請失敗');
     }
   },
 );
+
+/** GET /api/member/leave-applications：本人暫停申請紀錄 */
+router.get('/leave-applications', async (req, res) => {
+  try {
+    const rows = await listMemberLeaves({ memberId: req.user.memberId, take: 20 });
+    res.json({ status: 'success', data: rows.map((r) => toLeaveView(r)) });
+  } catch (error) {
+    sendErr(res, error, '讀取暫停申請失敗');
+  }
+});
+
+/** POST /api/member/leave-applications/:id/proof：傷病／疫情先送件者補附證明 */
+router.post('/leave-applications/:id/proof', verifyMemberDevice, maybeLeaveProofUpload, async (req, res) => {
+  try {
+    const memberId = req.user.memberId;
+    if (!requestHasLeaveProof(req)) throw httpError('請上傳證明檔案');
+    const leave = await withStoredLeaveProof(memberId, req, (proof) =>
+      attachLeaveProof({ leaveId: req.params.id, memberId, proof }),
+    );
+    res.json({ status: 'success', message: '已補附證明，門市將於 7 個工作日內審核', data: toLeaveView(leave) });
+  } catch (error) {
+    sendErr(res, error, '補附證明失敗');
+  }
+});
 
 router.post('/subscription-cancel', verifyMemberDevice, async (req, res) => {
   try {
