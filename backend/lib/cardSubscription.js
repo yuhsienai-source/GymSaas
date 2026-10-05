@@ -23,7 +23,7 @@ import {
 } from './promotion.js';
 import { issueOrderInvoice } from './einvoice.js';
 import { generateSubscriptionOrderId } from './orderIds.js';
-import { remainingCourseChargeDates } from './coursePlan.js';
+import { courseInstallmentChargeAt, remainingCourseChargeDates } from './coursePlan.js';
 
 const MAX_FAILS = 3;
 const DEFAULT_TICK_MS = 60_000;
@@ -68,6 +68,23 @@ export function computeNextChargeAt(periodType, from = new Date()) {
   next.setHours(0, 0, 0, 0);
   next.setDate(next.getDate() + days);
   return next;
+}
+
+/** 課程分期扣款表起算點＝首期訂單建立時間（查無才用訂閱建立時間）；非課程分期回 null */
+export async function resolveCourseOriginAt(sub, db = prisma) {
+  if (!sub?.coursePlanId) return null;
+  const origin = sub.originOrderId
+    ? await db.order.findUnique({ where: { id: sub.originOrderId }, select: { createdAt: true } })
+    : null;
+  return origin?.createdAt || sub.createdAt || null;
+}
+
+/** 第 periodIndex 期扣款時刻：課程分期依契約 1／16 日扣款表，其餘（含月卡）以天數遞延 */
+export function resolveNextPeriodChargeAt(sub, periodIndex, courseOriginAt, now = new Date()) {
+  return (
+    (sub?.coursePlanId ? courseInstallmentChargeAt(periodIndex, courseOriginAt) : null) ||
+    computeNextChargeAt(sub?.periodType, now)
+  );
 }
 
 /** PayUNi 代扣時曾用的本機略過佔位日（勿再寫入；僅辨識舊資料） */
@@ -309,7 +326,7 @@ export async function createSubscriptionFromPaidOrder(order, {
     }
   }
 
-  // 下次扣款：PERIOD 優先 DateList／指定日；否則本機 +30 天推算（僅本機幕後續扣適用）
+  // 下次扣款：PERIOD 優先 DateList／指定日；否則課程分期依 1／16 日扣款表、其餘 +30 天推算
   const fromHint =
     nextChargeAtHint instanceof Date && !Number.isNaN(nextChargeAtHint.getTime())
       ? nextChargeAtHint
@@ -317,10 +334,20 @@ export async function createSubscriptionFromPaidOrder(order, {
         ? new Date(nextChargeAtHint)
         : null;
   const fromList = resolveNextChargeAtFromDateList(dateList, now);
+  const courseOriginAt = coursePlan?.id
+    ? order.createdAt ||
+      (await prisma.order.findUnique({ where: { id: order.id }, select: { createdAt: true } }))?.createdAt ||
+      now
+    : null;
   const nextChargeAt =
     (fromHint && !Number.isNaN(fromHint.getTime()) ? fromHint : null) ||
     fromList ||
-    computeNextChargeAt(periodType, now);
+    resolveNextPeriodChargeAt(
+      { coursePlanId: coursePlan?.id || null, periodType },
+      2,
+      courseOriginAt,
+      now,
+    );
 
   const status =
     periodTimes > 0 && periodTimes <= 1 ? 'COMPLETED' : 'ACTIVE';
@@ -573,11 +600,7 @@ export async function buildSubscriptionRebindRequest(
     coursePlan: sub.coursePlan,
   });
 
-  const courseOriginAt = sub.coursePlanId
-    ? (sub.originOrderId
-        ? (await prisma.order.findUnique({ where: { id: sub.originOrderId }, select: { createdAt: true } }))?.createdAt
-        : null) || sub.createdAt
-    : null;
+  const courseOriginAt = await resolveCourseOriginAt(sub);
 
   const bindMerTradeNo = `${id}R${String(Date.now()).slice(-6)}`.slice(0, 25);
   const itemDesc = sub.promotion?.name || sub.coursePlan?.name || '定期定額換卡';
@@ -731,6 +754,8 @@ export async function processOneSubscription(subscriptionId, { now = new Date() 
     return { ok: false, message: '續扣金額無效' };
   }
 
+  const courseOriginAt = await resolveCourseOriginAt(sub);
+
   const existingCharge = await prisma.cardSubscriptionCharge.findUnique({
     where: {
       subscriptionId_periodIndex: {
@@ -880,7 +905,9 @@ export async function processOneSubscription(subscriptionId, { now = new Date() 
         failCount: 0,
         lastError: null,
         lastChargeAt: now,
-        nextChargeAt: completed ? sub.nextChargeAt : computeNextChargeAt(sub.periodType, now),
+        nextChargeAt: completed
+          ? sub.nextChargeAt
+          : resolveNextPeriodChargeAt(sub, chargedCount + 1, courseOriginAt, now),
         status: completed ? 'COMPLETED' : 'ACTIVE',
       },
     });

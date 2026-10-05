@@ -34,6 +34,14 @@ export function courseInstallmentChargeDates(times, from = new Date()) {
   return out;
 }
 
+/** 課程分期第 periodIndex 期（≥2）扣款時刻（台灣日 00:00）；期別無效或缺起算點回 null */
+export function courseInstallmentChargeAt(periodIndex, originAt) {
+  const k = parseInt(periodIndex, 10) - 1;
+  if (!Number.isInteger(k) || k < 1 || !originAt) return null;
+  const ymd = courseInstallmentChargeDates(k, originAt)[k - 1];
+  return new Date(`${ymd}T00:00:00+08:00`);
+}
+
 /** 換卡續約：沿用首期付款日之扣款表，取今日之後剩餘 times 筆（不足回 null，交由 PayUNi 預設排程） */
 export function remainingCourseChargeDates(totalTimes, times, originAt, now = new Date()) {
   const today = twYmd(now);

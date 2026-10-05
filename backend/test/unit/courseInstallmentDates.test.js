@@ -3,8 +3,13 @@
 import '../helpers/env.js';
 import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { courseInstallmentChargeDates, remainingCourseChargeDates } from '../../lib/coursePlan.js';
+import {
+  courseInstallmentChargeAt,
+  courseInstallmentChargeDates,
+  remainingCourseChargeDates,
+} from '../../lib/coursePlan.js';
 import { resolveBindSchedule } from '../../lib/payuni.js';
+import { computeNextChargeAt, resolveNextPeriodChargeAt } from '../../lib/cardSubscription.js';
 
 const tw = (ymd, hm = '10:00') => new Date(`${ymd}T${hm}:00+08:00`);
 const twToday = () => new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);
@@ -64,6 +69,53 @@ describe('remainingCourseChargeDates（換卡續約）', () => {
 
   test('扣款日當天換卡：今日不可排入，回 null', () => {
     assert.equal(remainingCourseChargeDates(4, 1, origin, tw('2022-04-01')), null);
+  });
+});
+
+describe('courseInstallmentChargeAt（本機排程用扣款時刻）', () => {
+  const origin = tw('2022-01-08');
+
+  test('第 2／3／4 期＝台灣日 00:00 之 02-01、03-01、04-01', () => {
+    assert.equal(courseInstallmentChargeAt(2, origin).toISOString(), tw('2022-02-01', '00:00').toISOString());
+    assert.equal(courseInstallmentChargeAt(3, origin).toISOString(), tw('2022-03-01', '00:00').toISOString());
+    assert.equal(courseInstallmentChargeAt(4, origin).toISOString(), tw('2022-04-01', '00:00').toISOString());
+  });
+
+  test('首期、期別無效或缺起算點回 null', () => {
+    assert.equal(courseInstallmentChargeAt(1, origin), null);
+    assert.equal(courseInstallmentChargeAt('x', origin), null);
+    assert.equal(courseInstallmentChargeAt(2, null), null);
+  });
+});
+
+describe('resolveNextPeriodChargeAt（伺服器排程續扣後之下期扣款日）', () => {
+  const origin = tw('2022-01-08');
+  const course = { coursePlanId: 1, periodType: 'M' };
+
+  test('課程分期：扣款實際時間延後（失敗重試至 02-03）仍不漂移，第 3 期維持 03-01', () => {
+    const next = resolveNextPeriodChargeAt(course, 3, origin, tw('2022-02-03', '09:00'));
+    assert.equal(next.toISOString(), tw('2022-03-01', '00:00').toISOString());
+  });
+
+  test('課程分期：與換卡送 PayUNi 之扣款表一致', () => {
+    const dates = courseInstallmentChargeDates(3, origin);
+    for (let p = 2; p <= 4; p += 1) {
+      const ymd = new Date(resolveNextPeriodChargeAt(course, p, origin).getTime() + 8 * 3600 * 1000)
+        .toISOString()
+        .slice(0, 10);
+      assert.equal(ymd, dates[p - 2]);
+    }
+  });
+
+  test('月卡（無 coursePlanId）維持每滿 30 日，不收斂 1／16 日', () => {
+    const now = tw('2022-01-01', '10:00');
+    const next = resolveNextPeriodChargeAt({ coursePlanId: null, periodType: 'M' }, 2, origin, now);
+    assert.equal(next.getTime(), computeNextChargeAt('M', now).getTime());
+  });
+
+  test('課程分期缺起算點：退回天數遞延', () => {
+    const now = tw('2022-02-01', '10:00');
+    assert.equal(resolveNextPeriodChargeAt(course, 2, null, now).getTime(), computeNextChargeAt('M', now).getTime());
   });
 });
 
