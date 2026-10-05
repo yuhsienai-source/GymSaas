@@ -45,12 +45,10 @@ function A4Copy({
   p,
   label,
   sigUrl,
-  sigRef,
 }: {
   p: AllowancePrintPayload;
   label: string;
   sigUrl: string | null;
-  sigRef?: (el: HTMLImageElement | null) => void;
 }) {
   const inv = p.originalInvoice;
   return (
@@ -123,7 +121,7 @@ function A4Copy({
           <div className="alw-slot">原銷貨營業人蓋章</div>
           <div className="alw-slot">
             原買受人簽收
-            {sigUrl ? <img ref={sigRef} className="alw-sig" src={sigUrl} alt="買受人簽名" /> : null}
+            {sigUrl ? <img className="alw-sig" src={sigUrl} alt="買受人簽名" /> : null}
             <SignatureNote p={p} />
           </div>
         </div>
@@ -135,11 +133,9 @@ function A4Copy({
 function Thermal({
   p,
   sigUrl,
-  sigRef,
 }: {
   p: AllowancePrintPayload;
   sigUrl: string | null;
-  sigRef?: (el: HTMLImageElement | null) => void;
 }) {
   const inv = p.originalInvoice;
   return (
@@ -171,7 +167,7 @@ function Thermal({
       <div className="alw-hr" />
       <div>原因：{p.allowance.reason || '—'}</div>
       <div style={{ marginTop: '3mm' }}>買受人簽收：</div>
-      {sigUrl ? <img ref={sigRef} className="alw-sig" src={sigUrl} alt="買受人簽名" /> : <div className="alw-slot" />}
+      {sigUrl ? <img className="alw-sig" src={sigUrl} alt="買受人簽名" /> : <div className="alw-slot" />}
       <div className="alw-sub"><SignatureNote p={p} /></div>
     </div>
   );
@@ -195,15 +191,9 @@ export default function AllowancePrintView({
   const [sigReady, setSigReady] = useState(!rawSigUrl && !signedButMissing);
   const [sigBroken, setSigBroken] = useState(false);
   const sigUrl = sigBroken ? null : rawSigUrl;
-  const imgRefs = useRef<Array<HTMLImageElement | null>>([]);
+  const rootRef = useRef<HTMLDivElement | null>(null);
   const [bindTick, setBindTick] = useState(0);
   const sigCopies = format === 'THERMAL_80MM' ? 1 : 4;
-
-  function bindSig(index: number) {
-    return (el: HTMLImageElement | null) => {
-      imgRefs.current[index] = el;
-    };
-  }
 
   useEffect(() => {
     document.body.classList.add('alw-printing');
@@ -213,14 +203,12 @@ export default function AllowancePrintView({
   useLayoutEffect(() => {
     if (!rawSigUrl || sigBroken) return;
     let alive = true;
-    const imgs = imgRefs.current.slice(0, sigCopies).filter((n): n is HTMLImageElement => n != null);
+    const imgs = Array.from(rootRef.current?.querySelectorAll<HTMLImageElement>('img.alw-sig') ?? []).slice(0, sigCopies);
     if (imgs.length < sigCopies) {
-      if (bindTick >= 8) {
-        setSigBroken(true);
-        return;
-      }
       const raf = window.requestAnimationFrame(() => {
-        if (alive) setBindTick((n) => n + 1);
+        if (!alive) return;
+        if (bindTick >= 8) setSigBroken(true);
+        else setBindTick((n) => n + 1);
       });
       return () => {
         alive = false;
@@ -286,17 +274,17 @@ export default function AllowancePrintView({
 
   const blocked = signedButMissing || sigBroken;
   const sheet = (
-    <div className={`alw-print-root alw-print-root--${format === 'THERMAL_80MM' ? 'thermal' : 'a4'}`}>
+    <div ref={rootRef} className={`alw-print-root alw-print-root--${format === 'THERMAL_80MM' ? 'thermal' : 'a4'}`}>
       <style>{pageRule}</style>
       {format === 'THERMAL_80MM' ? (
-        <Thermal p={payload} sigUrl={sigUrl} sigRef={bindSig(0)} />
+        <Thermal p={payload} sigUrl={sigUrl} />
       ) : (
         [COPY_LABELS.slice(0, 2), COPY_LABELS.slice(2, 4)].map((pair, page) => (
           <div key={page} className="alw-a4__page">
             {pair.map((label, j) => (
               <div key={label} className="alw-a4__half">
                 {j === 1 ? <div className="alw-a4__cut" /> : null}
-                <A4Copy p={payload} label={label} sigUrl={sigUrl} sigRef={bindSig(page * 2 + j)} />
+                <A4Copy p={payload} label={label} sigUrl={sigUrl} />
               </div>
             ))}
           </div>
