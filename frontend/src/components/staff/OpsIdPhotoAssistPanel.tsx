@@ -27,6 +27,8 @@ type Props = {
   branchCode: string;
   staffId: number | string;
   posDisplay: PosDisplayHostApi;
+  /** 所在頁籤隱藏時須關閉相機串流（保留委託簽署狀態） */
+  active?: boolean;
   onUploaded?: () => void;
 };
 
@@ -78,6 +80,7 @@ export default function OpsIdPhotoAssistPanel({
   branchCode,
   staffId,
   posDisplay,
+  active = true,
   onUploaded,
 }: Props) {
   const { toast } = useToast();
@@ -111,7 +114,7 @@ export default function OpsIdPhotoAssistPanel({
   }, [consentOk, assistConsentId, toast]);
 
   useEffect(() => {
-    if (!cameraSide) return;
+    if (!cameraSide || !active) return;
     let cancelled = false;
     void (async () => {
       setCameraError('');
@@ -139,7 +142,7 @@ export default function OpsIdPhotoAssistPanel({
       cancelled = true;
       stopCamera();
     };
-  }, [cameraSide]);
+  }, [cameraSide, active]);
 
   function dispatchConsent() {
     posDisplay.openDisplayWindow();

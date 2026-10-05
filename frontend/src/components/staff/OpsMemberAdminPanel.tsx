@@ -26,6 +26,15 @@ type Props = {
   staffId?: number | null;
 };
 
+type MemberAdminPane = 'notes' | 'idAssist' | 'idPhotos' | 'expire';
+
+const MEMBER_ADMIN_TABS: { key: MemberAdminPane; label: string }[] = [
+  { key: 'notes', label: '會員備註' },
+  { key: 'idAssist', label: '臨櫃代辦證件上傳' },
+  { key: 'idPhotos', label: '證件狀態與調閱' },
+  { key: 'expire', label: '調整會籍日期' },
+];
+
 type PendingDelete = {
   id: string;
   side: string;
@@ -65,6 +74,7 @@ export default function OpsMemberAdminPanel({
   }>({});
   const [previewBusy, setPreviewBusy] = useState<IdPhotoSide | null>(null);
   const [viewReason, setViewReason] = useState('');
+  const [pane, setPane] = useState<MemberAdminPane>('notes');
 
   const memberId = member?.id ?? null;
 
@@ -247,9 +257,35 @@ export default function OpsMemberAdminPanel({
 
   const hasFront = Boolean(idMeta?.sides?.front);
   const hasBack = Boolean(idMeta?.sides?.back);
+  const canAssistUpload = Boolean(posDisplay && staffId != null);
+  const tabs = MEMBER_ADMIN_TABS.filter((t) => t.key !== 'idAssist' || canAssistUpload);
+  const activePane = tabs.some((t) => t.key === pane) ? pane : 'notes';
 
   return (
     <div className="ops-member-admin">
+      <nav className="hq-tabs ops-member-admin-tabs" role="tablist" aria-label="會員管理項目">
+        {tabs.map((item) => (
+          <button
+            key={item.key}
+            type="button"
+            role="tab"
+            id={`ops-member-tab-${item.key}`}
+            aria-selected={activePane === item.key}
+            aria-controls={`ops-member-panel-${item.key}`}
+            className={`hq-tabs__btn ${activePane === item.key ? 'is-active' : ''}`}
+            onClick={() => setPane(item.key)}
+          >
+            {item.label}
+          </button>
+        ))}
+      </nav>
+
+      <div
+        id="ops-member-panel-notes"
+        role="tabpanel"
+        aria-labelledby="ops-member-tab-notes"
+        hidden={activePane !== 'notes'}
+      >
       <Card title="會員備註" subtitle={`${member.memberNo || `#${member.id}`} ${member.name}`}>
         <form onSubmit={(e) => void onAddNote(e)}>
           <Field label="新增備註">
@@ -273,21 +309,33 @@ export default function OpsMemberAdminPanel({
           {!notes.length && <Alert tone="info">尚無備註</Alert>}
         </ul>
       </Card>
+      </div>
 
       {posDisplay && staffId != null && (
-        <div style={{ marginTop: '1rem' }}>
+        <div
+          id="ops-member-panel-idAssist"
+          role="tabpanel"
+          aria-labelledby="ops-member-tab-idAssist"
+          hidden={activePane !== 'idAssist'}
+        >
           <OpsIdPhotoAssistPanel
             key={member.id}
             member={member}
             branchCode={branchCode}
             staffId={staffId}
             posDisplay={posDisplay}
+            active={activePane === 'idAssist'}
             onUploaded={() => void loadIdPhotos()}
           />
         </div>
       )}
 
-      <div style={{ marginTop: '1rem' }}>
+      <div
+        id="ops-member-panel-idPhotos"
+        role="tabpanel"
+        aria-labelledby="ops-member-tab-idPhotos"
+        hidden={activePane !== 'idPhotos'}
+      >
         <Card title="證件狀態與調閱" subtitle="一般櫃檯僅見已建檔標記；原圖限 DUTY+ 短效 Presigned／token">
           <Alert tone="info">
             個資用途僅限會籍身分核對；禁止下載／轉傳。清除申請須核准後才刪檔。
@@ -399,7 +447,12 @@ export default function OpsMemberAdminPanel({
         </Card>
       </div>
 
-      <div style={{ marginTop: '1rem' }}>
+      <div
+        id="ops-member-panel-expire"
+        role="tabpanel"
+        aria-labelledby="ops-member-tab-expire"
+        hidden={activePane !== 'expire'}
+      >
         <Card title="調整會籍日期">
           <Alert tone="info">DUTY+ 可調整；正數延長、負數縮短，原因必填並寫入備註。</Alert>
           <form onSubmit={(e) => void onAdjustExpire(e)}>
